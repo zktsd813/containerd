@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -17,6 +18,9 @@ const (
 	Version     uint32 = 2
 	ContentType        = "application/vnd.trenv.publication.v2"
 	Extension          = ".trpub"
+
+	DedupRestoreCOWPhase  = "dedup-restore-cow"
+	restoreExtentPageSize = 4096
 )
 
 var magic = [8]byte{'T', 'R', 'P', 'U', 'B', '0', '0', '2'}
@@ -135,6 +139,96 @@ func WriteFileNoReplace(path string, pub Publication) error {
 		return err
 	}
 	return file.Close()
+}
+
+func DerivedDedupArtifactID(base Publication, createdAt time.Time) string {
+	artifactID := base.ArtifactID
+	if artifactID == "" {
+		artifactID = base.CheckpointID
+	}
+	if artifactID == "" {
+		artifactID = "checkpoint"
+	}
+	return fmt.Sprintf("%s-dedup-%s", artifactID, createdAt.UTC().Format("20060102T150405.000000000Z"))
+}
+
+func CoalesceRestoreExtents(extents []RestoreExtent) []RestoreExtent {
+	if len(extents) == 0 {
+		return nil
+	}
+	out := append([]RestoreExtent(nil), extents...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Vaddr != out[j].Vaddr {
+			return out[i].Vaddr < out[j].Vaddr
+		}
+		if out[i].ShardIndex != out[j].ShardIndex {
+			return out[i].ShardIndex < out[j].ShardIndex
+		}
+		return out[i].Pgoff < out[j].Pgoff
+	})
+	write := 0
+	for _, extent := range out {
+		if extent.NrPages == 0 {
+			continue
+		}
+		if write > 0 {
+			prev := &out[write-1]
+			nextVaddr := prev.Vaddr + prev.NrPages*restoreExtentPageSize
+			nextPgoff := prev.Pgoff + prev.NrPages
+			if prev.ShardIndex == extent.ShardIndex && prev.Type == extent.Type && prev.Flags == extent.Flags &&
+				nextVaddr == extent.Vaddr && nextPgoff == extent.Pgoff {
+				prev.NrPages += extent.NrPages
+				continue
+			}
+		}
+		out[write] = extent
+		write++
+	}
+	return out[:write]
+}
+
+func DeriveDedupPublication(base Publication, dedup []RestoreExtent, stats Stats, createdAt time.Time) Publication {
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	derived := base
+	derived.ArtifactID = DerivedDedupArtifactID(base, createdAt)
+	if derived.CheckpointID == "" {
+		derived.CheckpointID = base.ArtifactID
+	}
+	derived.State = "COMMITTED"
+	derived.CheckpointPhase = DedupRestoreCOWPhase
+	derived.DedupDelta = append([]RestoreExtent(nil), dedup...)
+	derived.Stats = stats
+	if derived.Stats.DedupDeltaCount == 0 {
+		derived.Stats.DedupDeltaCount = uint64(len(dedup))
+	}
+	if derived.Stats.DedupAppliedCount == 0 {
+		derived.Stats.DedupAppliedCount = uint64(len(dedup))
+	}
+	derived.CreatedAt = createdAt.UTC()
+	derived.Shards = append([]Shard(nil), base.Shards...)
+	if len(base.BaseRestoreMap) == 0 {
+		derived.BaseRestoreMap = CoalesceRestoreExtents(dedup)
+	} else {
+		derived.BaseRestoreMap = append([]RestoreExtent(nil), base.BaseRestoreMap...)
+	}
+	if derived.Stats.BaseExtentCount == 0 {
+		derived.Stats.BaseExtentCount = uint64(len(derived.BaseRestoreMap))
+	}
+	return derived
+}
+
+func WriteDerivedDedupPublication(basePath, outputPath string, dedup []RestoreExtent, stats Stats, createdAt time.Time) (Publication, error) {
+	base, err := ReadFile(basePath)
+	if err != nil {
+		return Publication{}, err
+	}
+	derived := DeriveDedupPublication(base, dedup, stats, createdAt)
+	if err := WriteFileNoReplace(outputPath, derived); err != nil {
+		return Publication{}, err
+	}
+	return derived, nil
 }
 
 func Encode(pub Publication) ([]byte, error) {

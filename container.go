@@ -339,6 +339,9 @@ func (c *container) SwitchTask(ctx context.Context, ioCreate cio.Creator, opts .
 		Stdout:      cfg.Stdout,
 		Stderr:      cfg.Stderr,
 	}
+	// Switch reuses the existing container metadata/rootfs envelope and swaps
+	// the task process from checkpoint state. This is distinct from NewTask,
+	// which starts a fresh process from the OCI spec.
 	r, err := c.get(ctx)
 	if err != nil {
 		return nil, err
@@ -383,6 +386,24 @@ func (c *container) SwitchTask(ctx context.Context, ioCreate cio.Creator, opts .
 	for _, o := range opts {
 		if err := o(ctx, c.client, &info); err != nil {
 			return nil, err
+		}
+	}
+
+	if info.CheckpointPath != "" {
+		if CheckRuntime(info.runtime, "io.containerd.runc") {
+			if info.Options == nil {
+				info.Options = &options.Options{}
+			}
+			runcOpts, ok := info.Options.(*options.Options)
+			if !ok {
+				return nil, fmt.Errorf("invalid v2 shim create options format")
+			}
+			if runcOpts.CriuImagePath == "" {
+				// Pass the converted CRIU image path through the runc shim
+				// options so the task service does not need OpenWhisk-specific
+				// checkpoint metadata.
+				runcOpts.CriuImagePath = info.CheckpointPath
+			}
 		}
 	}
 

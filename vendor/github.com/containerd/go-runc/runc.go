@@ -438,6 +438,8 @@ type CheckpointOpts struct {
 	ParentPath string
 	// AllowOpenTCP allows open tcp connections to be checkpointed
 	AllowOpenTCP bool
+	// TcpClose restores TCP sockets in closed state
+	TcpClose bool
 	// AllowExternalUnixSockets allows external unix sockets to be checkpointed
 	AllowExternalUnixSockets bool
 	// AllowTerminal allows the terminal(pty) to be checkpointed with a container
@@ -460,6 +462,8 @@ type CheckpointOpts struct {
 type CgroupMode string
 
 const (
+	Ignore CgroupMode = "ignore"
+	Props  CgroupMode = "props"
 	Soft   CgroupMode = "soft"
 	Full   CgroupMode = "full"
 	Strict CgroupMode = "strict"
@@ -477,6 +481,9 @@ func (o *CheckpointOpts) args() (out []string) {
 	}
 	if o.AllowOpenTCP {
 		out = append(out, "--tcp-established")
+	}
+	if o.TcpClose {
+		out = append(out, "--tcp-close")
 	}
 	if o.AllowExternalUnixSockets {
 		out = append(out, "--ext-unix-sk")

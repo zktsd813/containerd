@@ -97,6 +97,86 @@ func TestDecodeRejectsChecksumMismatch(t *testing.T) {
 	}
 }
 
+func TestDeriveDedupPublicationPreservesCheckpointIdentity(t *testing.T) {
+	createdAt := time.Date(2026, 6, 20, 4, 5, 6, 7, time.UTC)
+	base := Publication{
+		ArtifactID:        "ckpt-a",
+		CheckpointID:      "ckpt-a",
+		State:             "COMMITTED",
+		CheckpointPhase:   "post-first-run",
+		Fingerprint:       "fp-a",
+		SnapshotStartMode: "restore",
+		Shards: []Shard{{
+			ShardID:        "dax0.0",
+			DaxDevice:      "/dev/dax0.0",
+			DaxStartPage:   16,
+			DaxLengthPages: 32,
+		}},
+	}
+	dedup := []RestoreExtent{{
+		Vaddr:      0x400000,
+		NrPages:    2,
+		Pgoff:      128,
+		ShardIndex: 0,
+	}}
+
+	derived := DeriveDedupPublication(base, dedup, Stats{}, createdAt)
+	if derived.CheckpointID != base.CheckpointID {
+		t.Fatalf("checkpoint identity changed: %#v", derived)
+	}
+	if derived.ArtifactID == base.ArtifactID || derived.ArtifactID == "" {
+		t.Fatalf("expected unique derived artifact id, got %q", derived.ArtifactID)
+	}
+	if derived.CheckpointPhase != DedupRestoreCOWPhase {
+		t.Fatalf("unexpected checkpoint phase %q", derived.CheckpointPhase)
+	}
+	if len(derived.DedupDelta) != 1 || derived.DedupDelta[0].Pgoff != 128 {
+		t.Fatalf("unexpected dedup delta: %#v", derived.DedupDelta)
+	}
+	if len(derived.BaseRestoreMap) != 1 || derived.BaseRestoreMap[0].Pgoff != 128 {
+		t.Fatalf("expected materialized restore map, got %#v", derived.BaseRestoreMap)
+	}
+	if derived.Stats.DedupDeltaCount != 1 || derived.Stats.DedupAppliedCount != 1 {
+		t.Fatalf("unexpected derived stats: %#v", derived.Stats)
+	}
+	if !derived.CreatedAt.Equal(createdAt) {
+		t.Fatalf("unexpected created_at: %s", derived.CreatedAt)
+	}
+}
+
+func TestCoalesceRestoreExtents(t *testing.T) {
+	extents := []RestoreExtent{{
+		Vaddr:      0x402000,
+		NrPages:    1,
+		Pgoff:      130,
+		ShardIndex: 0,
+		Flags:      1,
+	}, {
+		Vaddr:      0x400000,
+		NrPages:    2,
+		Pgoff:      128,
+		ShardIndex: 0,
+		Flags:      1,
+	}, {
+		Vaddr:      0x500000,
+		NrPages:    1,
+		Pgoff:      2048,
+		ShardIndex: 1,
+		Flags:      1,
+	}}
+
+	got := CoalesceRestoreExtents(extents)
+	if len(got) != 2 {
+		t.Fatalf("expected two coalesced extents, got %#v", got)
+	}
+	if got[0].Vaddr != 0x400000 || got[0].NrPages != 3 || got[0].Pgoff != 128 {
+		t.Fatalf("unexpected first extent: %#v", got[0])
+	}
+	if got[1].ShardIndex != 1 || got[1].Pgoff != 2048 {
+		t.Fatalf("unexpected second extent: %#v", got[1])
+	}
+}
+
 func TestNormalizePathReplacesJSONExtension(t *testing.T) {
 	if got := NormalizePath("/tmp/ckpt.json"); got != "/tmp/ckpt"+Extension {
 		t.Fatalf("unexpected normalized path %q", got)

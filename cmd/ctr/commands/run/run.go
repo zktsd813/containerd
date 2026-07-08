@@ -21,6 +21,9 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -30,8 +33,10 @@ import (
 	"github.com/containerd/containerd/cmd/ctr/commands"
 	"github.com/containerd/containerd/cmd/ctr/commands/tasks"
 	"github.com/containerd/containerd/containers"
+	"github.com/containerd/containerd/defaults"
 	clabels "github.com/containerd/containerd/labels"
 	"github.com/containerd/containerd/log"
+	"github.com/containerd/containerd/namespaces"
 	"github.com/containerd/containerd/oci"
 	gocni "github.com/containerd/go-cni"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -88,6 +93,122 @@ func parseMountFlag(m string) (specs.Mount, error) {
 	return mount, nil
 }
 
+func resolveTrenvActionSubpath(root string) (string, error) {
+	clean := filepath.Clean(root)
+	relative := strings.TrimPrefix(clean, string(os.PathSeparator))
+	if relative == "" || relative == "." {
+		return "", fmt.Errorf("invalid action root %q", root)
+	}
+	for _, segment := range strings.Split(relative, string(os.PathSeparator)) {
+		if segment == ".." {
+			return "", fmt.Errorf("invalid action root %q", root)
+		}
+	}
+	return relative, nil
+}
+
+func copyTrenvFile(source, target string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode.Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(target, mode.Perm())
+}
+
+func copyTrenvActionTree(source, target string) error {
+	sourceInfo, err := os.Lstat(source)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(target); err != nil {
+		return err
+	}
+	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		targetPath := target
+		if relative != "." {
+			targetPath = filepath.Join(target, relative)
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+				return err
+			}
+			return os.Symlink(linkTarget, targetPath)
+		}
+		if info.IsDir() {
+			return os.MkdirAll(targetPath, info.Mode().Perm())
+		}
+		if info.Mode().IsRegular() {
+			return copyTrenvFile(path, targetPath, info.Mode())
+		}
+		if path == source && !sourceInfo.IsDir() {
+			return copyTrenvFile(path, targetPath, info.Mode())
+		}
+		return nil
+	})
+}
+
+func stageTrenvActionRoots(ctx gocontext.Context, id, sourceRootfs string, rebinds []string) error {
+	sourceRootfs = strings.TrimSpace(sourceRootfs)
+	if sourceRootfs == "" || len(rebinds) == 0 {
+		return nil
+	}
+	namespaceValue, ok := namespaces.Namespace(ctx)
+	if !ok || strings.TrimSpace(namespaceValue) == "" {
+		namespaceValue = "default"
+	}
+	targetRootfs := filepath.Join(defaults.DefaultStateDir, "io.containerd.runtime.v2.task", namespaceValue, id, "rootfs")
+	for _, rebind := range rebinds {
+		sourceRoot, targetRoot, ok := strings.Cut(strings.TrimSpace(rebind), ":")
+		if !ok {
+			return fmt.Errorf("invalid TrEnv action rebind %q", rebind)
+		}
+		sourceRelative, err := resolveTrenvActionSubpath(sourceRoot)
+		if err != nil {
+			return err
+		}
+		targetRelative, err := resolveTrenvActionSubpath(targetRoot)
+		if err != nil {
+			return err
+		}
+		sourcePath := filepath.Join(sourceRootfs, sourceRelative)
+		targetPath := filepath.Join(targetRootfs, targetRelative)
+		if err := copyTrenvActionTree(sourcePath, targetPath); err != nil {
+			return fmt.Errorf("stage TrEnv action root %q -> %q: %w", sourcePath, targetPath, err)
+		}
+	}
+	return nil
+}
+
 // Command runs a container
 var Command = cli.Command{
 	Name:           "run",
@@ -126,6 +247,18 @@ var Command = cli.Command{
 		cli.BoolFlag{
 			Name:  "cni",
 			Usage: "enable cni networking for the container",
+		},
+		cli.StringFlag{
+			Name:  "restore-image-path",
+			Usage: "restore task state from a local CRIU image directory",
+		},
+		cli.StringFlag{
+			Name:  "trenv-action-source-rootfs",
+			Usage: "TrEnv restore-only exported source rootfs used to stage packaged action files",
+		},
+		cli.StringSliceFlag{
+			Name:  "trenv-action-rebind",
+			Usage: "TrEnv restore-only packaged action source:target root to stage before task start",
 		},
 	}, append(platformRunFlags,
 		append(append(commands.SnapshotterFlags, []cli.Flag{commands.SnapshotterLabels}...),
@@ -197,6 +330,11 @@ var Command = cli.Command{
 		if err != nil {
 			return err
 		}
+		if context.String("restore-image-path") != "" {
+			if err := stageTrenvActionRoots(ctx, id, context.String("trenv-action-source-rootfs"), context.StringSlice("trenv-action-rebind")); err != nil {
+				return err
+			}
+		}
 
 		var statusC <-chan containerd.ExitStatus
 		if !detach {
@@ -213,12 +351,14 @@ var Command = cli.Command{
 				return err
 			}
 		}
-		if context.IsSet("pid-file") {
-			if err := commands.WritePidFile(context.String("pid-file"), int(task.Pid())); err != nil {
-				return err
+		restoreTask := context.String("restore-image-path") != ""
+		writePidFile := func() error {
+			if context.IsSet("pid-file") {
+				return commands.WritePidFile(context.String("pid-file"), int(task.Pid()))
 			}
+			return nil
 		}
-		if enableCNI {
+		setupCNI := func() error {
 			netNsPath, err := getNetNSPath(ctx, task)
 			if err != nil {
 				return err
@@ -227,9 +367,30 @@ var Command = cli.Command{
 			if _, err := network.Setup(ctx, commands.FullID(ctx, container), netNsPath); err != nil {
 				return err
 			}
+			return nil
+		}
+		if !restoreTask {
+			if err := writePidFile(); err != nil {
+				return err
+			}
+			if enableCNI {
+				if err := setupCNI(); err != nil {
+					return err
+				}
+			}
 		}
 		if err := task.Start(ctx); err != nil {
 			return err
+		}
+		if restoreTask {
+			if err := writePidFile(); err != nil {
+				return err
+			}
+			if enableCNI {
+				if err := setupCNI(); err != nil {
+					return err
+				}
+			}
 		}
 
 		latency := float64(time.Since(start).Microseconds()) / 1000.0

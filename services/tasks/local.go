@@ -271,6 +271,9 @@ func (l *local) Switch(ctx context.Context, r *api.SwitchTaskRequest, _ ...grpc.
 		return nil, errdefs.ToGRPC(err)
 	}
 	t, err := l.getTaskFromContainer(ctx, container)
+	if err != nil {
+		return nil, errdefs.ToGRPC(err)
+	}
 	checkpointPath, err := getRestorePath(container.Runtime.Name, r.Options)
 	if err != nil {
 		return nil, err
@@ -279,6 +282,10 @@ func (l *local) Switch(ctx context.Context, r *api.SwitchTaskRequest, _ ...grpc.
 		return nil, errors.New("Checkpoint is empty")
 	}
 	logEntry = logEntry.WithField("checkpoint_path", checkpointPath)
+	// The local task service is only a runtime primitive: it resolves the
+	// checkpoint path from runtime options and asks the existing task to switch.
+	// OpenWhisk action identity and action-root rebinding are handled above by
+	// trenvd/switchtask.
 	// if r.RuntimePath != "" {
 	// 	opts.Runtime = r.RuntimePath
 	// }
@@ -302,9 +309,10 @@ func (l *local) Switch(ctx context.Context, r *api.SwitchTaskRequest, _ ...grpc.
 		return nil, fmt.Errorf("failed to Switch from %s: %w", checkpointPath, err)
 	}
 
-	pid, err := t.PID(ctx)
+	pid, err := safeTaskPID(ctx, t)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get task pid: %w", err)
+		logEntry.WithError(err).Warn("switch completed but task PID lookup failed")
+		pid = 0
 	}
 
 	log.G(ctx).WithField("pid", pid).WithField("elapsed", time.Since(start)).Debugf("Switch finish for container %s", r.ContainerID)
@@ -313,6 +321,15 @@ func (l *local) Switch(ctx context.Context, r *api.SwitchTaskRequest, _ ...grpc.
 		ContainerID: r.ContainerID,
 		Pid:         pid,
 	}, nil
+}
+
+func safeTaskPID(ctx context.Context, t runtime.Task) (pid uint32, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("task PID lookup panic: %v", r)
+		}
+	}()
+	return t.PID(ctx)
 }
 
 func (l *local) TakeOver(ctx context.Context, r *api.TakeOverTaskRequest, _ ...grpc.CallOption) (*api.TakeOverTaskResponse, error) {

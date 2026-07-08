@@ -405,6 +405,9 @@ func getNewTaskOpts(context *cli.Context) []containerd.NewTaskOpts {
 	if context.Bool("no-pivot") {
 		tOpts = append(tOpts, containerd.WithNoPivotRoot)
 	}
+	if restoreImagePath := context.String("restore-image-path"); restoreImagePath != "" {
+		tOpts = append(tOpts, containerd.WithRestoreImagePath(restoreImagePath))
+	}
 	if uidmap := context.String("uidmap"); uidmap != "" {
 		uidMap, err := parseIDMapping(uidmap)
 		if err != nil {

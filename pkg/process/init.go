@@ -209,6 +209,19 @@ func (p *Init) Switch(ctx context.Context, r *SwitchConfig) error {
 		CheckpointOpts: runc.CheckpointOpts{
 			ImagePath: r.Checkpoint,
 			WorkDir:   p.CriuWorkPath,
+			// OpenWhisk action containers keep the runtime API socket open, so
+			// switch restore needs the same TCP allowance as checkpoint creation.
+			AllowOpenTCP: true,
+			// The target container receives a fresh OpenWhisk bridge address, so
+			// the writer's established runtime API socket cannot be rebound.
+			TcpClose: true,
+			// Post-first-run Java checkpoints can legitimately include file locks.
+			// Keep restore semantics aligned with the checkpoint helper.
+			FileLocks: true,
+			// Start with the same minimal cgroup semantic that already works in
+			// the direct CRIU switch harness. If this clears the blocker, we can
+			// port faasd's PROPS + cgroup-fd path next.
+			Cgroups: runc.Ignore,
 		},
 		OriginalPid: p.Pid(),
 		PidFile:     pidFile.Path(),
@@ -317,6 +330,7 @@ func (p *Init) createCheckpointedState(r *CreateConfig, pidFile *pidFile) error 
 			WorkDir:    p.CriuWorkPath,
 			ParentPath: r.ParentCheckpoint,
 			LazyPages:  p.CriuLazyPages,
+			FileLocks:  true,
 		},
 		PidFile:     pidFile.Path(),
 		NoPivot:     p.NoPivotRoot,

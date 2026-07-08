@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -18,184 +19,83 @@ import (
 	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/trenvpub"
 )
 
-func TestRunCommandDispatchesLegacyCheckpointRequest(t *testing.T) {
-	resp := runCommand(daemonRequest{
-		Command:       []string{"/usr/local/bin/trenv-checkpoint-task"},
-		TimeoutMillis: 1500,
-	})
-
-	if resp.Ok {
-		t.Fatalf("expected checkpoint request to fail on helper usage validation")
-	}
-	if resp.ExitCode != 2 {
-		t.Fatalf("expected helper usage exit code 2, got %d", resp.ExitCode)
-	}
-	if !strings.Contains(resp.Stderr, "image path must be provided") {
-		t.Fatalf("expected checkpoint helper stderr, got %q", resp.Stderr)
-	}
-}
-
-func TestRunCommandDispatchesExplicitSwitchRequest(t *testing.T) {
-	resp := runCommand(daemonRequest{
-		Operation:     "switch",
-		Command:       []string{"/usr/local/bin/trenv-switch-task"},
-		TimeoutMillis: 1500,
-	})
-
-	if resp.Ok {
-		t.Fatalf("expected switch request to fail on helper usage validation")
-	}
-	if resp.ExitCode != 2 {
-		t.Fatalf("expected helper usage exit code 2, got %d", resp.ExitCode)
-	}
-	if !strings.Contains(resp.Stderr, "checkpoint path must be provided") {
-		t.Fatalf("expected switch helper stderr, got %q", resp.Stderr)
-	}
-}
-
-func TestRunCommandRejectsHelperAsExternalExec(t *testing.T) {
-	resp := runCommand(daemonRequest{
-		Operation:     "exec",
-		Command:       []string{"/usr/local/bin/trenv-switch-task"},
-		TimeoutMillis: 1500,
-	})
-
-	if resp.Ok {
-		t.Fatalf("expected external helper exec to be rejected")
-	}
-	if !strings.Contains(resp.Error, "not allowed") {
-		t.Fatalf("expected not-allowed error, got %q", resp.Error)
-	}
-}
-
-func TestStructuredCheckpointRequestBuildsHelperArgs(t *testing.T) {
-	got := checkpointArgs(checkpointRequest{
-		Address:            "/run/containerd/containerd.sock",
-		Namespace:          "openwhisk",
-		ImagePath:          "/tmp/image",
-		WorkPath:           "/tmp/work",
-		MetadataBundlePath: "/tmp/work/metadata-bundle",
-		ActionExportRoots:  []string{"/home/app"},
-		Publication: &checkpointPublicationRequest{
-			PublicationPath:            "/tmp/checkpoints/publication/ckpt.json",
-			RuntimeKind:                "nodejs:20",
-			RuntimeFamily:              "nodejs",
-			ActionNamespace:            "guest",
-			ActionName:                 "/guest/hello",
-			ActionRevision:             "rev-1",
-			CheckpointPhase:            "post-first-run",
-			Fingerprint:                "fp-1",
-			SnapshotStartMode:          "switch",
-			CheckpointActionExportRoot: "/tmp/work/action-root",
+func TestPublicationRecordBinaryRoundTripPreservesDedupDelta(t *testing.T) {
+	pub := trenvpub.Publication{
+		ArtifactID:        "ckpt-a-dedup",
+		CheckpointID:      "ckpt-a",
+		State:             "COMMITTED",
+		Fingerprint:       "fp-a",
+		SnapshotStartMode: "restore",
+		Shards: []trenvpub.Shard{{
+			ShardID:        "base",
+			DaxDevice:      "/dev/dax0.0",
+			DaxStartPage:   100,
+			DaxLengthPages: 50,
+		}, {
+			ShardID:        "canon",
+			DaxDevice:      "/dev/dax1.0",
+			DaxStartPage:   900,
+			DaxLengthPages: 50,
+		}},
+		DedupDelta: []trenvpub.RestoreExtent{{
+			Vaddr:      0x400000,
+			NrPages:    2,
+			Pgoff:      904,
+			ShardIndex: 1,
+		}},
+		Stats: trenvpub.Stats{
+			DedupDeltaCount:   1,
+			DedupAppliedCount: 1,
 		},
-		ContainerID: "source",
-	}, 2500, checkpointWriterPlacement{
-		DaxDevice:       "/dev/dax0.0",
-		WriterID:        "writer0",
-		ShardID:         "dax0.0",
-		WriterStateRoot: "/tmp/openwhisk-trenv/writers",
-	})
-	want := []string{
-		"--timeout", "2500ms",
-		"--address", "/run/containerd/containerd.sock",
-		"--namespace", "openwhisk",
-		"--image-path", "/tmp/image",
-		"--work-path", "/tmp/work",
-		"--metadata-bundle-path", "/tmp/work/metadata-bundle",
-		"--dax-device", "/dev/dax0.0",
-		"--shard-id", "dax0.0",
-		"--writer-id", "writer0",
-		"--writer-state-root", "/tmp/openwhisk-trenv/writers",
-		"--publication-path", "/tmp/checkpoints/publication/ckpt.json",
-		"--runtime-kind", "nodejs:20",
-		"--runtime-family", "nodejs",
-		"--action-namespace", "guest",
-		"--action-name", "/guest/hello",
-		"--action-revision", "rev-1",
-		"--checkpoint-phase", "post-first-run",
-		"--fingerprint", "fp-1",
-		"--snapshot-start-mode", "switch",
-		"--checkpoint-action-export-root", "/tmp/work/action-root",
-		"--action-export-root", "/home/app",
-		"source",
+		CreatedAt: time.Unix(0, 1).UTC(),
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("unexpected args:\nwant: %#v\n got: %#v", want, got)
+
+	record := publicationRecordFromBinary(pub)
+	got := publicationRecordToBinary(record)
+	if got.CheckpointID != "ckpt-a" || got.ArtifactID != "ckpt-a-dedup" {
+		t.Fatalf("unexpected identity after round trip: %#v", got)
+	}
+	if len(got.Shards) != 2 || got.Shards[1].ShardID != "canon" {
+		t.Fatalf("dedup shards were not preserved: %#v", got.Shards)
+	}
+	if len(got.DedupDelta) != 1 || got.DedupDelta[0].Pgoff != 904 || got.DedupDelta[0].ShardIndex != 1 {
+		t.Fatalf("dedup delta was not preserved: %#v", got.DedupDelta)
+	}
+	if got.Stats.DedupDeltaCount != 1 || got.Stats.DedupAppliedCount != 1 {
+		t.Fatalf("dedup stats were not preserved: %#v", got.Stats)
 	}
 }
 
-func TestStructuredCheckpointRequestOmitsEmptyPublicationArgs(t *testing.T) {
-	got := checkpointArgs(checkpointRequest{
-		Address:            "/run/containerd/containerd.sock",
-		Namespace:          "openwhisk",
-		ImagePath:          "/tmp/image",
-		WorkPath:           "/tmp/work",
-		MetadataBundlePath: "/tmp/work/metadata-bundle",
-		Publication:        &checkpointPublicationRequest{},
-		ContainerID:        "source",
-	}, 0, checkpointWriterPlacement{
-		DaxDevice:       "/dev/dax0.0",
-		WriterID:        "writer0",
-		ShardID:         "dax0.0",
-		WriterStateRoot: "/tmp/openwhisk-trenv/writers",
+func TestRunCommandAnnotatesOperationTiming(t *testing.T) {
+	resp := runCommand(daemonRequest{
+		Operation: "unknown-operation",
 	})
 
-	for _, forbidden := range []string{"--publication-path", "--runtime-kind", "--runtime-family", "--action-namespace", "--action-name", "--action-revision", "--checkpoint-phase", "--fingerprint", "--snapshot-start-mode", "--checkpoint-action-export-root"} {
-		for _, arg := range got {
-			if arg == forbidden {
-				t.Fatalf("did not expect empty publication arg %s in %#v", forbidden, got)
-			}
-		}
+	if resp.Operation != "unknown-operation" {
+		t.Fatalf("expected response operation annotation, got %q", resp.Operation)
+	}
+	if resp.DurationMicros < 0 {
+		t.Fatalf("expected non-negative duration, got %d", resp.DurationMicros)
 	}
 }
 
-func TestStructuredCheckpointRequestDoesNotPreallocateDaxOffset(t *testing.T) {
-	got := checkpointArgs(checkpointRequest{
-		Address:            "/run/containerd/containerd.sock",
-		Namespace:          "openwhisk",
-		ImagePath:          "/tmp/image",
-		WorkPath:           "/tmp/work",
-		MetadataBundlePath: "/tmp/work/metadata-bundle",
-		ContainerID:        "source",
-	}, 0, checkpointWriterPlacement{
-		DaxDevice:       "/dev/dax0.0",
-		WriterID:        "writer0",
-		ShardID:         "dax0.0",
-		WriterStateRoot: "/tmp/openwhisk-trenv/writers",
-	})
-
-	for _, arg := range got {
-		if arg == "--dax-pgoff" {
-			t.Fatalf("trenvd must not preallocate dax pgoff before checkpoint succeeds: %#v", got)
-		}
+func TestRunCommandRejectsRemovedExecOperation(t *testing.T) {
+	resp := runCommand(daemonRequest{Operation: "exec"})
+	if resp.Ok {
+		t.Fatal("expected removed exec operation to fail")
+	}
+	if !strings.Contains(resp.Error, "unsupported operation") {
+		t.Fatalf("expected unsupported operation error, got %q", resp.Error)
 	}
 }
 
-func TestStructuredCheckpointRequestBuildsMultiDaxArgs(t *testing.T) {
-	got := checkpointArgs(checkpointRequest{
-		Address:            "/run/containerd/containerd.sock",
-		Namespace:          "openwhisk",
-		ImagePath:          "/tmp/image",
-		WorkPath:           "/tmp/work",
-		MetadataBundlePath: "/tmp/work/metadata-bundle",
-		ContainerID:        "source",
-	}, 0, checkpointWriterPlacement{
-		WriterID: "writer0",
-		DaxShards: []daxShardConfig{
-			{ShardID: "dax7.0", DaxDevice: "/dev/dax7.0"},
-			{ShardID: "dax8.0", DaxDevice: "/dev/dax8.0"},
-		},
-		DaxPlacementPolicy: "round-robin",
-		WriterStateRoot:    "/tmp/openwhisk-trenv/writers",
-	})
-
-	for _, want := range []string{"--dax-shard", "dax7.0=/dev/dax7.0", "dax8.0=/dev/dax8.0", "--dax-placement-policy", "round-robin"} {
-		if !containsArg(got, want) {
-			t.Fatalf("expected %q in args: %#v", want, got)
-		}
+func TestRunCommandRejectsRemovedLegacySwitchOperation(t *testing.T) {
+	resp := runCommand(daemonRequest{Operation: "switch"})
+	if resp.Ok {
+		t.Fatal("expected removed switch operation to fail")
 	}
-	if containsArg(got, "--dax-device") || containsArg(got, "--shard-id") {
-		t.Fatalf("multi-DAX args should not include legacy single-DAX flags: %#v", got)
+	if !strings.Contains(resp.Error, "unsupported operation") {
+		t.Fatalf("expected unsupported operation error, got %q", resp.Error)
 	}
 }
 
@@ -216,152 +116,18 @@ func TestParseDaxShardConfigList(t *testing.T) {
 	}
 }
 
-func TestStructuredSwitchRequestBuildsHelperArgs(t *testing.T) {
-	got := switchArgs(switchRequest{
-		Address:             "/run/containerd/containerd.sock",
-		Namespace:           "openwhisk",
-		CheckpointPath:      "/tmp/image",
-		SourceContainer:     "source",
-		ActionSourceRootfs:  "/tmp/action-root",
-		ShellID:             "node-shell",
-		CompatibilityClass:  "nodejs",
-		ActiveRuntimeKind:   "nodejs:20_hybrid",
-		ActiveRuntimeFamily: "nodejs",
-		StableActionRoot:    "/home/app",
-		ActionRebinds:       []actionRebind{{SourceRoot: "/home/app", TargetRoot: "/home/app"}},
-		NullIO:              true,
-		PidFile:             "/tmp/pid",
-		ContainerID:         "candidate",
-	}, 2500)
-	want := []string{
-		"--timeout", "2500ms",
-		"--address", "/run/containerd/containerd.sock",
-		"--namespace", "openwhisk",
-		"--checkpoint-path", "/tmp/image",
-		"--null-io",
-		"--pid-file", "/tmp/pid",
-		"--shell-id", "node-shell",
-		"--compatibility-class", "nodejs",
-		"--active-runtime-kind", "nodejs:20_hybrid",
-		"--active-runtime-family", "nodejs",
-		"--stable-action-root", "/home/app",
-		"--action-source-rootfs", "/tmp/action-root",
-		"--source-container", "source",
-		"--action-rebind", "/home/app:/home/app",
-		"candidate",
-	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("unexpected args:\nwant: %#v\n got: %#v", want, got)
-	}
-}
-
-func TestSwitchRequestWithRuntimeConfigUsesReaderDaxShardMap(t *testing.T) {
-	req := switchRequest{
-		Address:        "/run/containerd/containerd.sock",
-		Namespace:      "openwhisk",
-		CheckpointPath: "/tmp/image",
-		ContainerID:    "candidate",
-	}
-	withConfig := switchRequestWithRuntimeConfig(req, daemonConfig{
-		DaxDevice: "/dev/dax-legacy",
-		ReaderDaxShards: []daxShardConfig{
-			{ShardID: "dax7.0", DaxDevice: "/dev/dax7.0"},
-		},
-	})
-	got := switchArgs(withConfig, 0)
-	if !containsArg(got, "--reader-dax-shard") || !containsArg(got, "dax7.0=/dev/dax7.0") {
-		t.Fatalf("expected reader DAX shard mapping in args: %#v", got)
-	}
-	if containsArg(got, "--dax-device") || containsArg(got, "/dev/dax-legacy") {
-		t.Fatalf("reader shard mapping should prevent legacy override injection: %#v", got)
-	}
-}
-
-func TestStructuredSwitchPhaseArgsSplitPrepareAndRestore(t *testing.T) {
-	req := switchRequest{
-		Address:        "/run/containerd/containerd.sock",
-		Namespace:      "openwhisk",
-		CheckpointPath: "/tmp/image",
-		ActionRebinds:  []actionRebind{{SourceRoot: "/home/app", TargetRoot: "/home/app"}},
-		ContainerID:    "candidate",
-	}
-
-	prepare := switchArgsForPhase(req, 0, true, false)
-	if !containsArg(prepare, "--prepare-only") {
-		t.Fatalf("prepare args should include --prepare-only: %#v", prepare)
-	}
-	if containsArg(prepare, "--skip-action-rebind") {
-		t.Fatalf("prepare args should not skip action rebind: %#v", prepare)
-	}
-
-	restore := switchArgsForPhase(req, 0, false, true)
-	if !containsArg(restore, "--skip-action-rebind") {
-		t.Fatalf("restore args should include --skip-action-rebind: %#v", restore)
-	}
-	if containsArg(restore, "--prepare-only") {
-		t.Fatalf("restore args should not include --prepare-only: %#v", restore)
-	}
-}
-
-func containsArg(args []string, want string) bool {
-	for _, arg := range args {
-		if arg == want {
-			return true
-		}
-	}
-	return false
-}
-
-func TestIntegratedTaskArgsInjectsDaemonTimeout(t *testing.T) {
-	got := integratedTaskArgs([]string{"--checkpoint-path", "/tmp/image", "candidate"}, 2500)
-	want := []string{"--timeout", "2500ms", "--checkpoint-path", "/tmp/image", "candidate"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("unexpected args:\nwant: %#v\n got: %#v", want, got)
-	}
-}
-
-func TestIntegratedTaskArgsKeepsExplicitTimeout(t *testing.T) {
-	args := []string{"--timeout", "7s", "--checkpoint-path", "/tmp/image", "candidate"}
-	got := integratedTaskArgs(args, 2500)
-	if !reflect.DeepEqual(got, args) {
-		t.Fatalf("unexpected args:\nwant: %#v\n got: %#v", args, got)
-	}
-
-	args = []string{"--timeout=7s", "--checkpoint-path", "/tmp/image", "candidate"}
-	got = integratedTaskArgs(args, 2500)
-	if !reflect.DeepEqual(got, args) {
-		t.Fatalf("unexpected args:\nwant: %#v\n got: %#v", args, got)
-	}
-}
-
-func TestDefaultWriterStateRootUsesOpenWhiskRoot(t *testing.T) {
-	got := defaultWriterStateRoot("/tmp/openwhisk-trenv/checkpoints/unit-abcd/image")
-	want := "/tmp/openwhisk-trenv/writers"
-	if got != want {
-		t.Fatalf("unexpected default writer state root: want %q, got %q", want, got)
-	}
-}
-
-func TestResolveCheckpointWriterPlacementRejectsDisabledWriter(t *testing.T) {
-	_, err := resolveCheckpointWriterPlacement(checkpointRequest{
-		ImagePath: "/tmp/openwhisk-trenv/checkpoints/unit-abcd/image",
-	}, daemonConfig{CheckpointWriterDisabled: true})
-	if err == nil {
-		t.Fatal("expected disabled checkpoint writer to be rejected")
-	}
-	if !strings.Contains(err.Error(), "disabled") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func writeTestPublication(t *testing.T, workDir, checkpointID, fingerprint, createdAt string) metadataPublicationRecord {
 	t.Helper()
 	bundlePath := filepath.Join(workDir, "checkpoints", checkpointID, "work", "metadata-bundle")
 	imagePath := filepath.Join(bundlePath, "image")
+	checkpointPath := filepath.Join(workDir, "checkpoints", checkpointID, "image")
 	actionRoot := filepath.Join(workDir, "checkpoints", checkpointID, "work", "action-root")
 	publicationPath := filepath.Join(workDir, "checkpoints", "publication", checkpointID+".json")
 	if err := os.MkdirAll(imagePath, 0o755); err != nil {
 		t.Fatalf("mkdir image: %v", err)
+	}
+	if err := os.MkdirAll(checkpointPath, 0o755); err != nil {
+		t.Fatalf("mkdir checkpoint path: %v", err)
 	}
 	if err := os.MkdirAll(actionRoot, 0o755); err != nil {
 		t.Fatalf("mkdir action root: %v", err)
@@ -371,6 +137,9 @@ func writeTestPublication(t *testing.T, workDir, checkpointID, fingerprint, crea
 	}
 	if err := os.WriteFile(filepath.Join(imagePath, "inventory.img"), []byte("inventory\n"), 0o644); err != nil {
 		t.Fatalf("write inventory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(checkpointPath, "pages-1.img"), []byte("pages\n"), 0o644); err != nil {
+		t.Fatalf("write checkpoint pages: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(bundlePath, "placement.json"), []byte(`{"checkpoint_id":"`+checkpointID+`","state":"COMMITTED"}`+"\n"), 0o644); err != nil {
 		t.Fatalf("write placement: %v", err)
@@ -408,7 +177,7 @@ func writeTestPublication(t *testing.T, workDir, checkpointID, fingerprint, crea
 		SnapshotStartMode:          "restore",
 		RuntimeKind:                "nodejs:20_hybrid",
 		RuntimeFamily:              "nodejs",
-		CheckpointPath:             filepath.Join(workDir, "checkpoints", checkpointID, "image"),
+		CheckpointPath:             checkpointPath,
 		MetadataBundlePath:         bundlePath,
 		PlacementPath:              filepath.Join(bundlePath, "placement.json"),
 		CheckpointActionExportRoot: actionRoot,
@@ -447,6 +216,152 @@ func TestListCommittedPublicationsFiltersByFingerprint(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].CheckpointID != "ckpt-a" {
 		t.Fatalf("unexpected publications: %#v", got)
+	}
+}
+
+func TestPublicationPreferencePrefersDedupOverNewerBase(t *testing.T) {
+	base := metadataPublicationRecord{
+		ArtifactID:   "ckpt-a",
+		CheckpointID: "ckpt-a",
+		State:        "COMMITTED",
+		CreatedAt:    time.Date(2026, 5, 18, 0, 1, 0, 0, time.UTC),
+	}
+	dedup := metadataPublicationRecord{
+		ArtifactID:      "ckpt-a-dedup",
+		CheckpointID:    "ckpt-a",
+		State:           "COMMITTED",
+		CheckpointPhase: trenvpub.DedupRestoreCOWPhase,
+		Stats:           trenvpub.Stats{DedupDeltaCount: 1, DedupAppliedCount: 4},
+		CreatedAt:       time.Date(2026, 5, 18, 0, 0, 0, 0, time.UTC),
+	}
+	publications := []metadataPublicationRecord{base, dedup}
+	sort.Slice(publications, func(i, j int) bool {
+		return publicationLess(publications[i], publications[j])
+	})
+	if publications[len(publications)-1].ArtifactID != "ckpt-a-dedup" {
+		t.Fatalf("dedup publication should win over newer base: %#v", publications)
+	}
+}
+
+func TestFindPublicationByCheckpointIDPrefersDerivedDedupPublication(t *testing.T) {
+	workDir := t.TempDir()
+	config := daemonConfig{WorkingDirectory: workDir}
+	base := writeTestPublication(t, workDir, "ckpt-a", "fp-a", "2026-05-18T00:01:00Z")
+	baseBinaryPath := filepath.Join(workDir, "checkpoints", "publication", "ckpt-a"+trenvpub.Extension)
+	if err := trenvpub.WriteFileNoReplace(baseBinaryPath, publicationRecordToBinary(base)); err != nil {
+		t.Fatalf("write base binary publication: %v", err)
+	}
+	dedup := base
+	dedup.ArtifactID = "ckpt-a-dedup"
+	dedup.CheckpointPhase = trenvpub.DedupRestoreCOWPhase
+	dedup.DedupDelta = []trenvpub.RestoreExtent{{Vaddr: 0x400000, NrPages: 1, Pgoff: 64}}
+	dedup.Stats = trenvpub.Stats{DedupDeltaCount: 1, DedupAppliedCount: 1}
+	dedup.CreatedAt = base.CreatedAt.Add(-time.Minute)
+	dedupPath := filepath.Join(workDir, "checkpoints", "publication", "ckpt-a.dedup"+trenvpub.Extension)
+	if err := trenvpub.WriteFileNoReplace(dedupPath, publicationRecordToBinary(dedup)); err != nil {
+		t.Fatalf("write derived binary publication: %v", err)
+	}
+
+	got, err := findPublicationByCheckpointID(config, "ckpt-a")
+	if err != nil {
+		t.Fatalf("find publication: %v", err)
+	}
+	if got.ArtifactID != "ckpt-a-dedup" || got.PublicationPath != dedupPath {
+		t.Fatalf("expected derived dedup publication, got %#v", got)
+	}
+}
+
+func TestListDedupCandidatesSkipsCheckpointWithExistingDerivedPublication(t *testing.T) {
+	workDir := t.TempDir()
+	config := normalizeDedupConfig(daemonConfig{WorkingDirectory: workDir})
+	base := writeTestPublication(t, workDir, "ckpt-a", "fp-a", "2026-05-18T00:01:00Z")
+	baseBinaryPath := filepath.Join(workDir, "checkpoints", "publication", "ckpt-a"+trenvpub.Extension)
+	if err := trenvpub.WriteFileNoReplace(baseBinaryPath, publicationRecordToBinary(base)); err != nil {
+		t.Fatalf("write base binary publication: %v", err)
+	}
+	candidates, err := listDedupCandidates(config)
+	if err != nil {
+		t.Fatalf("list candidates: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].CheckpointID != "ckpt-a" {
+		t.Fatalf("expected base candidate before derived publication, got %#v", candidates)
+	}
+
+	dedup := base
+	dedup.ArtifactID = "ckpt-a-dedup"
+	dedup.CheckpointPhase = trenvpub.DedupRestoreCOWPhase
+	dedup.DedupDelta = []trenvpub.RestoreExtent{{Vaddr: 0x400000, NrPages: 1, Pgoff: 64}}
+	dedup.Stats = trenvpub.Stats{DedupDeltaCount: 1, DedupAppliedCount: 1}
+	dedup.CreatedAt = base.CreatedAt.Add(time.Minute)
+	dedupPath := filepath.Join(workDir, "checkpoints", "publication", "ckpt-a.dedup"+trenvpub.Extension)
+	if err := trenvpub.WriteFileNoReplace(dedupPath, publicationRecordToBinary(dedup)); err != nil {
+		t.Fatalf("write derived binary publication: %v", err)
+	}
+
+	candidates, err = listDedupCandidates(config)
+	if err != nil {
+		t.Fatalf("list candidates after derived publication: %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("expected checkpoint with derived publication to be skipped, got %#v", candidates)
+	}
+}
+
+func TestRunDedupPublicationPassesDaxDeviceToLedger(t *testing.T) {
+	workDir := t.TempDir()
+	logPath := filepath.Join(workDir, "dedup-args.log")
+	dedupdPath := filepath.Join(workDir, "fake-dedupd")
+	pubPath := filepath.Join(workDir, "fake-trenv-dedup-pub")
+	fakeDedupd := "#!/bin/sh\n" +
+		"echo dedupd \"$@\" >> \"$TRENV_TEST_ARG_LOG\"\n" +
+		"if [ \"$1\" = checkpoint-ledger ]; then\n" +
+		"  while [ $# -gt 0 ]; do if [ \"$1\" = --output ]; then shift; touch \"$1\"; break; fi; shift; done\n" +
+		"  echo '{\"mode\":\"checkpoint-candidate-ledger\"}'\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"if [ \"$1\" = checkpoint-apply-plan ]; then echo '{\"mode\":\"checkpoint-apply-plan\",\"page_size\":4096,\"items\":[]}'; exit 0; fi\n" +
+		"exit 1\n"
+	fakePub := "#!/bin/sh\n" +
+		"echo trenv-dedup-pub \"$@\" >> \"$TRENV_TEST_ARG_LOG\"\n" +
+		"exit 0\n"
+	if err := os.WriteFile(dedupdPath, []byte(fakeDedupd), 0o755); err != nil {
+		t.Fatalf("write fake dedupd: %v", err)
+	}
+	if err := os.WriteFile(pubPath, []byte(fakePub), 0o755); err != nil {
+		t.Fatalf("write fake trenv-dedup-pub: %v", err)
+	}
+	t.Setenv("TRENV_TEST_ARG_LOG", logPath)
+
+	checkpointPath := filepath.Join(workDir, "checkpoints", "ckpt-a", "image")
+	if err := os.MkdirAll(checkpointPath, 0o755); err != nil {
+		t.Fatalf("mkdir checkpoint: %v", err)
+	}
+	config := normalizeDedupConfig(daemonConfig{
+		WorkingDirectory:       workDir,
+		DedupDedupdBinary:      dedupdPath,
+		DedupPublicationBinary: pubPath,
+		DedupExecution:         "cpu",
+		DedupOutputDirectory:   filepath.Join(workDir, "dedup"),
+		DedupMinPages:          1,
+	})
+	publication := metadataPublicationRecord{
+		ArtifactID:      "ckpt-a",
+		CheckpointID:    "ckpt-a",
+		State:           "COMMITTED",
+		CheckpointPath:  checkpointPath,
+		PublicationPath: filepath.Join(workDir, "checkpoints", "publication", "ckpt-a"+trenvpub.Extension),
+		DaxDevice:       "/dev/dax0.0",
+	}
+	if err := runDedupPublication(context.Background(), config, publication, "unit-test"); err != nil {
+		t.Fatalf("runDedupPublication: %v", err)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read arg log: %v", err)
+	}
+	if !strings.Contains(string(data), "checkpoint-ledger") ||
+		!strings.Contains(string(data), "--dax-device /dev/dax0.0") {
+		t.Fatalf("expected ledger args to include dax device, got:\n%s", data)
 	}
 }
 

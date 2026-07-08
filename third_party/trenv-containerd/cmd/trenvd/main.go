@@ -25,18 +25,19 @@ import (
 	"time"
 
 	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/trenvpub"
-	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/trenvtask/checkpoint"
-	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/trenvtask/switchtask"
 )
 
 type daemonRequest struct {
-	CommandLabel    string                  `json:"commandLabel"`
-	Command         []string                `json:"command,omitempty"`
-	TimeoutMillis   int64                   `json:"timeoutMillis"`
-	Operation       string                  `json:"operation"`
-	Checkpoint      *checkpointRequest      `json:"checkpoint,omitempty"`
-	SwitchTask      *switchRequest          `json:"switchTask,omitempty"`
-	MetadataResolve *metadataResolveRequest `json:"metadataResolve,omitempty"`
+	CommandLabel    string                    `json:"commandLabel"`
+	TimeoutMillis   int64                     `json:"timeoutMillis"`
+	Operation       string                    `json:"operation"`
+	CreateContainer *createContainerRequest   `json:"createContainer,omitempty"`
+	Checkpoint      *checkpointRequest        `json:"checkpointContainer,omitempty"`
+	Restore         *switchRequest            `json:"restoreIntoContainer,omitempty"`
+	Switch          *switchRequest            `json:"switchIntoCandidate,omitempty"`
+	Container       *containerRequest         `json:"container,omitempty"`
+	Cleanup         *cleanupContainersRequest `json:"cleanupContainers,omitempty"`
+	MetadataResolve *metadataResolveRequest   `json:"metadataResolve,omitempty"`
 }
 
 // A structured checkpoint request is preferred over allowing the invoker to
@@ -44,8 +45,6 @@ type daemonRequest struct {
 // action-root export so those host-side decisions stay outside the invoker
 // container.
 type checkpointRequest struct {
-	Address            string                        `json:"address"`
-	Namespace          string                        `json:"namespace"`
 	ImagePath          string                        `json:"imagePath"`
 	WorkPath           string                        `json:"workPath"`
 	MetadataBundlePath string                        `json:"metadataBundlePath"`
@@ -69,23 +68,22 @@ type checkpointPublicationRequest struct {
 }
 
 type switchRequest struct {
-	Address             string           `json:"address"`
-	Namespace           string           `json:"namespace"`
-	CheckpointPath      string           `json:"checkpointPath"`
-	DaxDevice           string           `json:"daxDevice,omitempty"`
-	DaxDeviceFallback   string           `json:"-"`
-	ReaderDaxShards     []daxShardConfig `json:"-"`
-	SourceContainer     string           `json:"sourceContainer,omitempty"`
-	ActionSourceRootfs  string           `json:"actionSourceRootfs,omitempty"`
-	ShellID             string           `json:"shellId,omitempty"`
-	CompatibilityClass  string           `json:"compatibilityClass,omitempty"`
-	ActiveRuntimeKind   string           `json:"activeRuntimeKind,omitempty"`
-	ActiveRuntimeFamily string           `json:"activeRuntimeFamily,omitempty"`
-	StableActionRoot    string           `json:"stableActionRoot,omitempty"`
-	ActionRebinds       []actionRebind   `json:"actionRebinds"`
-	NullIO              bool             `json:"nullIO"`
-	PidFile             string           `json:"pidFile,omitempty"`
-	ContainerID         string           `json:"containerId"`
+	CheckpointPath              string           `json:"checkpointPath"`
+	DaxDevice                   string           `json:"daxDevice,omitempty"`
+	DaxDeviceFallback           string           `json:"-"`
+	ReaderDaxShards             []daxShardConfig `json:"-"`
+	SourceContainer             string           `json:"sourceContainer,omitempty"`
+	ActionSourceRootfs          string           `json:"actionSourceRootfs,omitempty"`
+	ShellID                     string           `json:"shellId,omitempty"`
+	CompatibilityClass          string           `json:"compatibilityClass,omitempty"`
+	ActiveRuntimeKind           string           `json:"activeRuntimeKind,omitempty"`
+	ActiveRuntimeFamily         string           `json:"activeRuntimeFamily,omitempty"`
+	StableActionRoot            string           `json:"stableActionRoot,omitempty"`
+	PseudoMMMaterializationRoot string           `json:"-"`
+	ActionRebinds               []actionRebind   `json:"actionRebinds"`
+	NullIO                      bool             `json:"nullIO"`
+	PidFile                     string           `json:"pidFile,omitempty"`
+	ContainerID                 string           `json:"containerId"`
 }
 
 type actionRebind struct {
@@ -94,11 +92,14 @@ type actionRebind struct {
 }
 
 type execResponse struct {
-	Ok       bool   `json:"ok"`
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	ExitCode int    `json:"exitCode"`
-	Error    string `json:"error"`
+	Ok             bool             `json:"ok"`
+	Stdout         string           `json:"stdout"`
+	Stderr         string           `json:"stderr"`
+	ExitCode       int              `json:"exitCode"`
+	Error          string           `json:"error"`
+	Operation      string           `json:"operation,omitempty"`
+	DurationMicros int64            `json:"durationMicros,omitempty"`
+	TimingsMicros  map[string]int64 `json:"timingsMicros,omitempty"`
 }
 
 type metadataResolveRequest struct {
@@ -156,32 +157,36 @@ type metadataPublicationRecord struct {
 	PageCount                  int64                              `json:"page_count"`
 	PageSize                   int64                              `json:"page_size"`
 	Layout                     string                             `json:"layout"`
+	Shards                     []trenvpub.Shard                   `json:"shards,omitempty"`
+	BaseRestoreMap             []trenvpub.RestoreExtent           `json:"base_restore_map,omitempty"`
+	DedupDelta                 []trenvpub.RestoreExtent           `json:"dedup_delta,omitempty"`
+	Stats                      trenvpub.Stats                     `json:"stats,omitempty"`
 	CreatedAt                  time.Time                          `json:"created_at"`
 	PublicationPath            string                             `json:"-"`
 	PeerURL                    string                             `json:"-"`
 }
 
 type daemonConfig struct {
-	WriterID                 string
-	WriterStateRoot          string
-	DaxDevice                string
-	ShardID                  string
-	DaxShards                []daxShardConfig
-	ReaderDaxShards          []daxShardConfig
-	DaxPlacementPolicy       string
-	CheckpointWriterDisabled bool
-	WorkingDirectory         string
-	MetadataListen           string
-	MetadataPeers            []string
-}
-
-type checkpointWriterPlacement struct {
-	DaxDevice          string
-	WriterID           string
-	ShardID            string
-	DaxShards          []daxShardConfig
-	DaxPlacementPolicy string
-	WriterStateRoot    string
+	WriterID                    string
+	WriterStateRoot             string
+	DaxDevice                   string
+	ShardID                     string
+	DaxShards                   []daxShardConfig
+	ReaderDaxShards             []daxShardConfig
+	DaxPlacementPolicy          string
+	CheckpointWriterDisabled    bool
+	WorkingDirectory            string
+	MetadataListen              string
+	MetadataPeers               []string
+	PseudoMMMaterializationRoot string
+	DedupInterval               time.Duration
+	DedupOnCheckpoint           bool
+	DedupTimeout                time.Duration
+	DedupDedupdBinary           string
+	DedupPublicationBinary      string
+	DedupExecution              string
+	DedupOutputDirectory        string
+	DedupMinPages               uint64
 }
 
 type daxShardConfig struct {
@@ -197,6 +202,7 @@ func (d daxShardConfig) String() string {
 }
 
 var activeConfig daemonConfig
+var dedupRunGate = make(chan struct{}, 1)
 
 func writeFrame(conn net.Conn, payload []byte) error {
 	header := make([]byte, 4)
@@ -221,74 +227,73 @@ func readFrame(conn net.Conn) ([]byte, error) {
 	return body, nil
 }
 
-func allowedCommand(binaryPath string) bool {
-	base := filepath.Base(binaryPath)
-	switch base {
-	case "ctr":
-		return true
-	default:
-		return false
-	}
-}
-
-func runCommand(req daemonRequest) execResponse {
+func runCommand(req daemonRequest) (resp execResponse) {
+	startedAt := time.Now()
 	operation := strings.TrimSpace(req.Operation)
+	if operation == "" && req.CreateContainer != nil {
+		operation = "createContainer"
+	}
 	if operation == "" && req.Checkpoint != nil {
-		operation = "checkpoint"
+		operation = "checkpointContainer"
 	}
-	if operation == "" && req.SwitchTask != nil {
-		operation = "switch"
+	if operation == "" && req.Restore != nil {
+		operation = "restoreIntoContainer"
 	}
-	if operation == "" && len(req.Command) > 0 {
-		switch filepath.Base(req.Command[0]) {
-		case "trenv-checkpoint-task":
-			operation = "checkpoint"
-		case "trenv-switch-task":
-			operation = "switch"
-		default:
-			operation = "exec"
-		}
+	if operation == "" && req.Switch != nil {
+		operation = "switchIntoCandidate"
 	}
+	if operation == "" && req.Container != nil {
+		operation = "container"
+	}
+	if operation == "" && req.Cleanup != nil {
+		operation = "cleanupContainers"
+	}
+	defer func() {
+		resp.Operation = operation
+		resp.DurationMicros = elapsedMicros(startedAt)
+	}()
 
 	switch operation {
-	case "checkpoint":
+	case "createContainer":
+		if req.CreateContainer == nil {
+			return execResponse{Ok: false, Error: "createContainer operation requires createContainer request"}
+		}
+		return runCreateContainerRequest(*req.CreateContainer, req.TimeoutMillis, activeConfig)
+	case "checkpointContainer":
 		if req.Checkpoint != nil {
-			return runCheckpointRequest(*req.Checkpoint, req.TimeoutMillis, activeConfig)
+			return runDirectCheckpointRequest(*req.Checkpoint, req.TimeoutMillis, activeConfig)
 		}
-		return runIntegratedTask(req, "trenv-checkpoint-task", checkpoint.Run)
-	case "prepareSwitchTarget":
-		if req.SwitchTask == nil {
-			return execResponse{Ok: false, Error: "prepareSwitchTarget operation requires switchTask request"}
+		return execResponse{Ok: false, Error: "checkpointContainer operation requires checkpointContainer request"}
+	case "restoreIntoContainer":
+		if req.Restore == nil {
+			return execResponse{Ok: false, Error: "restoreIntoContainer operation requires restoreIntoContainer request"}
 		}
-		return runStructuredTask(switchArgsForPhase(switchRequestWithRuntimeConfig(*req.SwitchTask, activeConfig), req.TimeoutMillis, true, false), "prepareSwitchTarget", switchtask.Run)
-	case "restorePreparedSwitch":
-		if req.SwitchTask == nil {
-			return execResponse{Ok: false, Error: "restorePreparedSwitch operation requires switchTask request"}
+		return runDirectRestoreRequest(*req.Restore, req.TimeoutMillis, activeConfig)
+	case "switchIntoCandidate":
+		if req.Switch == nil {
+			return execResponse{Ok: false, Error: "switchIntoCandidate operation requires switchIntoCandidate request"}
 		}
-		return runStructuredTask(switchArgsForPhase(switchRequestWithRuntimeConfig(*req.SwitchTask, activeConfig), req.TimeoutMillis, false, true), "restorePreparedSwitch", switchtask.Run)
-	case "switch":
-		if req.SwitchTask != nil {
-			return runStructuredTask(switchArgs(switchRequestWithRuntimeConfig(*req.SwitchTask, activeConfig), req.TimeoutMillis), "switch", switchtask.Run)
+		return runDirectSwitchRequest(*req.Switch, req.TimeoutMillis, activeConfig)
+	case "pauseContainer", "resumeContainer", "removeContainer":
+		if req.Container == nil {
+			return execResponse{Ok: false, Error: fmt.Sprintf("%s operation requires container request", operation)}
 		}
-		return runIntegratedTask(req, "trenv-switch-task", switchtask.Run)
+		return runContainerLifecycleRequest(operation, *req.Container, req.TimeoutMillis, activeConfig)
+	case "cleanupContainers":
+		if req.Cleanup == nil {
+			return execResponse{Ok: false, Error: "cleanupContainers operation requires cleanupContainers request"}
+		}
+		return runCleanupContainersRequest(*req.Cleanup, req.TimeoutMillis, activeConfig)
 	case "metadataResolve":
 		if req.MetadataResolve == nil {
 			return execResponse{Ok: false, Error: "metadataResolve operation requires metadataResolve request"}
 		}
 		return runMetadataResolveRequest(*req.MetadataResolve, req.TimeoutMillis, activeConfig)
-	case "", "exec":
-		return runExternalCommand(req)
+	case "":
+		return execResponse{Ok: false, Error: "operation is empty"}
 	default:
 		return execResponse{Ok: false, Error: fmt.Sprintf("unsupported operation %q", operation)}
 	}
-}
-
-func runCheckpointRequest(req checkpointRequest, timeoutMillis int64, config daemonConfig) execResponse {
-	placement, err := resolveCheckpointWriterPlacement(req, config)
-	if err != nil {
-		return execResponse{Ok: false, Error: err.Error()}
-	}
-	return runStructuredTask(checkpointArgs(req, timeoutMillis, placement), "checkpoint", checkpoint.Run)
 }
 
 func runMetadataResolveRequest(req metadataResolveRequest, timeoutMillis int64, config daemonConfig) execResponse {
@@ -328,7 +333,7 @@ func resolveMetadata(ctx context.Context, req metadataResolveRequest, config dae
 		return metadataResolveResponse{Found: false}, nil
 	}
 	sort.Slice(publications, func(i, j int) bool {
-		return publications[i].CreatedAt.Before(publications[j].CreatedAt)
+		return publicationLess(publications[i], publications[j])
 	})
 	selected := publications[len(publications)-1]
 	// The daemon returns reader-local paths. Remote writer paths are only used
@@ -415,7 +420,7 @@ func materializePeerArtifact(ctx context.Context, publication metadataPublicatio
 	if checkpointID == "" {
 		return "", errors.New("selected publication is missing checkpoint id")
 	}
-	cacheRoot := filepath.Join(config.WorkingDirectory, "reader-cache", sanitizePathPart(checkpointID))
+	cacheRoot := filepath.Join(config.WorkingDirectory, "reader-cache", publicationCacheKey(publication))
 	cacheCommitted := filepath.Join(cacheRoot, "COMMITTED")
 	if isRegularFile(cacheCommitted) {
 		if err := materializeRestoreState(cacheRoot, checkpointID, readerContainer, publication, config); err != nil {
@@ -427,7 +432,7 @@ func materializePeerArtifact(ctx context.Context, publication metadataPublicatio
 	if err := os.MkdirAll(filepath.Join(config.WorkingDirectory, "reader-cache"), 0o755); err != nil {
 		return "", err
 	}
-	stageRoot, err := os.MkdirTemp(filepath.Join(config.WorkingDirectory, "reader-cache"), sanitizePathPart(checkpointID)+".tmp.")
+	stageRoot, err := os.MkdirTemp(filepath.Join(config.WorkingDirectory, "reader-cache"), publicationCacheKey(publication)+".tmp.")
 	if err != nil {
 		return "", err
 	}
@@ -457,6 +462,14 @@ func materializePeerArtifact(ctx context.Context, publication metadataPublicatio
 		return "", err
 	}
 	return filepath.Join(config.WorkingDirectory, "restore", sanitizePathPart(readerContainer), sanitizePathPart(checkpointID)), nil
+}
+
+func publicationCacheKey(publication metadataPublicationRecord) string {
+	key := strings.TrimSpace(publication.ArtifactID)
+	if key == "" {
+		key = strings.TrimSpace(publication.CheckpointID)
+	}
+	return sanitizePathPart(key)
 }
 
 func fetchArtifactTar(ctx context.Context, publication metadataPublicationRecord, target string) error {
@@ -540,143 +553,12 @@ func writeReaderPublication(root string, publication metadataPublicationRecord) 
 	return trenvpub.WriteFileNoReplace(filepath.Join(root, "publication.reader"+trenvpub.Extension), publicationRecordToBinary(record))
 }
 
-func runStructuredTask(args []string, operation string, runner func([]string, io.Writer, io.Writer) int) execResponse {
-	var stdoutBuilder strings.Builder
-	var stderrBuilder strings.Builder
-	exitCode := runner(args, &stdoutBuilder, &stderrBuilder)
-	stdout := stdoutBuilder.String()
-	stderr := stderrBuilder.String()
-	if exitCode == 0 {
-		return execResponse{Ok: true, Stdout: stdout}
+func elapsedMicros(startedAt time.Time) int64 {
+	elapsed := time.Since(startedAt).Microseconds()
+	if elapsed < 0 {
+		return 0
 	}
-	return execResponse{
-		Ok:       false,
-		Stdout:   stdout,
-		Stderr:   stderr,
-		ExitCode: exitCode,
-		Error:    fmt.Sprintf("%s operation failed with exit code %d", operation, exitCode),
-	}
-}
-
-func checkpointArgs(req checkpointRequest, timeoutMillis int64, placement checkpointWriterPlacement) []string {
-	args := []string{
-		"--address", req.Address,
-		"--namespace", req.Namespace,
-		"--image-path", req.ImagePath,
-		"--work-path", req.WorkPath,
-		"--metadata-bundle-path", req.MetadataBundlePath,
-	}
-	if len(placement.DaxShards) > 0 {
-		for _, shard := range placement.DaxShards {
-			args = append(args, "--dax-shard", shard.String())
-		}
-		if strings.TrimSpace(placement.DaxPlacementPolicy) != "" {
-			args = append(args, "--dax-placement-policy", placement.DaxPlacementPolicy)
-		}
-	} else {
-		args = append(args, "--dax-device", placement.DaxDevice)
-		if strings.TrimSpace(placement.ShardID) != "" {
-			args = append(args, "--shard-id", placement.ShardID)
-		}
-	}
-	args = append(args,
-		"--writer-id", placement.WriterID,
-		"--writer-state-root", placement.WriterStateRoot,
-	)
-	args = appendPublicationArgs(args, req.Publication)
-	for _, root := range req.ActionExportRoots {
-		args = append(args, "--action-export-root", root)
-	}
-	args = integratedTaskArgs(args, timeoutMillis)
-	args = append(args, req.ContainerID)
-	return args
-}
-
-func appendPublicationArgs(args []string, publication *checkpointPublicationRequest) []string {
-	if publication == nil {
-		return args
-	}
-	if strings.TrimSpace(publication.PublicationPath) != "" {
-		args = append(args, "--publication-path", publication.PublicationPath)
-	}
-	if strings.TrimSpace(publication.RuntimeKind) != "" {
-		args = append(args, "--runtime-kind", publication.RuntimeKind)
-	}
-	if strings.TrimSpace(publication.RuntimeFamily) != "" {
-		args = append(args, "--runtime-family", publication.RuntimeFamily)
-	}
-	if strings.TrimSpace(publication.ActionNamespace) != "" {
-		args = append(args, "--action-namespace", publication.ActionNamespace)
-	}
-	if strings.TrimSpace(publication.ActionName) != "" {
-		args = append(args, "--action-name", publication.ActionName)
-	}
-	if strings.TrimSpace(publication.ActionRevision) != "" {
-		args = append(args, "--action-revision", publication.ActionRevision)
-	}
-	if strings.TrimSpace(publication.CheckpointPhase) != "" {
-		args = append(args, "--checkpoint-phase", publication.CheckpointPhase)
-	}
-	if strings.TrimSpace(publication.Fingerprint) != "" {
-		args = append(args, "--fingerprint", publication.Fingerprint)
-	}
-	if strings.TrimSpace(publication.SnapshotStartMode) != "" {
-		args = append(args, "--snapshot-start-mode", publication.SnapshotStartMode)
-	}
-	if strings.TrimSpace(publication.CheckpointActionExportRoot) != "" {
-		args = append(args, "--checkpoint-action-export-root", publication.CheckpointActionExportRoot)
-	}
-	return args
-}
-
-func resolveCheckpointWriterPlacement(req checkpointRequest, config daemonConfig) (checkpointWriterPlacement, error) {
-	if strings.TrimSpace(req.ImagePath) == "" {
-		return checkpointWriterPlacement{}, errors.New("checkpoint image path is empty")
-	}
-	if config.CheckpointWriterDisabled {
-		return checkpointWriterPlacement{}, errors.New("checkpoint writer is disabled on this trenvd")
-	}
-	writerID := strings.TrimSpace(config.WriterID)
-	if writerID == "" {
-		writerID = defaultWriterID()
-	}
-	writerStateRoot := strings.TrimSpace(config.WriterStateRoot)
-	if writerStateRoot == "" {
-		writerStateRoot = defaultWriterStateRoot(req.ImagePath)
-	}
-	if len(config.DaxShards) > 0 {
-		if err := rejectDuplicateDaxShardConfig(config.DaxShards); err != nil {
-			return checkpointWriterPlacement{}, err
-		}
-		// Multi-DAX mode passes shard identities down to the checkpoint task;
-		// the task writes placement metadata that readers later map to their
-		// local DAX device paths.
-		return checkpointWriterPlacement{
-			WriterID:           writerID,
-			DaxShards:          config.DaxShards,
-			DaxPlacementPolicy: nonEmptyOrDefault(config.DaxPlacementPolicy, "first-fit"),
-			WriterStateRoot:    writerStateRoot,
-		}, nil
-	}
-	daxDevice := strings.TrimSpace(config.DaxDevice)
-	if daxDevice == "" {
-		var err error
-		daxDevice, err = detectDaxDevice()
-		if err != nil {
-			return checkpointWriterPlacement{}, err
-		}
-	}
-	shardID := strings.TrimSpace(config.ShardID)
-	if shardID == "" {
-		shardID = filepath.Base(daxDevice)
-	}
-
-	return checkpointWriterPlacement{
-		DaxDevice:       daxDevice,
-		WriterID:        writerID,
-		ShardID:         shardID,
-		WriterStateRoot: writerStateRoot,
-	}, nil
+	return elapsed
 }
 
 func defaultWriterID() string {
@@ -684,15 +566,6 @@ func defaultWriterID() string {
 		return hostname
 	}
 	return "unknown-writer"
-}
-
-func defaultWriterStateRoot(imagePath string) string {
-	checkpointRoot := filepath.Dir(filepath.Clean(imagePath))
-	checkpointsDir := filepath.Dir(checkpointRoot)
-	if filepath.Base(checkpointsDir) == "checkpoints" {
-		return filepath.Join(filepath.Dir(checkpointsDir), "writers")
-	}
-	return filepath.Join(checkpointRoot, "writers")
 }
 
 func checkpointID(imagePath string) string {
@@ -871,6 +744,32 @@ func envDefaultBool(name string, fallback bool) bool {
 	return parsed
 }
 
+func envDefaultDuration(name string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid duration %s=%q, using %s\n", name, value, fallback)
+		return fallback
+	}
+	return parsed
+}
+
+func envDefaultUint64(name string, fallback uint64) uint64 {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid uint64 %s=%q, using %d\n", name, value, fallback)
+		return fallback
+	}
+	return parsed
+}
+
 func safeJoin(root, name string) (string, error) {
 	separator := string(os.PathSeparator)
 	cleanName := filepath.Clean(strings.TrimPrefix(name, separator))
@@ -1038,178 +937,364 @@ func writeJSONFile(path string, value interface{}) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
-func switchRequestWithRuntimeConfig(req switchRequest, config daemonConfig) switchRequest {
-	if strings.TrimSpace(req.DaxDevice) == "" {
-		req.ReaderDaxShards = config.ReaderDaxShards
-		if len(req.ReaderDaxShards) == 0 {
-			req.ReaderDaxShards = config.DaxShards
+type dedupRunStatus struct {
+	CheckpointID       string    `json:"checkpoint_id"`
+	ArtifactID         string    `json:"artifact_id"`
+	BasePublication    string    `json:"base_publication"`
+	DerivedPublication string    `json:"derived_publication,omitempty"`
+	CheckpointPath     string    `json:"checkpoint_path"`
+	State              string    `json:"state"`
+	Reason             string    `json:"reason,omitempty"`
+	Error              string    `json:"error,omitempty"`
+	StartedAt          time.Time `json:"started_at"`
+	FinishedAt         time.Time `json:"finished_at"`
+}
+
+func dedupEnabled(config daemonConfig) bool {
+	return config.DedupInterval > 0 || config.DedupOnCheckpoint
+}
+
+func normalizeDedupConfig(config daemonConfig) daemonConfig {
+	if strings.TrimSpace(config.DedupDedupdBinary) == "" {
+		config.DedupDedupdBinary = "dedupd"
+	}
+	if strings.TrimSpace(config.DedupPublicationBinary) == "" {
+		config.DedupPublicationBinary = "trenv-dedup-pub"
+	}
+	if strings.TrimSpace(config.DedupExecution) == "" {
+		config.DedupExecution = "cpu"
+	}
+	if strings.TrimSpace(config.DedupOutputDirectory) == "" {
+		config.DedupOutputDirectory = filepath.Join(config.WorkingDirectory, "dedup")
+	}
+	if config.DedupTimeout <= 0 {
+		config.DedupTimeout = 15 * time.Minute
+	}
+	if config.DedupMinPages == 0 {
+		config.DedupMinPages = 1
+	}
+	return config
+}
+
+func startDedupScheduler(ctx context.Context, config daemonConfig) {
+	config = normalizeDedupConfig(config)
+	if config.DedupInterval <= 0 {
+		return
+	}
+	go func() {
+		triggerDedupCycleWithContext(ctx, config, "startup")
+		ticker := time.NewTicker(config.DedupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				triggerDedupCycleWithContext(ctx, config, "interval")
+			}
 		}
-		if len(req.ReaderDaxShards) == 0 {
-			req.DaxDeviceFallback = strings.TrimSpace(config.DaxDevice)
-		}
-	}
-	return req
+	}()
 }
 
-func switchArgs(req switchRequest, timeoutMillis int64) []string {
-	return switchArgsForPhase(req, timeoutMillis, false, false)
+func triggerDedupCycle(config daemonConfig, reason string) {
+	config = normalizeDedupConfig(config)
+	if !dedupEnabled(config) {
+		return
+	}
+	go triggerDedupCycleWithContext(context.Background(), config, reason)
 }
 
-func switchArgsForPhase(req switchRequest, timeoutMillis int64, prepareOnly bool, skipActionRebind bool) []string {
-	args := []string{
-		"--address", req.Address,
-		"--namespace", req.Namespace,
-		"--checkpoint-path", req.CheckpointPath,
-	}
-	if prepareOnly {
-		args = append(args, "--prepare-only")
-	}
-	if skipActionRebind {
-		args = append(args, "--skip-action-rebind")
-	}
-	if req.NullIO {
-		args = append(args, "--null-io")
-	}
-	if strings.TrimSpace(req.PidFile) != "" {
-		args = append(args, "--pid-file", req.PidFile)
-	}
-	if strings.TrimSpace(req.ShellID) != "" {
-		args = append(args, "--shell-id", req.ShellID)
-	}
-	if strings.TrimSpace(req.CompatibilityClass) != "" {
-		args = append(args, "--compatibility-class", req.CompatibilityClass)
-	}
-	if strings.TrimSpace(req.ActiveRuntimeKind) != "" {
-		args = append(args, "--active-runtime-kind", req.ActiveRuntimeKind)
-	}
-	if strings.TrimSpace(req.ActiveRuntimeFamily) != "" {
-		args = append(args, "--active-runtime-family", req.ActiveRuntimeFamily)
-	}
-	if strings.TrimSpace(req.StableActionRoot) != "" {
-		args = append(args, "--stable-action-root", req.StableActionRoot)
-	}
-	if strings.TrimSpace(req.DaxDevice) != "" {
-		args = append(args, "--dax-device", req.DaxDevice)
-	}
-	for _, shard := range req.ReaderDaxShards {
-		args = append(args, "--reader-dax-shard", shard.String())
-	}
-	if strings.TrimSpace(req.DaxDeviceFallback) != "" {
-		args = append(args, "--fallback-dax-device", req.DaxDeviceFallback)
-	}
-	if strings.TrimSpace(req.ActionSourceRootfs) != "" {
-		args = append(args, "--action-source-rootfs", req.ActionSourceRootfs)
-	}
-	if strings.TrimSpace(req.SourceContainer) != "" {
-		args = append(args, "--source-container", req.SourceContainer)
-	}
-	for _, rebind := range req.ActionRebinds {
-		args = append(args, "--action-rebind", fmt.Sprintf("%s:%s", rebind.SourceRoot, rebind.TargetRoot))
-	}
-	args = integratedTaskArgs(args, timeoutMillis)
-	args = append(args, req.ContainerID)
-	return args
-}
-
-func runIntegratedTask(req daemonRequest, expectedBinary string, runner func([]string, io.Writer, io.Writer) int) execResponse {
-	if len(req.Command) == 0 {
-		return execResponse{Ok: false, Error: "empty command"}
-	}
-	if base := filepath.Base(req.Command[0]); base != expectedBinary {
-		return execResponse{Ok: false, Error: fmt.Sprintf("operation %q requires command %q, got %q", strings.TrimPrefix(expectedBinary, "trenv-"), expectedBinary, base)}
-	}
-
-	var stdoutBuilder strings.Builder
-	var stderrBuilder strings.Builder
-	exitCode := runner(integratedTaskArgs(req.Command[1:], req.TimeoutMillis), &stdoutBuilder, &stderrBuilder)
-	stdout := stdoutBuilder.String()
-	stderr := stderrBuilder.String()
-	if exitCode == 0 {
-		return execResponse{Ok: true, Stdout: stdout}
-	}
-	return execResponse{
-		Ok:       false,
-		Stdout:   stdout,
-		Stderr:   stderr,
-		ExitCode: exitCode,
-		Error:    fmt.Sprintf("%s failed with exit code %d", expectedBinary, exitCode),
-	}
-}
-
-func integratedTaskArgs(args []string, timeoutMillis int64) []string {
-	if timeoutMillis <= 0 || hasTimeoutFlag(args) {
-		return args
-	}
-	withTimeout := make([]string, 0, len(args)+2)
-	withTimeout = append(withTimeout, "--timeout", fmt.Sprintf("%dms", timeoutMillis))
-	withTimeout = append(withTimeout, args...)
-	return withTimeout
-}
-
-func hasTimeoutFlag(args []string) bool {
-	for i := range args {
-		if args[i] == "--timeout" || strings.HasPrefix(args[i], "--timeout=") {
-			return true
-		}
-	}
-	return false
-}
-
-func runExternalCommand(req daemonRequest) execResponse {
-	if len(req.Command) == 0 {
-		return execResponse{Ok: false, Error: "empty command"}
-	}
-	if !allowedCommand(req.Command[0]) {
-		return execResponse{Ok: false, Error: fmt.Sprintf("command %q is not allowed", req.Command[0])}
-	}
-
-	timeout := time.Duration(req.TimeoutMillis) * time.Millisecond
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func triggerDedupCycleWithContext(parent context.Context, config daemonConfig, reason string) {
+	config = normalizeDedupConfig(config)
+	ctx, cancel := context.WithTimeout(parent, config.DedupTimeout)
 	defer cancel()
+	if err := runDedupCycle(ctx, config, reason); err != nil {
+		fmt.Fprintf(os.Stderr, "trenvd dedup cycle failed: %v\n", err)
+	}
+}
 
-	cmd := exec.CommandContext(ctx, req.Command[0], req.Command[1:]...)
+func runDedupCycle(ctx context.Context, config daemonConfig, reason string) error {
+	config = normalizeDedupConfig(config)
+	select {
+	case dedupRunGate <- struct{}{}:
+		defer func() { <-dedupRunGate }()
+	default:
+		return nil
+	}
+	candidates, err := listDedupCandidates(config)
+	if err != nil {
+		return err
+	}
+	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := runDedupPublication(ctx, config, candidate, reason); err != nil {
+			fmt.Fprintf(os.Stderr, "trenvd dedup skipped checkpoint=%s artifact=%s: %v\n", candidate.CheckpointID, candidate.ArtifactID, err)
+		}
+	}
+	return nil
+}
+
+func listDedupCandidates(config daemonConfig) ([]metadataPublicationRecord, error) {
+	publications, err := listCommittedPublications(config, "")
+	if err != nil {
+		return nil, err
+	}
+	dedupByCheckpoint := map[string]bool{}
+	for _, publication := range publications {
+		if publicationHasDedup(publication) {
+			dedupByCheckpoint[publication.CheckpointID] = true
+		}
+	}
+	var candidates []metadataPublicationRecord
+	for _, publication := range publications {
+		if publicationHasDedup(publication) {
+			continue
+		}
+		if dedupByCheckpoint[publication.CheckpointID] {
+			continue
+		}
+		if filepath.Ext(publication.PublicationPath) != trenvpub.Extension {
+			continue
+		}
+		if dedupNoExtentsMarked(config, publication) {
+			continue
+		}
+		if !isDirectory(publication.CheckpointPath) || !checkpointHasPages(publication.CheckpointPath) {
+			continue
+		}
+		candidates = append(candidates, publication)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].CreatedAt.Before(candidates[j].CreatedAt)
+	})
+	return candidates, nil
+}
+
+func checkpointHasPages(checkpointPath string) bool {
+	matches, err := filepath.Glob(filepath.Join(checkpointPath, "pages-*.img"))
+	return err == nil && len(matches) > 0
+}
+
+func runDedupPublication(ctx context.Context, config daemonConfig, publication metadataPublicationRecord, reason string) error {
+	startedAt := time.Now().UTC()
+	workRoot := filepath.Join(dedupWorkDirectory(config), sanitizePathPart(publication.ArtifactID))
+	if err := os.RemoveAll(workRoot); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(workRoot, 0o755); err != nil {
+		return err
+	}
+
+	ledgerPath := filepath.Join(workRoot, "checkpoint-ledger.bin")
+	summaryPath := filepath.Join(workRoot, "checkpoint-ledger-summary.json")
+	planPath := filepath.Join(workRoot, "checkpoint-apply-plan.json")
+
+	ledgerArgs := []string{
+		"checkpoint-ledger",
+		"--source", publication.CheckpointPath,
+		"--page-size", "4096",
+		"--execution", config.DedupExecution,
+		"--output", ledgerPath,
+	}
+	if strings.TrimSpace(publication.DaxDevice) != "" {
+		ledgerArgs = append(ledgerArgs, "--dax-device", publication.DaxDevice)
+	}
+	if _, stderr, err := runDedupCommand(ctx, config.DedupDedupdBinary, ledgerArgs, summaryPath); err != nil {
+		_ = writeDedupStatus(config, publication, dedupRunStatus{
+			State:          "failed",
+			Reason:         reason,
+			Error:          commandErrorString(err, stderr),
+			CheckpointPath: publication.CheckpointPath,
+			StartedAt:      startedAt,
+			FinishedAt:     time.Now().UTC(),
+		})
+		return fmt.Errorf("checkpoint-ledger: %s", commandErrorString(err, stderr))
+	}
+
+	if _, stderr, err := runDedupCommand(ctx, config.DedupDedupdBinary, []string{
+		"checkpoint-apply-plan",
+		"--source", publication.CheckpointPath,
+		"--page-size", "4096",
+		"--ledger", ledgerPath,
+	}, planPath); err != nil {
+		_ = writeDedupStatus(config, publication, dedupRunStatus{
+			State:          "failed",
+			Reason:         reason,
+			Error:          commandErrorString(err, stderr),
+			CheckpointPath: publication.CheckpointPath,
+			StartedAt:      startedAt,
+			FinishedAt:     time.Now().UTC(),
+		})
+		return fmt.Errorf("checkpoint-apply-plan: %s", commandErrorString(err, stderr))
+	}
+
+	createdAt := time.Now().UTC()
+	derivedPath := filepath.Join(
+		publicationDirectory(config),
+		fmt.Sprintf("%s.dedup-%s%s", sanitizePathPart(publication.CheckpointID), createdAt.Format("20060102T150405.000000000Z"), trenvpub.Extension))
+	_, stderr, err := runDedupCommand(ctx, config.DedupPublicationBinary, []string{
+		"--base", publication.PublicationPath,
+		"--plan", planPath,
+		"--output", derivedPath,
+		"--created-at", createdAt.Format(time.RFC3339Nano),
+		"--min-pages", strconv.FormatUint(config.DedupMinPages, 10),
+	}, "")
+	if err != nil {
+		state := "failed"
+		if strings.Contains(stderr, "no publishable dedup extents") {
+			state = "no-extents"
+		}
+		_ = writeDedupStatus(config, publication, dedupRunStatus{
+			State:              state,
+			Reason:             reason,
+			Error:              commandErrorString(err, stderr),
+			CheckpointPath:     publication.CheckpointPath,
+			DerivedPublication: derivedPath,
+			StartedAt:          startedAt,
+			FinishedAt:         time.Now().UTC(),
+		})
+		if state == "no-extents" {
+			return nil
+		}
+		return fmt.Errorf("trenv-dedup-pub: %s", commandErrorString(err, stderr))
+	}
+
+	if err := writeDedupStatus(config, publication, dedupRunStatus{
+		State:              "published",
+		Reason:             reason,
+		CheckpointPath:     publication.CheckpointPath,
+		DerivedPublication: derivedPath,
+		StartedAt:          startedAt,
+		FinishedAt:         time.Now().UTC(),
+	}); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "trenvd dedup published checkpoint=%s base=%s derived=%s\n", publication.CheckpointID, publication.PublicationPath, derivedPath)
+	return nil
+}
+
+func runDedupCommand(ctx context.Context, binary string, args []string, stdoutPath string) (string, string, error) {
+	cmd := exec.CommandContext(ctx, binary, args...)
 	var stdoutBuilder strings.Builder
 	var stderrBuilder strings.Builder
-	cmd.Stdout = &stdoutBuilder
+	var stdoutFile *os.File
+	var stdoutTemp string
+	if strings.TrimSpace(stdoutPath) != "" {
+		if err := os.MkdirAll(filepath.Dir(stdoutPath), 0o755); err != nil {
+			return "", "", err
+		}
+		file, err := os.CreateTemp(filepath.Dir(stdoutPath), filepath.Base(stdoutPath)+".tmp.")
+		if err != nil {
+			return "", "", err
+		}
+		stdoutFile = file
+		stdoutTemp = file.Name()
+		cmd.Stdout = stdoutFile
+	} else {
+		cmd.Stdout = &stdoutBuilder
+	}
 	cmd.Stderr = &stderrBuilder
 
 	err := cmd.Run()
-	stdout := stdoutBuilder.String()
-	stderr := stderrBuilder.String()
-	if err == nil {
-		return execResponse{Ok: true, Stdout: stdout}
-	}
-
-	exitCode := 1
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		exitCode = exitErr.ExitCode()
-	}
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return execResponse{
-			Ok:       false,
-			Stdout:   stdout,
-			Stderr:   stderr,
-			ExitCode: exitCode,
-			Error:    fmt.Sprintf("command timed out after %s", timeout),
+	if stdoutFile != nil {
+		if closeErr := stdoutFile.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+		if err == nil {
+			err = os.Rename(stdoutTemp, stdoutPath)
+		}
+		if err != nil {
+			_ = os.Remove(stdoutTemp)
 		}
 	}
+	return stdoutBuilder.String(), stderrBuilder.String(), err
+}
 
-	return execResponse{
-		Ok:       false,
-		Stdout:   stdout,
-		Stderr:   stderr,
-		ExitCode: exitCode,
-		Error:    err.Error(),
+func commandErrorString(err error, stderr string) string {
+	message := strings.TrimSpace(stderr)
+	if message == "" && err != nil {
+		message = err.Error()
 	}
+	if message == "" {
+		message = "unknown error"
+	}
+	return message
+}
+
+func dedupWorkDirectory(config daemonConfig) string {
+	if strings.TrimSpace(config.DedupOutputDirectory) != "" {
+		return config.DedupOutputDirectory
+	}
+	return filepath.Join(config.WorkingDirectory, "dedup")
+}
+
+func dedupStatusPath(config daemonConfig, publication metadataPublicationRecord) string {
+	key := strings.TrimSpace(publication.ArtifactID)
+	if key == "" {
+		key = publication.CheckpointID
+	}
+	return filepath.Join(dedupWorkDirectory(config), "status", sanitizePathPart(key)+".json")
+}
+
+func dedupNoExtentsMarked(config daemonConfig, publication metadataPublicationRecord) bool {
+	data, err := os.ReadFile(dedupStatusPath(config, publication))
+	if err != nil {
+		return false
+	}
+	var status dedupRunStatus
+	if err := json.Unmarshal(data, &status); err != nil {
+		return false
+	}
+	return status.State == "no-extents"
+}
+
+func writeDedupStatus(config daemonConfig, publication metadataPublicationRecord, status dedupRunStatus) error {
+	status.CheckpointID = publication.CheckpointID
+	status.ArtifactID = publication.ArtifactID
+	status.BasePublication = publication.PublicationPath
+	if status.CheckpointPath == "" {
+		status.CheckpointPath = publication.CheckpointPath
+	}
+	if status.StartedAt.IsZero() {
+		status.StartedAt = time.Now().UTC()
+	}
+	if status.FinishedAt.IsZero() {
+		status.FinishedAt = time.Now().UTC()
+	}
+	return writeJSONFile(dedupStatusPath(config, publication), status)
 }
 
 func publicationDirectory(config daemonConfig) string {
 	return filepath.Join(config.WorkingDirectory, "checkpoints", "publication")
+}
+
+func publicationHasDedup(record metadataPublicationRecord) bool {
+	return record.Stats.DedupDeltaCount > 0 ||
+		record.Stats.DedupAppliedCount > 0 ||
+		len(record.DedupDelta) > 0 ||
+		record.CheckpointPhase == trenvpub.DedupRestoreCOWPhase
+}
+
+func publicationPriority(record metadataPublicationRecord) int {
+	if publicationHasDedup(record) {
+		return 1
+	}
+	return 0
+}
+
+func publicationLess(a, b metadataPublicationRecord) bool {
+	if publicationPriority(a) != publicationPriority(b) {
+		return publicationPriority(a) < publicationPriority(b)
+	}
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.Before(b.CreatedAt)
+	}
+	if a.CheckpointID != b.CheckpointID {
+		return a.CheckpointID < b.CheckpointID
+	}
+	return a.ArtifactID < b.ArtifactID
 }
 
 func listCommittedPublications(config daemonConfig, fingerprint string) ([]metadataPublicationRecord, error) {
@@ -1241,7 +1326,7 @@ func listCommittedPublications(config daemonConfig, fingerprint string) ([]metad
 		publications = append(publications, record)
 	}
 	sort.Slice(publications, func(i, j int) bool {
-		return publications[i].CreatedAt.Before(publications[j].CreatedAt)
+		return publicationLess(publications[i], publications[j])
 	})
 	return publications, nil
 }
@@ -1311,6 +1396,10 @@ func publicationRecordFromBinary(pub trenvpub.Publication) metadataPublicationRe
 		record.PageSize = shard.PageSize
 		record.Layout = shard.Layout
 	}
+	record.Shards = append([]trenvpub.Shard(nil), pub.Shards...)
+	record.BaseRestoreMap = append([]trenvpub.RestoreExtent(nil), pub.BaseRestoreMap...)
+	record.DedupDelta = append([]trenvpub.RestoreExtent(nil), pub.DedupDelta...)
+	record.Stats = pub.Stats
 	return record
 }
 
@@ -1322,6 +1411,19 @@ func publicationRecordToBinary(record metadataPublicationRecord) trenvpub.Public
 			FullyQualifiedName: record.ActionIdentity.FullyQualifiedName,
 			Revision:           record.ActionIdentity.Revision,
 		}
+	}
+	shards := append([]trenvpub.Shard(nil), record.Shards...)
+	if len(shards) == 0 {
+		shards = []trenvpub.Shard{{
+			WriterID:       record.WriterID,
+			ShardID:        record.ShardID,
+			DaxDevice:      record.DaxDevice,
+			DaxStartPage:   record.DaxStartPage,
+			DaxLengthPages: record.DaxLengthPages,
+			PageCount:      record.PageCount,
+			PageSize:       record.PageSize,
+			Layout:         record.Layout,
+		}}
 	}
 	return trenvpub.Publication{
 		ArtifactID:                 record.ArtifactID,
@@ -1339,18 +1441,11 @@ func publicationRecordToBinary(record metadataPublicationRecord) trenvpub.Public
 		CheckpointActionExportRoot: record.CheckpointActionExportRoot,
 		MetadataBundleSize:         record.MetadataBundleSize,
 		MetadataBundleSHA256:       record.MetadataBundleSHA256,
-		Shards: []trenvpub.Shard{{
-			WriterID:       record.WriterID,
-			ShardID:        record.ShardID,
-			DaxDevice:      record.DaxDevice,
-			DaxStartPage:   record.DaxStartPage,
-			DaxLengthPages: record.DaxLengthPages,
-			PageCount:      record.PageCount,
-			PageSize:       record.PageSize,
-			Layout:         record.Layout,
-		}},
-		Stats:     trenvpub.Stats{},
-		CreatedAt: record.CreatedAt,
+		Shards:                     shards,
+		BaseRestoreMap:             append([]trenvpub.RestoreExtent(nil), record.BaseRestoreMap...),
+		DedupDelta:                 append([]trenvpub.RestoreExtent(nil), record.DedupDelta...),
+		Stats:                      record.Stats,
+		CreatedAt:                  record.CreatedAt,
 	}
 }
 
@@ -1358,21 +1453,17 @@ func findPublicationByCheckpointID(config daemonConfig, checkpointID string) (me
 	if strings.TrimSpace(checkpointID) == "" {
 		return metadataPublicationRecord{}, errors.New("checkpoint id is empty")
 	}
-	path := filepath.Join(publicationDirectory(config), checkpointID+".json")
-	if binaryPath := filepath.Join(publicationDirectory(config), checkpointID+trenvpub.Extension); isRegularFile(binaryPath) {
-		path = binaryPath
-	}
-	record, err := readPublicationRecord(path)
+	publications, err := listCommittedPublications(config, "")
 	if err != nil {
 		return metadataPublicationRecord{}, err
 	}
-	if record.State != "COMMITTED" {
-		return metadataPublicationRecord{}, fmt.Errorf("publication %q is not COMMITTED", checkpointID)
+	for i := len(publications) - 1; i >= 0; i-- {
+		record := publications[i]
+		if record.CheckpointID == checkpointID || record.ArtifactID == checkpointID {
+			return record, nil
+		}
 	}
-	if record.CheckpointID != checkpointID {
-		return metadataPublicationRecord{}, fmt.Errorf("publication checkpoint id mismatch: want %q got %q", checkpointID, record.CheckpointID)
-	}
-	return record, nil
+	return metadataPublicationRecord{}, fmt.Errorf("publication %q was not found", checkpointID)
 }
 
 func handlePublications(config daemonConfig) http.HandlerFunc {
@@ -1705,6 +1796,15 @@ func main() {
 	workingDirectory := flag.String("working-directory", envDefault("TRENVD_WORKING_DIRECTORY", "/tmp/openwhisk-trenv"), "OpenWhisk TrEnv working directory")
 	metadataListen := flag.String("metadata-listen", envDefault("TRENVD_METADATA_LISTEN", ""), "optional TCP listen address for metadata HTTP, for example 127.0.0.1:18080")
 	metadataPeers := flag.String("metadata-peers", envDefault("TRENVD_METADATA_PEERS", ""), "comma-separated metadata peer HTTP URLs")
+	pseudoMMMaterializationRoot := flag.String("pseudo-mm-materialization-root", envDefault("TRENVD_PSEUDO_MM_MATERIALIZATION_ROOT", ""), "host-local root for reusable reader pseudo_mm materializations")
+	dedupInterval := flag.Duration("dedup-interval", envDefaultDuration("TRENVD_DEDUP_INTERVAL", 0), "periodic checkpoint dedup interval; 0 disables the scheduler")
+	dedupOnCheckpoint := flag.Bool("dedup-on-checkpoint", envDefaultBool("TRENVD_DEDUP_ON_CHECKPOINT", false), "run checkpoint dedup asynchronously after a successful checkpoint")
+	dedupTimeout := flag.Duration("dedup-timeout", envDefaultDuration("TRENVD_DEDUP_TIMEOUT", 15*time.Minute), "timeout for one dedup cycle")
+	dedupDedupdBinary := flag.String("dedup-dedupd-binary", envDefault("TRENVD_DEDUP_DEDUPD_BINARY", "dedupd"), "dedupd binary used by automatic checkpoint dedup")
+	dedupPublicationBinary := flag.String("dedup-publication-binary", envDefault("TRENVD_DEDUP_PUBLICATION_BINARY", "trenv-dedup-pub"), "trenv-dedup-pub binary used to write derived dedup publications")
+	dedupExecution := flag.String("dedup-execution", envDefault("TRENVD_DEDUP_EXECUTION", "cpu"), "dedupd fingerprint execution backend: cpu, sw, or hw")
+	dedupOutputDirectory := flag.String("dedup-output-directory", envDefault("TRENVD_DEDUP_OUTPUT_DIRECTORY", ""), "directory for automatic dedup ledgers, plans, and status files")
+	dedupMinPages := flag.Uint64("dedup-min-pages", envDefaultUint64("TRENVD_DEDUP_MIN_PAGES", 1), "minimum dedup extent size to publish")
 	flag.Parse()
 
 	parsedDaxShards, err := parseDaxShardConfigList(*daxShards)
@@ -1719,21 +1819,40 @@ func main() {
 	}
 
 	activeConfig = daemonConfig{
-		WriterID:                 *writerID,
-		WriterStateRoot:          *writerStateRoot,
-		DaxDevice:                *daxDevice,
-		ShardID:                  *shardID,
-		DaxShards:                parsedDaxShards,
-		ReaderDaxShards:          parsedReaderDaxShards,
-		DaxPlacementPolicy:       *daxPlacementPolicy,
-		CheckpointWriterDisabled: !*checkpointWriterEnabled,
-		WorkingDirectory:         *workingDirectory,
-		MetadataListen:           *metadataListen,
-		MetadataPeers:            splitCommaList(*metadataPeers),
+		WriterID:                    *writerID,
+		WriterStateRoot:             *writerStateRoot,
+		DaxDevice:                   *daxDevice,
+		ShardID:                     *shardID,
+		DaxShards:                   parsedDaxShards,
+		ReaderDaxShards:             parsedReaderDaxShards,
+		DaxPlacementPolicy:          *daxPlacementPolicy,
+		CheckpointWriterDisabled:    !*checkpointWriterEnabled,
+		WorkingDirectory:            *workingDirectory,
+		MetadataListen:              *metadataListen,
+		MetadataPeers:               splitCommaList(*metadataPeers),
+		PseudoMMMaterializationRoot: *pseudoMMMaterializationRoot,
+		DedupInterval:               *dedupInterval,
+		DedupOnCheckpoint:           *dedupOnCheckpoint,
+		DedupTimeout:                *dedupTimeout,
+		DedupDedupdBinary:           *dedupDedupdBinary,
+		DedupPublicationBinary:      *dedupPublicationBinary,
+		DedupExecution:              *dedupExecution,
+		DedupOutputDirectory:        *dedupOutputDirectory,
+		DedupMinPages:               *dedupMinPages,
 	}
 
 	if activeConfig.WorkingDirectory == "" {
 		activeConfig.WorkingDirectory = "/tmp/openwhisk-trenv"
+	}
+	if strings.TrimSpace(activeConfig.PseudoMMMaterializationRoot) == "" {
+		activeConfig.PseudoMMMaterializationRoot = filepath.Join(activeConfig.WorkingDirectory, "pseudo-mm-materialized")
+	}
+	activeConfig = normalizeDedupConfig(activeConfig)
+	switch activeConfig.DedupExecution {
+	case "cpu", "sw", "hw":
+	default:
+		fmt.Fprintf(os.Stderr, "invalid --dedup-execution %q; expected cpu, sw, or hw\n", activeConfig.DedupExecution)
+		os.Exit(1)
 	}
 	if err := os.MkdirAll(activeConfig.WorkingDirectory, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to create working directory: %v\n", err)
@@ -1771,10 +1890,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	daemonCtx, daemonCancel := context.WithCancel(context.Background())
+	defer daemonCancel()
+	startDedupScheduler(daemonCtx, activeConfig)
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
+		daemonCancel()
 		if metadataServer != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			_ = metadataServer.Shutdown(ctx)
