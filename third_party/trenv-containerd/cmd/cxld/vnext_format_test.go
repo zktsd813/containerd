@@ -7,7 +7,35 @@ import (
 	"hash/crc32"
 	"math"
 	"testing"
+
+	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/cxlcheckpoint"
 )
+
+func TestVNextFormatComponentsMatchPortableCompatibilityContract(t *testing.T) {
+	if got := string(vnextPublicationMagic[:]); got != cxlcheckpoint.MagicString {
+		t.Fatalf("publication magic = %q, want %q", got, cxlcheckpoint.MagicString)
+	}
+	if vnextFormatVersion != cxlcheckpoint.Version {
+		t.Fatalf("format version = %d, want %d", vnextFormatVersion, cxlcheckpoint.Version)
+	}
+	if vnextFormatHeaderSize != uint32(cxlcheckpoint.PublicationEnvelopeHeaderBytes) {
+		t.Fatalf("format header = %d, want %d",
+			vnextFormatHeaderSize, cxlcheckpoint.PublicationEnvelopeHeaderBytes)
+	}
+	if vnextMaxEnvelopePayload != cxlcheckpoint.MaxPayloadBytes {
+		t.Fatalf("maximum payload = %d, want %d", vnextMaxEnvelopePayload, cxlcheckpoint.MaxPayloadBytes)
+	}
+	if vnextContentPageSize != cxlcheckpoint.PageSize {
+		t.Fatalf("content page = %d, want %d", vnextContentPageSize, cxlcheckpoint.PageSize)
+	}
+	if got := string(vnextDeviceMagic[:]); got != cxlcheckpoint.DeviceFormatMagicString {
+		t.Fatalf("device magic = %q, want %q", got, cxlcheckpoint.DeviceFormatMagicString)
+	}
+	if vnextPageDescriptorSize != cxlcheckpoint.PageDescriptorBytes {
+		t.Fatalf("descriptor bytes = %d, want %d",
+			vnextPageDescriptorSize, cxlcheckpoint.PageDescriptorBytes)
+	}
+}
 
 func TestVNextCRC32CastagnoliKnownAnswer(t *testing.T) {
 	const expected uint32 = 0xe3069283

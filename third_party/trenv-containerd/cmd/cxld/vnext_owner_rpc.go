@@ -20,8 +20,8 @@ const (
 	vnextOwnerRPCOperationAbort   = "vnextOwnerAbort"
 
 	// JSON/base64 is intentionally limited below the 64 MiB publication codec
-	// ceiling. Eight MiB of TRCRC006 records still describe more than 800 GiB
-	// of 4 KiB pages. Larger metadata requires a future streaming or
+	// ceiling. At 40 bytes per record, eight MiB of TRCRC006 describes roughly
+	// 0.8 GiB of 4 KiB pages. Larger metadata requires a future streaming or
 	// SCM_RIGHTS protocol, not a larger single allocation in this v1 adapter.
 	vnextOwnerRPCMaxPublicationBytes = 8 << 20
 	vnextOwnerRPCMaxSidecarBytes     = 8 << 20

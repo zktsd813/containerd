@@ -457,8 +457,26 @@ func TestDeviceTableDigestIsCanonicalAndHasNoLocalPathContract(t *testing.T) {
 		t.Fatal("portable publication contains a host-local /dev path")
 	}
 
-	publication.Devices[0].DeviceUUID = "/dev/dax0.0"
-	requireInvalid(t, publication)
+	for _, identifier := range []string{
+		"/dev/dax0.0",
+		"file:device-a",
+		"FILE:device-a",
+		".",
+		"..",
+	} {
+		t.Run(identifier, func(t *testing.T) {
+			if err := validateDeviceUUID(identifier); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("validateDeviceUUID(%q) error = %v, want ErrInvalid", identifier, err)
+			}
+		})
+	}
+	for _, identifier := range []string{"device-a", "device:file", "장치-1"} {
+		t.Run("portable "+identifier, func(t *testing.T) {
+			if err := validateDeviceUUID(identifier); err != nil {
+				t.Fatalf("validateDeviceUUID(%q): %v", identifier, err)
+			}
+		})
+	}
 }
 
 func TestInitialAllocationCanSpanDevicesButNotOwners(t *testing.T) {

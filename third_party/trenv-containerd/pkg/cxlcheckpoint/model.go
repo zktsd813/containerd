@@ -1075,7 +1075,8 @@ func validateDeviceUUID(value string) error {
 	if err := validateIdentity("device UUID", value); err != nil {
 		return err
 	}
-	if strings.ContainsAny(value, "/\\") || value == "." || value == ".." {
+	fileURI := len(value) >= len("file:") && strings.EqualFold(value[:len("file:")], "file:")
+	if strings.ContainsAny(value, "/\\") || value == "." || value == ".." || fileURI {
 		return invalidf("device UUID %q looks like a local path", value)
 	}
 	return nil

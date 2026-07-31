@@ -1,0 +1,77 @@
+{
+  "fixtureSchema": "trenv.cxlcheckpoint.cross-language.v1",
+  "publicationFile": "trpub006-cross-language-v1.b64",
+  "contractId": "publication=TRPUB006/v6/little-endian/trpub006-envelope-little-endian-pages-image-sparse-publication-slot-v1;envelope-header=64;max-payload=67108864;page=4096;fingerprint=crc32c-castagnoli/0x11edc6f41;descriptor=TRCXL006/64/trcxl006-page-descriptor-little-endian-v1",
+  "publicationByteLength": 5263,
+  "publicationSha256": "ff2f3685fdbb3fee1d54ff1e26d1819fb20a60f817cfbf41d35b53121261a456",
+  "publicationSlotCapacityPages": 3,
+  "initialAllocation": {
+    "checkpointId": "fixture-checkpoint-v6",
+    "ownerId": "owner-a",
+    "ownerEpoch": 7,
+    "allocationRecordId": 42,
+    "totalPages": 10,
+    "extents": [
+      {
+        "deviceUuid": "device-a",
+        "startDataPageIndex": 100,
+        "pageCount": 8,
+        "logicalPageStart": 0
+      },
+      {
+        "deviceUuid": "device-b",
+        "startDataPageIndex": 200,
+        "pageCount": 2,
+        "logicalPageStart": 8
+      }
+    ]
+  },
+  "deviceTable": [
+    {
+      "deviceUuid": "device-a",
+      "ownerId": "owner-a",
+      "ownerEpoch": 7,
+      "dataPageCount": 1024
+    },
+    {
+      "deviceUuid": "device-b",
+      "ownerId": "owner-a",
+      "ownerEpoch": 7,
+      "dataPageCount": 1024
+    },
+    {
+      "deviceUuid": "device-c",
+      "ownerId": "owner-b",
+      "ownerEpoch": 9,
+      "dataPageCount": 1024
+    }
+  ],
+  "deviceTableSha256": "1bca732f28cb7a7cbe7bff8bc7b5329b88e0d4a68f0a0c299cc58293af92b339",
+  "root": {
+    "rootId": "root-a",
+    "rootVersion": 1,
+    "mmTemplateId": "template-a",
+    "pageMapId": "page-map-a",
+    "pageMapVersion": 1
+  },
+  "pageRuns": [
+    {
+      "firstPage": {
+        "ownerId": "owner-a",
+        "deviceUuid": "device-a",
+        "dataPageIndex": 107,
+        "allocationRecordId": 42
+      },
+      "pageCount": 1
+    },
+    {
+      "firstPage": {
+        "ownerId": "owner-a",
+        "deviceUuid": "device-b",
+        "dataPageIndex": 200,
+        "allocationRecordId": 42
+      },
+      "pageCount": 1
+    }
+  ]
+}
