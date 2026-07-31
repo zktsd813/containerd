@@ -68,6 +68,79 @@ func requireVNextOwnerServiceCode(
 	return serviceError
 }
 
+func TestVNextOwnerServiceInventoryEchoesIdentityWithoutAdvancingJournal(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
+		{UUID: "service-inventory-z", Size: 256 << 10},
+		{UUID: "service-inventory-a", Size: 384 << 10},
+	})
+	service := newVNextOwnerServiceForFixture(t, fixture)
+	request := vnextOwnerInventoryRequest{
+		RequestID:  "service-inventory-request",
+		OwnerID:    "owner-0",
+		OwnerEpoch: 7,
+	}
+	first, err := service.inventory(request)
+	if err != nil {
+		t.Fatalf("read service inventory: %v", err)
+	}
+	if first.RequestID != request.RequestID || first.OwnerID != request.OwnerID ||
+		first.OwnerEpoch != request.OwnerEpoch || first.SnapshotSequence == 0 ||
+		len(first.Devices) != 2 || first.Devices[0].DeviceUUID != "service-inventory-a" ||
+		first.Devices[1].DeviceUUID != "service-inventory-z" {
+		t.Fatalf("service inventory does not echo a stable Owner identity: %#v", first)
+	}
+	second, err := service.inventory(request)
+	if err != nil {
+		t.Fatalf("retry service inventory: %v", err)
+	}
+	if !bytes.Equal(mustMarshalJSON(t, first), mustMarshalJSON(t, second)) {
+		t.Fatalf("read-only service inventory advanced or changed state: %#v != %#v",
+			first, second)
+	}
+}
+
+func TestVNextOwnerServiceInventoryRejectsStaleOrPoisonedOwner(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "service-inventory-authority", Size: 256 << 10,
+	}})
+	service := newVNextOwnerServiceForFixture(t, fixture)
+	base := vnextOwnerInventoryRequest{
+		RequestID:  "service-inventory-authority-request",
+		OwnerID:    "owner-0",
+		OwnerEpoch: 7,
+	}
+
+	wrongOwner := base
+	wrongOwner.OwnerID = "owner-stale"
+	response, err := service.inventory(wrongOwner)
+	requireVNextOwnerServiceCode(t, err, vnextOwnerServiceIdentityMismatch)
+	if response.RequestID != "" || response.OwnerID != "" ||
+		response.OwnerEpoch != 0 || response.SnapshotSequence != 0 ||
+		len(response.Devices) != 0 {
+		t.Fatalf("wrong Owner identity returned inventory: %#v", response)
+	}
+	wrongEpoch := base
+	wrongEpoch.OwnerEpoch++
+	response, err = service.inventory(wrongEpoch)
+	requireVNextOwnerServiceCode(t, err, vnextOwnerServiceIdentityMismatch)
+	if response.RequestID != "" || response.OwnerID != "" ||
+		response.OwnerEpoch != 0 || response.SnapshotSequence != 0 ||
+		len(response.Devices) != 0 {
+		t.Fatalf("stale Owner epoch returned inventory: %#v", response)
+	}
+
+	fixture.group.mu.Lock()
+	fixture.group.poisoned = errors.New("test poisoned Owner")
+	fixture.group.mu.Unlock()
+	response, err = service.inventory(base)
+	requireVNextOwnerServiceCode(t, err, vnextOwnerServiceUnavailable)
+	if response.RequestID != "" || response.OwnerID != "" ||
+		response.OwnerEpoch != 0 || response.SnapshotSequence != 0 ||
+		len(response.Devices) != 0 {
+		t.Fatalf("poisoned Owner returned inventory: %#v", response)
+	}
+}
+
 func TestVNextOwnerServiceMultiDAXReserveResponseIsPortable(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
 		{UUID: "owner-service-device-b", Size: 256 << 10},

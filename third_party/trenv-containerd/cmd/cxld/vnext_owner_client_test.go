@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -138,6 +139,261 @@ func TestVNextOwnerClientReserveSealCommitThroughDaemonRoundTrip(t *testing.T) {
 			request.CommandLabel != "vnext-owner-client" || request.TimeoutMillis != 0 {
 			t.Fatalf("round trip %d has unexpected envelope: %#v", index, request)
 		}
+	}
+}
+
+func TestVNextOwnerClientInventoryRoundTripsExactReadOnlyRequest(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
+		{UUID: "client-inventory-z", Size: 256 << 10},
+		{UUID: "client-inventory-a", Size: 384 << 10},
+	})
+	transport := &vnextOwnerClientRecordingTransport{
+		rpc: newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture)),
+	}
+	client, err := newVNextOwnerClient(transport)
+	if err != nil {
+		t.Fatalf("create inventory client: %v", err)
+	}
+	request := vnextOwnerInventoryRequest{
+		RequestID:  "client-inventory-request",
+		OwnerID:    "owner-0",
+		OwnerEpoch: 7,
+	}
+	fixture.group.mu.Lock()
+	wantSequence := fixture.group.journal.SnapshotSequence
+	fixture.group.mu.Unlock()
+	response, err := client.Inventory(context.Background(), request)
+	if err != nil {
+		t.Fatalf("read inventory through strict Owner client: %v", err)
+	}
+	if response.RequestID != request.RequestID || response.OwnerID != request.OwnerID ||
+		response.OwnerEpoch != request.OwnerEpoch ||
+		response.SnapshotSequence != wantSequence || len(response.Devices) != 2 ||
+		response.Devices[0].DeviceUUID != "client-inventory-a" ||
+		response.Devices[1].DeviceUUID != "client-inventory-z" {
+		t.Fatalf("unexpected strict inventory response: %#v", response)
+	}
+	if len(transport.requests) != 1 {
+		t.Fatalf("inventory transport calls = %d, want 1", len(transport.requests))
+	}
+	captured := transport.requests[0]
+	if captured.Operation != vnextOwnerRPCOperationInventory ||
+		captured.CommandLabel != "vnext-owner-client" || captured.TimeoutMillis != 0 ||
+		len(captured.VNextOwnerInventory) == 0 || len(captured.VNextOwnerReserve) != 0 ||
+		len(captured.VNextOwnerSeal) != 0 || len(captured.VNextOwnerCommit) != 0 ||
+		len(captured.VNextOwnerAbort) != 0 {
+		t.Fatalf("inventory client sent an invalid daemon envelope: %#v", captured)
+	}
+	var wire vnextOwnerRPCInventoryRequest
+	if err := decodeStrictVNextOwnerRPC(captured.VNextOwnerInventory, &wire); err != nil {
+		t.Fatalf("decode mandatory inventory request: %v", err)
+	}
+	if wire.Protocol != vnextOwnerRPCProtocol || wire.RequestID != request.RequestID ||
+		wire.ExpectedOwnerID != request.OwnerID ||
+		wire.ExpectedOwnerEpoch != request.OwnerEpoch {
+		t.Fatalf("inventory client changed expected identity: %#v", wire)
+	}
+	fixture.group.mu.Lock()
+	gotSequence := fixture.group.journal.SnapshotSequence
+	fixture.group.mu.Unlock()
+	if gotSequence != wantSequence {
+		t.Fatalf("inventory client advanced journal sequence %d -> %d", wantSequence, gotSequence)
+	}
+}
+
+func TestVNextOwnerClientRejectsMismatchedInventoryResponses(t *testing.T) {
+	request := vnextOwnerInventoryRequest{
+		RequestID:  "client-inventory-response-request",
+		OwnerID:    "owner-0",
+		OwnerEpoch: 7,
+	}
+	valid := vnextOwnerRPCInventoryResponse{
+		Protocol:         vnextOwnerRPCProtocol,
+		Operation:        vnextOwnerRPCOperationInventory,
+		RequestID:        request.RequestID,
+		OwnerID:          request.OwnerID,
+		OwnerEpoch:       request.OwnerEpoch,
+		SnapshotSequence: 11,
+		Devices: vnextOwnerRPCInventoryDevices{
+			{DeviceUUID: "inventory-a", TotalDataPages: 10, FreeDataPages: 7},
+			{DeviceUUID: "inventory-b", TotalDataPages: 20, FreeDataPages: 12},
+		},
+	}
+	tests := []struct {
+		name   string
+		mutate func(vnextOwnerRPCInventoryResponse) []byte
+	}{
+		{
+			name: "mismatched-request-ID",
+			mutate: func(wire vnextOwnerRPCInventoryResponse) []byte {
+				wire.RequestID = "other-request"
+				return vnextOwnerClientMarshalJSON(t, wire)
+			},
+		},
+		{
+			name: "mismatched-Owner-epoch",
+			mutate: func(wire vnextOwnerRPCInventoryResponse) []byte {
+				wire.OwnerEpoch++
+				return vnextOwnerClientMarshalJSON(t, wire)
+			},
+		},
+		{
+			name: "journal-sequence-exceeds-signed-ABI",
+			mutate: func(wire vnextOwnerRPCInventoryResponse) []byte {
+				wire.SnapshotSequence = uint64(math.MaxInt64) + 1
+				return vnextOwnerClientMarshalJSON(t, wire)
+			},
+		},
+		{
+			name: "device-capacity-exceeds-signed-ABI",
+			mutate: func(wire vnextOwnerRPCInventoryResponse) []byte {
+				wire.Devices[0].TotalDataPages = uint64(math.MaxInt64) + 1
+				return vnextOwnerClientMarshalJSON(t, wire)
+			},
+		},
+		{
+			name: "free-pages-exceed-total",
+			mutate: func(wire vnextOwnerRPCInventoryResponse) []byte {
+				wire.Devices[0].FreeDataPages = wire.Devices[0].TotalDataPages + 1
+				return vnextOwnerClientMarshalJSON(t, wire)
+			},
+		},
+		{
+			name: "device-order-is-not-stable",
+			mutate: func(wire vnextOwnerRPCInventoryResponse) []byte {
+				wire.Devices[0], wire.Devices[1] = wire.Devices[1], wire.Devices[0]
+				return vnextOwnerClientMarshalJSON(t, wire)
+			},
+		},
+		{
+			name: "local-path-device-ID",
+			mutate: func(wire vnextOwnerRPCInventoryResponse) []byte {
+				wire.Devices[0].DeviceUUID = "/dev/dax0.0"
+				return vnextOwnerClientMarshalJSON(t, wire)
+			},
+		},
+		{
+			name: "missing-device-table",
+			mutate: func(wire vnextOwnerRPCInventoryResponse) []byte {
+				object := vnextOwnerClientJSONMap(t, vnextOwnerClientMarshalJSON(t, wire))
+				delete(object, "devices")
+				return vnextOwnerClientMarshalJSON(t, object)
+			},
+		},
+		{
+			name: "unknown-response-field",
+			mutate: func(wire vnextOwnerRPCInventoryResponse) []byte {
+				raw := vnextOwnerClientMarshalJSON(t, wire)
+				return append(append([]byte(nil), raw[:len(raw)-1]...), []byte(`,"grant":"forbidden"}`)...)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := valid
+			candidate.Devices = append(
+				vnextOwnerRPCInventoryDevices(nil), valid.Devices...)
+			payload := test.mutate(candidate)
+			client, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+				func(context.Context, daemonRequest) (execResponse, error) {
+					return execResponse{
+						Ok:        true,
+						Operation: vnextOwnerRPCOperationInventory,
+						Stdout:    string(payload),
+					}, nil
+				}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Inventory(context.Background(), request); err == nil {
+				t.Fatal("malformed or mismatched inventory response was accepted")
+			}
+		})
+	}
+}
+
+func TestVNextOwnerClientAllowsBigIntAggregateAcrossSignedDevices(t *testing.T) {
+	request := vnextOwnerInventoryRequest{
+		RequestID:  "client-inventory-bigint-request",
+		OwnerID:    "owner-0",
+		OwnerEpoch: 7,
+	}
+	wire := vnextOwnerRPCInventoryResponse{
+		Protocol:         vnextOwnerRPCProtocol,
+		Operation:        vnextOwnerRPCOperationInventory,
+		RequestID:        request.RequestID,
+		OwnerID:          request.OwnerID,
+		OwnerEpoch:       request.OwnerEpoch,
+		SnapshotSequence: uint64(math.MaxInt64),
+		Devices: vnextOwnerRPCInventoryDevices{
+			{
+				DeviceUUID:     "aggregate-a",
+				TotalDataPages: uint64(math.MaxInt64),
+				FreeDataPages:  uint64(math.MaxInt64),
+			},
+			{DeviceUUID: "aggregate-b", TotalDataPages: 1, FreeDataPages: 1},
+		},
+	}
+	payload := vnextOwnerClientMarshalJSON(t, wire)
+	client, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+		func(context.Context, daemonRequest) (execResponse, error) {
+			return execResponse{
+				Ok:        true,
+				Operation: vnextOwnerRPCOperationInventory,
+				Stdout:    string(payload),
+			}, nil
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Inventory(context.Background(), request)
+	if err != nil {
+		t.Fatalf("valid per-device Long values with BigInt aggregate were rejected: %v", err)
+	}
+	if len(response.Devices) != 2 ||
+		response.Devices[0].TotalDataPages != uint64(math.MaxInt64) ||
+		response.Devices[1].TotalDataPages != 1 {
+		t.Fatalf("BigInt aggregate conversion changed device counts: %#v", response)
+	}
+}
+
+func TestVNextOwnerClientBoundsInventoryDeviceArrayBeforeConversion(t *testing.T) {
+	request := vnextOwnerInventoryRequest{
+		RequestID:  "client-inventory-bounded-request",
+		OwnerID:    "owner-0",
+		OwnerEpoch: 7,
+	}
+	devices := make(vnextOwnerRPCInventoryDevices, vnextOwnerRPCMaxInventoryDevices+1)
+	for index := range devices {
+		devices[index] = vnextOwnerRPCInventoryDevice{
+			DeviceUUID:     fmt.Sprintf("bounded-%04d", index),
+			TotalDataPages: 1,
+			FreeDataPages:  1,
+		}
+	}
+	payload := vnextOwnerClientMarshalJSON(t, vnextOwnerRPCInventoryResponse{
+		Protocol:         vnextOwnerRPCProtocol,
+		Operation:        vnextOwnerRPCOperationInventory,
+		RequestID:        request.RequestID,
+		OwnerID:          request.OwnerID,
+		OwnerEpoch:       request.OwnerEpoch,
+		SnapshotSequence: 1,
+		Devices:          devices,
+	})
+	client, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+		func(context.Context, daemonRequest) (execResponse, error) {
+			return execResponse{
+				Ok:        true,
+				Operation: vnextOwnerRPCOperationInventory,
+				Stdout:    string(payload),
+			}, nil
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Inventory(context.Background(), request); err == nil ||
+		!strings.Contains(err.Error(), "more than") {
+		t.Fatalf("oversized inventory device table was not rejected before conversion: %v", err)
 	}
 }
 
@@ -410,6 +666,17 @@ func TestVNextOwnerClientRejectsOutgoingIdentityBeforeTransport(t *testing.T) {
 						},
 					},
 					MaxExtents: 1,
+				})
+				return err
+			},
+		},
+		{
+			name: "inventory-surrounding-whitespace",
+			run: func(client *vnextOwnerClient) error {
+				_, err := client.Inventory(context.Background(), vnextOwnerInventoryRequest{
+					RequestID:  " inventory-request",
+					OwnerID:    "owner-0",
+					OwnerEpoch: 7,
 				})
 				return err
 			},

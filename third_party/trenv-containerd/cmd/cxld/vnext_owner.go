@@ -76,6 +76,27 @@ type vnextOwnerPlan struct {
 	Fragments  []vnextOwnerDeviceFragment
 }
 
+// vnextOwnerInventoryDevice is deliberately limited to capacity information.
+// It must never grow allocator geometry, bitmap state, free runs, local paths,
+// file descriptors, grants, tokens, or transaction identities.
+type vnextOwnerInventoryDevice struct {
+	DeviceUUID     string
+	TotalDataPages uint64
+	FreeDataPages  uint64
+}
+
+// vnextOwnerInventorySnapshot is a point-in-time view of one live Owner. All
+// fields are copied while vnextOwnerGroup.mu is held, so a multi-device
+// reserve, abort, commit, reclaim, or recovery transition cannot be observed
+// halfway through. SnapshotSequence is the durable Owner journal sequence; an
+// inventory read itself is non-durable and never advances it.
+type vnextOwnerInventorySnapshot struct {
+	OwnerID          string
+	OwnerEpoch       uint64
+	SnapshotSequence uint64
+	Devices          []vnextOwnerInventoryDevice
+}
+
 func formatVNextOwnerGroup(
 	controlFile *os.File,
 	controlSlotBytes uint64,
@@ -275,6 +296,106 @@ func (group *vnextOwnerGroup) reserve(
 	}
 	grant.fragmentGrants = fragmentGrants
 	return grant, nil
+}
+
+func (group *vnextOwnerGroup) inventory(
+	expectedOwnerID string,
+	expectedOwnerEpoch uint64,
+) (vnextOwnerInventorySnapshot, error) {
+	group.mu.Lock()
+	defer group.mu.Unlock()
+
+	if err := group.checkUsableLocked(); err != nil {
+		return vnextOwnerInventorySnapshot{}, err
+	}
+	// Authenticate the complete Owner incarnation before reading or copying
+	// any capacity data. A stale scheduler view must not receive inventory for
+	// a replacement Owner that happens to serve the same endpoint.
+	if expectedOwnerID != group.ownerID || expectedOwnerEpoch != group.ownerEpoch {
+		return vnextOwnerInventorySnapshot{}, fmt.Errorf(
+			"expected Owner %q/%d, live Owner is %q/%d: %w",
+			expectedOwnerID,
+			expectedOwnerEpoch,
+			group.ownerID,
+			group.ownerEpoch,
+			errVNextAuthority)
+	}
+	if group.journal == nil || group.journal.SnapshotSequence == 0 ||
+		group.journal.SnapshotSequence > uint64(math.MaxInt64) {
+		return vnextOwnerInventorySnapshot{}, fmt.Errorf(
+			"Owner journal sequence is outside the signed ABI: %w", errVNextCorrupt)
+	}
+	if len(group.deviceOrder) == 0 || len(group.deviceOrder) != len(group.devices) {
+		return vnextOwnerInventorySnapshot{}, fmt.Errorf(
+			"Owner device inventory is incomplete: %w", errVNextCorrupt)
+	}
+
+	snapshot := vnextOwnerInventorySnapshot{
+		OwnerID:          group.ownerID,
+		OwnerEpoch:       group.ownerEpoch,
+		SnapshotSequence: group.journal.SnapshotSequence,
+		Devices:          make([]vnextOwnerInventoryDevice, 0, len(group.deviceOrder)),
+	}
+	previousUUID := ""
+	for index, deviceUUID := range group.deviceOrder {
+		if deviceUUID == "" || (index > 0 && previousUUID >= deviceUUID) {
+			return vnextOwnerInventorySnapshot{}, fmt.Errorf(
+				"Owner device order is not strictly UUID-sorted: %w", errVNextCorrupt)
+		}
+		device := group.devices[deviceUUID]
+		if device == nil {
+			return vnextOwnerInventorySnapshot{}, fmt.Errorf(
+				"Owner device %q is detached: %w", deviceUUID, errVNextCorrupt)
+		}
+
+		// The Owner group lock makes the snapshot atomic with respect to every
+		// authoritative Owner operation. The device and allocator locks also
+		// make this read safe against lower-level device maintenance and allow
+		// a poisoned device to fail closed instead of advertising stale space.
+		device.mu.Lock()
+		if err := device.checkUsableLocked(); err != nil {
+			device.mu.Unlock()
+			return vnextOwnerInventorySnapshot{}, fmt.Errorf(
+				"Owner device %q is not usable: %w", deviceUUID, err)
+		}
+		if device.allocator == nil ||
+			device.superblock.DeviceUUID != deviceUUID ||
+			device.superblock.OwnerID != group.ownerID ||
+			device.superblock.OwnerEpoch != group.ownerEpoch ||
+			device.allocator.superblock.DeviceUUID != deviceUUID ||
+			device.allocator.superblock.OwnerID != group.ownerID ||
+			device.allocator.superblock.OwnerEpoch != group.ownerEpoch ||
+			device.allocator.superblock.Geometry.DataPageCount !=
+				device.superblock.Geometry.DataPageCount {
+			device.mu.Unlock()
+			return vnextOwnerInventorySnapshot{}, fmt.Errorf(
+				"Owner device %q identity is inconsistent: %w", deviceUUID, errVNextCorrupt)
+		}
+		totalPages := device.superblock.Geometry.DataPageCount
+		if totalPages == 0 || totalPages > uint64(math.MaxInt64) {
+			device.mu.Unlock()
+			return vnextOwnerInventorySnapshot{}, fmt.Errorf(
+				"Owner device %q capacity is outside the signed ABI: %w",
+				deviceUUID, errVNextCorrupt)
+		}
+		device.allocator.mu.Lock()
+		freePages := device.allocator.freePagesLocked()
+		device.allocator.mu.Unlock()
+		device.mu.Unlock()
+
+		if freePages > totalPages || freePages > uint64(math.MaxInt64) {
+			return vnextOwnerInventorySnapshot{}, fmt.Errorf(
+				"Owner device %q capacity is outside the signed ABI: %w",
+				deviceUUID, errVNextCorrupt)
+		}
+		snapshot.Devices = append(snapshot.Devices, vnextOwnerInventoryDevice{
+			DeviceUUID:     deviceUUID,
+			TotalDataPages: totalPages,
+			FreeDataPages:  freePages,
+		})
+		previousUUID = deviceUUID
+	}
+	return snapshot, nil
 }
 
 func (group *vnextOwnerGroup) writePage(

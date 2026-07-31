@@ -53,6 +53,54 @@ type vnextOwnerClientRemoteError struct {
 	ExitCode  int
 }
 
+// Inventory reads one atomic live-capacity snapshot for an exact Owner
+// incarnation. It is read-only: RequestID is correlation, not a durable
+// allocation identity, and the response never contains placement runs or
+// producer authority.
+func (client *vnextOwnerClient) Inventory(
+	ctx context.Context,
+	request vnextOwnerInventoryRequest,
+) (vnextOwnerInventoryResponse, error) {
+	if client == nil || client.transport == nil {
+		return vnextOwnerInventoryResponse{}, errors.New("VNext Owner client is unavailable")
+	}
+	if err := validateVNextOwnerClientText(
+		"inventory request ID", request.RequestID); err != nil {
+		return vnextOwnerInventoryResponse{}, err
+	}
+	if err := validateVNextOwnerClientText("expected Owner ID", request.OwnerID); err != nil {
+		return vnextOwnerInventoryResponse{}, err
+	}
+	if request.OwnerEpoch == 0 || request.OwnerEpoch > uint64(math.MaxInt64) {
+		return vnextOwnerInventoryResponse{}, errors.New(
+			"expected Owner epoch is outside the signed ABI")
+	}
+	wire := vnextOwnerRPCInventoryRequest{
+		Protocol:           vnextOwnerRPCProtocol,
+		RequestID:          request.RequestID,
+		ExpectedOwnerID:    request.OwnerID,
+		ExpectedOwnerEpoch: request.OwnerEpoch,
+	}
+	raw, err := marshalVNextOwnerClientPayload(wire)
+	if err != nil {
+		return vnextOwnerInventoryResponse{}, err
+	}
+	response, err := client.roundTrip(
+		ctx,
+		vnextOwnerRPCOperationInventory,
+		daemonRequest{VNextOwnerInventory: raw},
+	)
+	if err != nil {
+		return vnextOwnerInventoryResponse{}, err
+	}
+	var decoded vnextOwnerRPCInventoryResponse
+	if err := decodeVNextOwnerClientSuccess(
+		response, vnextOwnerRPCOperationInventory, &decoded); err != nil {
+		return vnextOwnerInventoryResponse{}, err
+	}
+	return convertVNextOwnerClientInventoryResponse(request, decoded)
+}
+
 func (err *vnextOwnerClientRemoteError) Error() string {
 	if err == nil {
 		return "<nil>"
@@ -518,6 +566,63 @@ func convertVNextOwnerClientReserveResponse(
 					deviceUUID)
 			}
 		}
+	}
+	return response, nil
+}
+
+func convertVNextOwnerClientInventoryResponse(
+	request vnextOwnerInventoryRequest,
+	wire vnextOwnerRPCInventoryResponse,
+) (vnextOwnerInventoryResponse, error) {
+	if wire.Protocol != vnextOwnerRPCProtocol ||
+		wire.Operation != vnextOwnerRPCOperationInventory ||
+		wire.RequestID != request.RequestID ||
+		wire.OwnerID != request.OwnerID ||
+		wire.OwnerEpoch != request.OwnerEpoch {
+		return vnextOwnerInventoryResponse{}, errors.New(
+			"inventory response identity differs from the request")
+	}
+	if wire.SnapshotSequence == 0 ||
+		wire.SnapshotSequence > uint64(math.MaxInt64) {
+		return vnextOwnerInventoryResponse{}, errors.New(
+			"inventory journal sequence is outside the signed ABI")
+	}
+	if len(wire.Devices) == 0 ||
+		len(wire.Devices) > vnextOwnerRPCMaxInventoryDevices {
+		return vnextOwnerInventoryResponse{}, errors.New(
+			"inventory response has an invalid device count")
+	}
+
+	response := vnextOwnerInventoryResponse{
+		RequestID:        wire.RequestID,
+		OwnerID:          wire.OwnerID,
+		OwnerEpoch:       wire.OwnerEpoch,
+		SnapshotSequence: wire.SnapshotSequence,
+		Devices:          make([]vnextOwnerInventoryDevice, len(wire.Devices)),
+	}
+	previousUUID := ""
+	for index, device := range wire.Devices {
+		if err := validateVNextOwnerClientDeviceID(device.DeviceUUID); err != nil {
+			return vnextOwnerInventoryResponse{}, err
+		}
+		if index > 0 && previousUUID >= device.DeviceUUID {
+			return vnextOwnerInventoryResponse{}, errors.New(
+				"inventory device table is not strictly UUID-sorted")
+		}
+		if device.TotalDataPages == 0 ||
+			device.TotalDataPages > uint64(math.MaxInt64) ||
+			device.FreeDataPages > device.TotalDataPages ||
+			device.FreeDataPages > uint64(math.MaxInt64) {
+			return vnextOwnerInventoryResponse{}, fmt.Errorf(
+				"inventory device %q capacity is outside the signed ABI",
+				device.DeviceUUID)
+		}
+		response.Devices[index] = vnextOwnerInventoryDevice{
+			DeviceUUID:     device.DeviceUUID,
+			TotalDataPages: device.TotalDataPages,
+			FreeDataPages:  device.FreeDataPages,
+		}
+		previousUUID = device.DeviceUUID
 	}
 	return response, nil
 }

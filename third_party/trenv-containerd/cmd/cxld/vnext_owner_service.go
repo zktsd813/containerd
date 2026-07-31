@@ -198,6 +198,23 @@ type vnextOwnerReserveResponse struct {
 	Devices    []vnextOwnerPortableDevice
 }
 
+// vnextOwnerInventoryRequest names the exact Owner incarnation whose live
+// capacity the caller expects. RequestID is correlation only; it is echoed
+// exactly and is never added to the durable Owner journal.
+type vnextOwnerInventoryRequest struct {
+	RequestID  string
+	OwnerID    string
+	OwnerEpoch uint64
+}
+
+type vnextOwnerInventoryResponse struct {
+	RequestID        string
+	OwnerID          string
+	OwnerEpoch       uint64
+	SnapshotSequence uint64
+	Devices          []vnextOwnerInventoryDevice
+}
+
 // vnextOwnerExternalSealRequest is the complete producer seal request. The
 // TRCRC006 map remains the memory-page evidence. ExternalContentPageCRCs must
 // cover every other producer-written page in the durable grant exactly once;
@@ -281,6 +298,55 @@ func newVNextOwnerService(
 		}
 	}
 	return &vnextOwnerService{group: group, directory: directory}, nil
+}
+
+// inventory is read-only. It intentionally does not take service.mu: the
+// Owner group lock is the authority boundary and produces one atomic snapshot
+// without making a long-running seal operation hold an unrelated service-wide
+// queue. The read never persists or advances SnapshotSequence.
+func (service *vnextOwnerService) inventory(
+	request vnextOwnerInventoryRequest,
+) (vnextOwnerInventoryResponse, error) {
+	const operation = "inventory"
+	if service == nil || service.group == nil {
+		return vnextOwnerInventoryResponse{}, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceUnavailable,
+			"Owner group is not configured",
+			nil)
+	}
+	if request.RequestID == "" || len(request.RequestID) > vnextMaxIdentityBytes ||
+		request.OwnerID == "" || len(request.OwnerID) > vnextMaxIdentityBytes ||
+		request.OwnerEpoch == 0 || request.OwnerEpoch > uint64(math.MaxInt64) {
+		return vnextOwnerInventoryResponse{}, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceInvalidRequest,
+			"inventory request identity is incomplete or outside the signed ABI",
+			nil)
+	}
+
+	snapshot, err := service.group.inventory(request.OwnerID, request.OwnerEpoch)
+	if err != nil {
+		if errors.Is(err, errVNextAuthority) {
+			return vnextOwnerInventoryResponse{}, vnextOwnerServiceFailure(
+				operation,
+				vnextOwnerServiceIdentityMismatch,
+				"requested Owner identity is not the live Owner incarnation",
+				err)
+		}
+		return vnextOwnerInventoryResponse{}, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceUnavailable,
+			"Owner inventory is not available",
+			err)
+	}
+	return vnextOwnerInventoryResponse{
+		RequestID:        request.RequestID,
+		OwnerID:          snapshot.OwnerID,
+		OwnerEpoch:       snapshot.OwnerEpoch,
+		SnapshotSequence: snapshot.SnapshotSequence,
+		Devices:          append([]vnextOwnerInventoryDevice(nil), snapshot.Devices...),
+	}, nil
 }
 
 func (service *vnextOwnerService) reserve(

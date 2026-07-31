@@ -109,6 +109,15 @@ func vnextOwnerRPCTestReserveRequest(ownerID string) vnextOwnerRPCReserveRequest
 	}
 }
 
+func vnextOwnerRPCTestInventoryRequest(ownerID string) vnextOwnerRPCInventoryRequest {
+	return vnextOwnerRPCInventoryRequest{
+		Protocol:           vnextOwnerRPCProtocol,
+		RequestID:          "rpc-inventory-request",
+		ExpectedOwnerID:    ownerID,
+		ExpectedOwnerEpoch: 7,
+	}
+}
+
 func vnextOwnerRPCTestRoundTrip(
 	t *testing.T,
 	rpc *vnextOwnerRPC,
@@ -141,6 +150,66 @@ func vnextOwnerRPCTestRoundTrip(
 		t.Fatalf("decode daemon response: %v", err)
 	}
 	return response
+}
+
+func TestVNextOwnerRPCInventoryUsesStrictDaemonFrameAndMinimalResponse(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
+		{UUID: "rpc-inventory-z", Size: 256 << 10},
+		{UUID: "rpc-inventory-a", Size: 384 << 10},
+	})
+	rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+	fixture.group.mu.Lock()
+	wantSequence := fixture.group.journal.SnapshotSequence
+	fixture.group.mu.Unlock()
+	request := vnextOwnerRPCTestInventoryRequest("owner-0")
+	response := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
+		CommandLabel:        "rpc-inventory-test",
+		Operation:           vnextOwnerRPCOperationInventory,
+		VNextOwnerInventory: marshalVNextOwnerRPCTestPayload(t, request),
+	})
+	if !response.Ok || response.Operation != vnextOwnerRPCOperationInventory ||
+		response.Error != "" || response.ErrorCode != "" {
+		t.Fatalf("inventory daemon round trip failed: %#v", response)
+	}
+	fields := requireVNextOwnerRPCJSONFields(
+		t,
+		[]byte(response.Stdout),
+		"protocol",
+		"operation",
+		"requestId",
+		"ownerId",
+		"ownerEpoch",
+		"snapshotSequence",
+		"devices")
+	var wire vnextOwnerRPCInventoryResponse
+	if err := decodeStrictVNextOwnerRPC([]byte(response.Stdout), &wire); err != nil {
+		t.Fatalf("decode strict inventory response: %v", err)
+	}
+	if wire.Protocol != vnextOwnerRPCProtocol ||
+		wire.Operation != vnextOwnerRPCOperationInventory ||
+		wire.RequestID != request.RequestID || wire.OwnerID != request.ExpectedOwnerID ||
+		wire.OwnerEpoch != request.ExpectedOwnerEpoch ||
+		wire.SnapshotSequence != wantSequence || len(wire.Devices) != 2 ||
+		wire.Devices[0].DeviceUUID != "rpc-inventory-a" ||
+		wire.Devices[1].DeviceUUID != "rpc-inventory-z" {
+		t.Fatalf("inventory response did not echo the exact stable snapshot: %#v", wire)
+	}
+	var devices []json.RawMessage
+	if err := json.Unmarshal(fields["devices"], &devices); err != nil || len(devices) != 2 {
+		t.Fatalf("decode inventory device table: %v / %d", err, len(devices))
+	}
+	for _, device := range devices {
+		requireVNextOwnerRPCJSONFields(
+			t, device, "deviceUuid", "totalDataPages", "freeDataPages")
+	}
+	fixture.group.mu.Lock()
+	gotSequence := fixture.group.journal.SnapshotSequence
+	transactions := len(fixture.group.journal.Transactions)
+	fixture.group.mu.Unlock()
+	if gotSequence != wantSequence || transactions != 0 {
+		t.Fatalf("inventory mutated durable Owner state: sequence=%d/%d transactions=%d",
+			gotSequence, wantSequence, transactions)
+	}
 }
 
 func TestVNextOwnerRPCReserveUsesActualDaemonFrameAndReturnsPortablePlacement(t *testing.T) {
@@ -250,6 +319,24 @@ func TestVNextOwnerRPCStrictlyRejectsUnknownAndTrailingJSON(t *testing.T) {
 	if mixed.Ok || mixed.ErrorCode != string(vnextOwnerServiceInvalidRequest) ||
 		!strings.Contains(mixed.Error, "legacy operation payload") {
 		t.Fatalf("mixed VNext/legacy payload was not rejected: %#v", mixed)
+	}
+}
+
+func TestVNextOwnerRPCInventoryRejectsStaleIdentityBeforeReturningCapacity(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "rpc-inventory-stale", Size: 256 << 10,
+	}})
+	rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+	request := vnextOwnerRPCTestInventoryRequest("owner-stale")
+	response := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
+		CommandLabel:        "rpc-inventory-stale-test",
+		Operation:           vnextOwnerRPCOperationInventory,
+		VNextOwnerInventory: marshalVNextOwnerRPCTestPayload(t, request),
+	})
+	if response.Ok ||
+		response.ErrorCode != string(vnextOwnerServiceIdentityMismatch) ||
+		response.Stdout != "" || !strings.Contains(response.Error, "identity") {
+		t.Fatalf("stale Owner received inventory capacity: %#v", response)
 	}
 }
 
@@ -423,6 +510,30 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 			}`),
 			target:  &vnextOwnerRPCLifecycleRequest{},
 			contain: `missing required field "allocationRecordId"`,
+		},
+		{
+			name: "inventory expected Owner epoch",
+			raw: []byte(`{
+				"protocol":"cxld.vnext-owner.v1",
+				"requestId":"r",
+				"expectedOwnerId":"owner-a"
+			}`),
+			target:  &vnextOwnerRPCInventoryRequest{},
+			contain: `missing required field "expectedOwnerEpoch"`,
+		},
+		{
+			name: "inventory response device array",
+			raw: []byte(`{
+				"protocol":"cxld.vnext-owner.v1",
+				"operation":"vnextOwnerInventory",
+				"requestId":"r",
+				"ownerId":"owner-a",
+				"ownerEpoch":1,
+				"snapshotSequence":1,
+				"devices":null
+			}`),
+			target:  &vnextOwnerRPCInventoryResponse{},
+			contain: "must be a JSON array",
 		},
 		{
 			name:    "null external CRC array",

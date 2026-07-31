@@ -331,6 +331,45 @@ func TestVNextOwnerTLSReserveUsesRealMutualTLSFraming(t *testing.T) {
 	}
 }
 
+func TestVNextOwnerTLSInventoryUsesRealMutualTLSFramingWithoutMutation(t *testing.T) {
+	material := newVNextOwnerTLSTestMaterial(t)
+	server, fixture, _ := startVNextOwnerTLSTestServer(t, material, nil)
+	transport, err := newVNextOwnerTLSRoundTripper(
+		vnextOwnerTLSTestClientConfig(material, server.Addr().String()))
+	if err != nil {
+		t.Fatalf("create VNext Owner TLS inventory transport: %v", err)
+	}
+	client, err := newVNextOwnerClient(transport)
+	if err != nil {
+		t.Fatalf("create strict VNext Owner inventory client: %v", err)
+	}
+	fixture.group.mu.Lock()
+	wantSequence := fixture.group.journal.SnapshotSequence
+	fixture.group.mu.Unlock()
+	response, err := client.Inventory(context.Background(), vnextOwnerInventoryRequest{
+		RequestID:  "tls-inventory-request",
+		OwnerID:    "owner-0",
+		OwnerEpoch: 7,
+	})
+	if err != nil {
+		t.Fatalf("Inventory over real VNext Owner mTLS framing: %v", err)
+	}
+	if response.RequestID != "tls-inventory-request" || response.OwnerID != "owner-0" ||
+		response.OwnerEpoch != 7 || response.SnapshotSequence != wantSequence ||
+		len(response.Devices) != 1 || response.Devices[0].DeviceUUID != "tls-device" ||
+		response.Devices[0].FreeDataPages != response.Devices[0].TotalDataPages {
+		t.Fatalf("unexpected TLS Inventory response: %#v", response)
+	}
+	fixture.group.mu.Lock()
+	gotSequence := fixture.group.journal.SnapshotSequence
+	transactions := len(fixture.group.journal.Transactions)
+	fixture.group.mu.Unlock()
+	if gotSequence != wantSequence || transactions != 0 {
+		t.Fatalf("TLS inventory mutated Owner state: sequence=%d/%d transactions=%d",
+			gotSequence, wantSequence, transactions)
+	}
+}
+
 func TestVNextOwnerTLSRejectsUntrustedOrUnallowlistedPeersBeforeDispatch(t *testing.T) {
 	tests := []struct {
 		name         string

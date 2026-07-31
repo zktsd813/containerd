@@ -15,10 +15,11 @@ import (
 const (
 	vnextOwnerRPCProtocol = "cxld.vnext-owner.v1"
 
-	vnextOwnerRPCOperationReserve = "vnextOwnerReserve"
-	vnextOwnerRPCOperationSeal    = "vnextOwnerSeal"
-	vnextOwnerRPCOperationCommit  = "vnextOwnerCommit"
-	vnextOwnerRPCOperationAbort   = "vnextOwnerAbort"
+	vnextOwnerRPCOperationReserve   = "vnextOwnerReserve"
+	vnextOwnerRPCOperationSeal      = "vnextOwnerSeal"
+	vnextOwnerRPCOperationCommit    = "vnextOwnerCommit"
+	vnextOwnerRPCOperationAbort     = "vnextOwnerAbort"
+	vnextOwnerRPCOperationInventory = "vnextOwnerInventory"
 
 	// JSON/base64 is intentionally limited below the 64 MiB publication codec
 	// ceiling. At 40 bytes per record, eight MiB of TRCRC006 describes roughly
@@ -36,7 +37,11 @@ const (
 	vnextOwnerRPCMaxExternalContentPageCRCs = 1 << 17
 	vnextOwnerRPCMaxContents                = 4096
 	vnextOwnerRPCMaxExtents                 = 256
-	// The complete daemon envelope currently defines fourteen fields. Keep a
+	// A device UUID can use the complete 4 KiB identity limit. Even if every
+	// byte needs HTML-safe JSON escaping, this count keeps both the inner
+	// inventory JSON and its escaped outer execResponse below 32 MiB.
+	vnextOwnerRPCMaxInventoryDevices = 1024
+	// The complete daemon envelope currently defines fifteen fields. Keep a
 	// little legacy headroom, but reject an attacker-controlled number of
 	// unknown or duplicate members before retaining RawMessage entries.
 	vnextOwnerRPCMaxDaemonFields = 32
@@ -184,6 +189,31 @@ type vnextOwnerRPCLifecycleResponse struct {
 	Protocol  string `json:"protocol"`
 	Operation string `json:"operation"`
 	State     string `json:"state"`
+}
+
+type vnextOwnerRPCInventoryRequest struct {
+	Protocol           string `json:"protocol"`
+	RequestID          string `json:"requestId"`
+	ExpectedOwnerID    string `json:"expectedOwnerId"`
+	ExpectedOwnerEpoch uint64 `json:"expectedOwnerEpoch"`
+}
+
+type vnextOwnerRPCInventoryDevice struct {
+	DeviceUUID     string `json:"deviceUuid"`
+	TotalDataPages uint64 `json:"totalDataPages"`
+	FreeDataPages  uint64 `json:"freeDataPages"`
+}
+
+type vnextOwnerRPCInventoryDevices []vnextOwnerRPCInventoryDevice
+
+type vnextOwnerRPCInventoryResponse struct {
+	Protocol         string                        `json:"protocol"`
+	Operation        string                        `json:"operation"`
+	RequestID        string                        `json:"requestId"`
+	OwnerID          string                        `json:"ownerId"`
+	OwnerEpoch       uint64                        `json:"ownerEpoch"`
+	SnapshotSequence uint64                        `json:"snapshotSequence"`
+	Devices          vnextOwnerRPCInventoryDevices `json:"devices"`
 }
 
 func (contents *vnextOwnerRPCReserveContents) UnmarshalJSON(raw []byte) error {
@@ -335,6 +365,8 @@ func runVNextOwnerRPC(
 		return rpc.commit(raw)
 	case vnextOwnerRPCOperationAbort:
 		return rpc.abort(raw)
+	case vnextOwnerRPCOperationInventory:
+		return rpc.inventory(raw)
 	default:
 		return vnextOwnerRPCErrorResponse(fmt.Errorf("unsupported VNext Owner operation %q", operation))
 	}
@@ -345,7 +377,8 @@ func isVNextOwnerRPCOperation(operation string) bool {
 	case vnextOwnerRPCOperationReserve,
 		vnextOwnerRPCOperationSeal,
 		vnextOwnerRPCOperationCommit,
-		vnextOwnerRPCOperationAbort:
+		vnextOwnerRPCOperationAbort,
+		vnextOwnerRPCOperationInventory:
 		return true
 	default:
 		return false
@@ -372,6 +405,7 @@ var vnextOwnerRPCDaemonFields = map[string]struct{}{
 	"vnextOwnerSeal":       {},
 	"vnextOwnerCommit":     {},
 	"vnextOwnerAbort":      {},
+	"vnextOwnerInventory":  {},
 }
 
 var vnextOwnerRPCLegacyPayloadFields = map[string]struct{}{
@@ -506,6 +540,8 @@ func decodeVNextOwnerRPCDaemonEnvelope(
 			request.VNextOwnerCommit = append(json.RawMessage(nil), field.raw...)
 		case "vnextOwnerAbort":
 			request.VNextOwnerAbort = append(json.RawMessage(nil), field.raw...)
+		case "vnextOwnerInventory":
+			request.VNextOwnerInventory = append(json.RawMessage(nil), field.raw...)
 		}
 	}
 	if !isVNextOwnerRPCOperation(strings.TrimSpace(request.Operation)) {
@@ -542,6 +578,7 @@ func vnextOwnerRPCPayload(operation string, request daemonRequest) (json.RawMess
 		{vnextOwnerRPCOperationSeal, request.VNextOwnerSeal},
 		{vnextOwnerRPCOperationCommit, request.VNextOwnerCommit},
 		{vnextOwnerRPCOperationAbort, request.VNextOwnerAbort},
+		{vnextOwnerRPCOperationInventory, request.VNextOwnerInventory},
 	}
 	present := 0
 	var selected json.RawMessage
@@ -562,6 +599,95 @@ func vnextOwnerRPCPayload(operation string, request daemonRequest) (json.RawMess
 		return nil, fmt.Errorf("%s operation is missing its matching payload", operation)
 	}
 	return selected, nil
+}
+
+func (rpc *vnextOwnerRPC) inventory(raw json.RawMessage) execResponse {
+	var wire vnextOwnerRPCInventoryRequest
+	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	if err := validateVNextOwnerClientText("inventory request ID", wire.RequestID); err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	if err := validateVNextOwnerClientText(
+		"expected Owner ID", wire.ExpectedOwnerID); err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	if wire.ExpectedOwnerEpoch == 0 ||
+		wire.ExpectedOwnerEpoch > uint64(math.MaxInt64) {
+		return vnextOwnerRPCErrorResponse(errors.New(
+			"expected Owner epoch is outside the signed ABI"))
+	}
+
+	response, err := rpc.service.inventory(vnextOwnerInventoryRequest{
+		RequestID:  wire.RequestID,
+		OwnerID:    wire.ExpectedOwnerID,
+		OwnerEpoch: wire.ExpectedOwnerEpoch,
+	})
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	if response.RequestID != wire.RequestID ||
+		response.OwnerID != wire.ExpectedOwnerID ||
+		response.OwnerEpoch != wire.ExpectedOwnerEpoch ||
+		response.SnapshotSequence == 0 ||
+		response.SnapshotSequence > uint64(math.MaxInt64) ||
+		len(response.Devices) == 0 ||
+		len(response.Devices) > vnextOwnerRPCMaxInventoryDevices {
+		return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+			"inventory",
+			vnextOwnerServiceUnavailable,
+			"Owner inventory cannot be represented by the bounded signed RPC contract",
+			nil))
+	}
+
+	wireResponse := vnextOwnerRPCInventoryResponse{
+		Protocol:         vnextOwnerRPCProtocol,
+		Operation:        vnextOwnerRPCOperationInventory,
+		RequestID:        response.RequestID,
+		OwnerID:          response.OwnerID,
+		OwnerEpoch:       response.OwnerEpoch,
+		SnapshotSequence: response.SnapshotSequence,
+		Devices: make(
+			vnextOwnerRPCInventoryDevices, len(response.Devices)),
+	}
+	previousUUID := ""
+	for index, device := range response.Devices {
+		if err := validateVNextOwnerClientDeviceID(device.DeviceUUID); err != nil {
+			return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+				"inventory",
+				vnextOwnerServiceUnavailable,
+				"Owner inventory contains an invalid device UUID",
+				err))
+		}
+		if index > 0 && previousUUID >= device.DeviceUUID {
+			return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+				"inventory",
+				vnextOwnerServiceUnavailable,
+				"Owner inventory is not strictly UUID-sorted",
+				errVNextCorrupt))
+		}
+		if device.TotalDataPages == 0 ||
+			device.TotalDataPages > uint64(math.MaxInt64) ||
+			device.FreeDataPages > device.TotalDataPages ||
+			device.FreeDataPages > uint64(math.MaxInt64) {
+			return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+				"inventory",
+				vnextOwnerServiceUnavailable,
+				"Owner inventory contains capacity outside the signed ABI",
+				errVNextCorrupt))
+		}
+		wireResponse.Devices[index] = vnextOwnerRPCInventoryDevice{
+			DeviceUUID:     device.DeviceUUID,
+			TotalDataPages: device.TotalDataPages,
+			FreeDataPages:  device.FreeDataPages,
+		}
+		previousUUID = device.DeviceUUID
+	}
+	return marshalVNextOwnerRPCResponse(wireResponse)
 }
 
 func (rpc *vnextOwnerRPC) reserve(raw json.RawMessage) execResponse {
@@ -941,6 +1067,8 @@ func validateVNextOwnerRPCJSONValue(
 			limit = vnextOwnerRPCMaxSidecars
 		case reflect.TypeOf(vnextOwnerRPCExternalContentPageCRCs{}):
 			limit = vnextOwnerRPCMaxExternalContentPageCRCs
+		case reflect.TypeOf(vnextOwnerRPCInventoryDevices{}):
+			limit = vnextOwnerRPCMaxInventoryDevices
 		}
 		count := 0
 		for decoder.More() {

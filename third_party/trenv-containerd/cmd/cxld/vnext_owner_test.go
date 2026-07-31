@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 )
 
 const (
@@ -119,6 +121,164 @@ func writeAllVNextOwnerPages(
 		if err := group.writePage(grant, logicalPage, content); err != nil {
 			t.Fatalf("write Owner logical page %d: %v", logicalPage, err)
 		}
+	}
+}
+
+func vnextOwnerInventoryFreePages(snapshot vnextOwnerInventorySnapshot) uint64 {
+	var pages uint64
+	for _, device := range snapshot.Devices {
+		pages += device.FreeDataPages
+	}
+	return pages
+}
+
+func TestVNextOwnerInventoryIsStableAndTracksReserveAbort(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
+		{UUID: "inventory-device-b", Size: 256 << 10},
+		{UUID: "inventory-device-a", Size: 384 << 10},
+	})
+	initial, err := fixture.group.inventory("owner-0", 7)
+	if err != nil {
+		t.Fatalf("read initial Owner inventory: %v", err)
+	}
+	if initial.OwnerID != "owner-0" || initial.OwnerEpoch != 7 ||
+		initial.SnapshotSequence == 0 || len(initial.Devices) != 2 ||
+		initial.Devices[0].DeviceUUID != "inventory-device-a" ||
+		initial.Devices[1].DeviceUUID != "inventory-device-b" {
+		t.Fatalf("initial inventory is not complete and UUID-stable: %#v", initial)
+	}
+	for _, device := range initial.Devices {
+		if device.TotalDataPages == 0 || device.FreeDataPages != device.TotalDataPages {
+			t.Fatalf("fresh inventory has unexpected capacity: %#v", device)
+		}
+	}
+	initialRetry, err := fixture.group.inventory("owner-0", 7)
+	if err != nil {
+		t.Fatalf("retry initial Owner inventory: %v", err)
+	}
+	if !reflect.DeepEqual(initialRetry, initial) {
+		t.Fatalf("read-only inventory changed the journal or counts: %#v != %#v",
+			initialRetry, initial)
+	}
+
+	request := vnextOwnerMemoryRequest("inventory-capacity", 3, 2)
+	grant, err := fixture.group.reserve(request)
+	if err != nil {
+		t.Fatalf("reserve inventory capacity: %v", err)
+	}
+	reserved, err := fixture.group.inventory("owner-0", 7)
+	if err != nil {
+		t.Fatalf("read reserved Owner inventory: %v", err)
+	}
+	if reserved.SnapshotSequence <= initial.SnapshotSequence ||
+		vnextOwnerInventoryFreePages(initial)-vnextOwnerInventoryFreePages(reserved) != 3 {
+		t.Fatalf("reserve was not reflected atomically in inventory: before=%#v after=%#v",
+			initial, reserved)
+	}
+	reservedRetry, err := fixture.group.inventory("owner-0", 7)
+	if err != nil || !reflect.DeepEqual(reservedRetry, reserved) {
+		t.Fatalf("reserved inventory read was not idempotent: %v / %#v", err, reservedRetry)
+	}
+
+	if err := fixture.group.abort(grant); err != nil {
+		t.Fatalf("abort inventory allocation: %v", err)
+	}
+	aborted, err := fixture.group.inventory("owner-0", 7)
+	if err != nil {
+		t.Fatalf("read aborted Owner inventory: %v", err)
+	}
+	if aborted.SnapshotSequence <= reserved.SnapshotSequence ||
+		vnextOwnerInventoryFreePages(aborted) != vnextOwnerInventoryFreePages(initial) {
+		t.Fatalf("abort did not restore inventory capacity: reserved=%#v aborted=%#v",
+			reserved, aborted)
+	}
+}
+
+func TestVNextOwnerInventoryCannotObservePartialMultiDeviceReserve(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
+		{UUID: "inventory-atomic-a", Size: 256 << 10},
+		{UUID: "inventory-atomic-b", Size: 256 << 10},
+	})
+	initial, err := fixture.group.inventory("owner-0", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pages := fixture.devices[0].superblock.Geometry.DataPageCount + 1
+	request := vnextOwnerMemoryRequest("inventory-atomic", pages, 2)
+	firstFragmentPrepared := make(chan struct{})
+	releaseReserve := make(chan struct{})
+	blocked := false
+	fixture.group.faultHook = func(stage, _ string) error {
+		if stage == vnextOwnerFailAfterPrepare && !blocked {
+			blocked = true
+			close(firstFragmentPrepared)
+			<-releaseReserve
+		}
+		return nil
+	}
+	type reserveResult struct {
+		grant vnextOwnerWriteGrant
+		err   error
+	}
+	reserveDone := make(chan reserveResult, 1)
+	go func() {
+		grant, reserveErr := fixture.group.reserve(request)
+		reserveDone <- reserveResult{grant: grant, err: reserveErr}
+	}()
+	<-firstFragmentPrepared
+
+	inventoryStarted := make(chan struct{})
+	inventoryDone := make(chan vnextOwnerInventorySnapshot, 1)
+	inventoryErr := make(chan error, 1)
+	go func() {
+		close(inventoryStarted)
+		snapshot, inventoryReadErr := fixture.group.inventory("owner-0", 7)
+		if inventoryReadErr != nil {
+			inventoryErr <- inventoryReadErr
+			return
+		}
+		inventoryDone <- snapshot
+	}()
+	<-inventoryStarted
+	select {
+	case snapshot := <-inventoryDone:
+		t.Fatalf("inventory crossed the Owner lock during partial prepare: %#v", snapshot)
+	case err := <-inventoryErr:
+		t.Fatalf("inventory unexpectedly failed during partial prepare: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseReserve)
+	result := <-reserveDone
+	if result.err != nil {
+		t.Fatalf("complete multi-device reserve: %v", result.err)
+	}
+	var snapshot vnextOwnerInventorySnapshot
+	select {
+	case snapshot = <-inventoryDone:
+	case err := <-inventoryErr:
+		t.Fatalf("inventory after reserve: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("inventory remained blocked after reserve completed")
+	}
+	if consumed := vnextOwnerInventoryFreePages(initial) -
+		vnextOwnerInventoryFreePages(snapshot); consumed != pages {
+		t.Fatalf("atomic inventory saw %d consumed pages, want %d: %#v",
+			consumed, pages, snapshot)
+	}
+	if err := fixture.group.abort(result.grant); err != nil {
+		t.Fatalf("abort atomic inventory allocation: %v", err)
+	}
+}
+
+func TestVNextOwnerInventoryRejectsUnsignedJournalSequence(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "inventory-sequence", Size: 256 << 10,
+	}})
+	fixture.group.mu.Lock()
+	fixture.group.journal.SnapshotSequence = uint64(math.MaxInt64) + 1
+	fixture.group.mu.Unlock()
+	if _, err := fixture.group.inventory("owner-0", 7); !errors.Is(err, errVNextCorrupt) {
+		t.Fatalf("unsigned journal sequence returned %v, want corruption", err)
 	}
 }
 

@@ -47,20 +47,21 @@ var (
 )
 
 type daemonRequest struct {
-	CommandLabel      string                    `json:"commandLabel"`
-	TimeoutMillis     int64                     `json:"timeoutMillis"`
-	Operation         string                    `json:"operation"`
-	CreateContainer   *createContainerRequest   `json:"createContainer,omitempty"`
-	Checkpoint        *checkpointRequest        `json:"checkpointContainer,omitempty"`
-	Restore           *switchRequest            `json:"restoreIntoContainer,omitempty"`
-	Switch            *switchRequest            `json:"switchIntoCandidate,omitempty"`
-	Container         *containerRequest         `json:"container,omitempty"`
-	Cleanup           *cleanupContainersRequest `json:"cleanupContainers,omitempty"`
-	MetadataResolve   *metadataResolveRequest   `json:"metadataResolve,omitempty"`
-	VNextOwnerReserve json.RawMessage           `json:"vnextOwnerReserve,omitempty"`
-	VNextOwnerSeal    json.RawMessage           `json:"vnextOwnerSeal,omitempty"`
-	VNextOwnerCommit  json.RawMessage           `json:"vnextOwnerCommit,omitempty"`
-	VNextOwnerAbort   json.RawMessage           `json:"vnextOwnerAbort,omitempty"`
+	CommandLabel        string                    `json:"commandLabel"`
+	TimeoutMillis       int64                     `json:"timeoutMillis"`
+	Operation           string                    `json:"operation"`
+	CreateContainer     *createContainerRequest   `json:"createContainer,omitempty"`
+	Checkpoint          *checkpointRequest        `json:"checkpointContainer,omitempty"`
+	Restore             *switchRequest            `json:"restoreIntoContainer,omitempty"`
+	Switch              *switchRequest            `json:"switchIntoCandidate,omitempty"`
+	Container           *containerRequest         `json:"container,omitempty"`
+	Cleanup             *cleanupContainersRequest `json:"cleanupContainers,omitempty"`
+	MetadataResolve     *metadataResolveRequest   `json:"metadataResolve,omitempty"`
+	VNextOwnerReserve   json.RawMessage           `json:"vnextOwnerReserve,omitempty"`
+	VNextOwnerSeal      json.RawMessage           `json:"vnextOwnerSeal,omitempty"`
+	VNextOwnerCommit    json.RawMessage           `json:"vnextOwnerCommit,omitempty"`
+	VNextOwnerAbort     json.RawMessage           `json:"vnextOwnerAbort,omitempty"`
+	VNextOwnerInventory json.RawMessage           `json:"vnextOwnerInventory,omitempty"`
 }
 
 // A structured checkpoint request is preferred over allowing the invoker to
@@ -441,7 +442,8 @@ func runCommandWithVNextOwnerRPC(
 	case vnextOwnerRPCOperationReserve,
 		vnextOwnerRPCOperationSeal,
 		vnextOwnerRPCOperationCommit,
-		vnextOwnerRPCOperationAbort:
+		vnextOwnerRPCOperationAbort,
+		vnextOwnerRPCOperationInventory:
 		return runVNextOwnerRPC(operation, req, vnextOwnerRPC)
 	case "":
 		return execResponse{Ok: false, Error: "operation is empty"}
