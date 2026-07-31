@@ -24,10 +24,11 @@ import (
 )
 
 const (
-	testVNextOwnerTLSServerName = "owner.test"
-	testVNextOwnerTLSServerURI  = "spiffe://trenv.test/owner/owner-0"
-	testVNextOwnerTLSClientURI  = "spiffe://trenv.test/scheduler/scheduler-0"
-	testVNextOwnerTLSDeniedURI  = "spiffe://trenv.test/scheduler/denied"
+	testVNextOwnerTLSServerName  = "owner.test"
+	testVNextOwnerTLSServerURI   = "spiffe://trenv.test/owner/owner-0"
+	testVNextOwnerTLSClientURI   = "spiffe://trenv.test/scheduler/scheduler-0"
+	testVNextOwnerTLSProducerURI = "spiffe://trenv.test/producer/producer-0"
+	testVNextOwnerTLSDeniedURI   = "spiffe://trenv.test/scheduler/denied"
 )
 
 type vnextOwnerTLSTestAuthority struct {
@@ -37,14 +38,18 @@ type vnextOwnerTLSTestAuthority struct {
 }
 
 type vnextOwnerTLSTestMaterial struct {
-	caPath                string
-	wrongCAPath           string
-	serverCertificatePath string
-	serverPrivateKeyPath  string
-	clientCertificatePath string
-	clientPrivateKeyPath  string
-	deniedCertificatePath string
-	deniedPrivateKeyPath  string
+	caPath                   string
+	wrongCAPath              string
+	serverCertificatePath    string
+	serverPrivateKeyPath     string
+	clientCertificatePath    string
+	clientPrivateKeyPath     string
+	deniedCertificatePath    string
+	deniedPrivateKeyPath     string
+	producerCertificatePath  string
+	producerPrivateKeyPath   string
+	ambiguousCertificatePath string
+	ambiguousPrivateKeyPath  string
 }
 
 func newVNextOwnerTLSTestAuthority(t *testing.T, commonName string) vnextOwnerTLSTestAuthority {
@@ -88,14 +93,31 @@ func issueVNextOwnerTLSTestCertificate(
 	uriSAN string,
 	usage x509.ExtKeyUsage,
 ) ([]byte, []byte) {
+	return issueVNextOwnerTLSTestCertificateWithURISANs(
+		t, authority, serial, commonName, dnsNames, []string{uriSAN}, usage)
+}
+
+func issueVNextOwnerTLSTestCertificateWithURISANs(
+	t *testing.T,
+	authority vnextOwnerTLSTestAuthority,
+	serial int64,
+	commonName string,
+	dnsNames []string,
+	uriSANs []string,
+	usage x509.ExtKeyUsage,
+) ([]byte, []byte) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generate %s key: %v", commonName, err)
 	}
-	identity, err := url.Parse(uriSAN)
-	if err != nil {
-		t.Fatalf("parse %s URI SAN: %v", commonName, err)
+	identities := make([]*url.URL, len(uriSANs))
+	for index, uriSAN := range uriSANs {
+		identity, err := url.Parse(uriSAN)
+		if err != nil {
+			t.Fatalf("parse %s URI SAN %d: %v", commonName, index, err)
+		}
+		identities[index] = identity
 	}
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(serial),
@@ -105,7 +127,7 @@ func issueVNextOwnerTLSTestCertificate(
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{usage},
 		DNSNames:     dnsNames,
-		URIs:         []*url.URL{identity},
+		URIs:         identities,
 	}
 	der, err := x509.CreateCertificate(
 		rand.Reader, template, authority.certificate, &key.PublicKey, authority.privateKey)
@@ -149,6 +171,13 @@ func newVNextOwnerTLSTestMaterial(t *testing.T) vnextOwnerTLSTestMaterial {
 	deniedCertificate, deniedKey := issueVNextOwnerTLSTestCertificate(
 		t, authority, 4, "scheduler-denied", nil, testVNextOwnerTLSDeniedURI,
 		x509.ExtKeyUsageClientAuth)
+	producerCertificate, producerKey := issueVNextOwnerTLSTestCertificate(
+		t, authority, 5, "producer-0", nil, testVNextOwnerTLSProducerURI,
+		x509.ExtKeyUsageClientAuth)
+	ambiguousCertificate, ambiguousKey := issueVNextOwnerTLSTestCertificateWithURISANs(
+		t, authority, 6, "ambiguous-client", nil,
+		[]string{testVNextOwnerTLSClientURI, testVNextOwnerTLSProducerURI},
+		x509.ExtKeyUsageClientAuth)
 	return vnextOwnerTLSTestMaterial{
 		caPath: writeVNextOwnerTLSTestFile(
 			t, directory, "ca.pem", authority.certificatePEM),
@@ -166,6 +195,14 @@ func newVNextOwnerTLSTestMaterial(t *testing.T) vnextOwnerTLSTestMaterial {
 			t, directory, "denied.pem", deniedCertificate),
 		deniedPrivateKeyPath: writeVNextOwnerTLSTestFile(
 			t, directory, "denied-key.pem", deniedKey),
+		producerCertificatePath: writeVNextOwnerTLSTestFile(
+			t, directory, "producer.pem", producerCertificate),
+		producerPrivateKeyPath: writeVNextOwnerTLSTestFile(
+			t, directory, "producer-key.pem", producerKey),
+		ambiguousCertificatePath: writeVNextOwnerTLSTestFile(
+			t, directory, "ambiguous.pem", ambiguousCertificate),
+		ambiguousPrivateKeyPath: writeVNextOwnerTLSTestFile(
+			t, directory, "ambiguous-key.pem", ambiguousKey),
 	}
 }
 
@@ -173,11 +210,11 @@ func vnextOwnerTLSTestServerConfig(
 	material vnextOwnerTLSTestMaterial,
 ) vnextOwnerTLSServerConfig {
 	return vnextOwnerTLSServerConfig{
-		ListenAddress:         "127.0.0.1:0",
-		ServerCertificatePath: material.serverCertificatePath,
-		ServerPrivateKeyPath:  material.serverPrivateKeyPath,
-		ClientCAPath:          material.caPath,
-		AllowedClientURISANs:  []string{testVNextOwnerTLSClientURI},
+		ListenAddress:                 "127.0.0.1:0",
+		ServerCertificatePath:         material.serverCertificatePath,
+		ServerPrivateKeyPath:          material.serverPrivateKeyPath,
+		ClientCAPath:                  material.caPath,
+		AllowedSchedulerClientURISANs: []string{testVNextOwnerTLSClientURI},
 	}
 }
 
@@ -192,7 +229,19 @@ func vnextOwnerTLSTestClientConfig(
 		ClientPrivateKeyPath:  material.clientPrivateKeyPath,
 		ServerCAPath:          material.caPath,
 		ExpectedServerURISAN:  testVNextOwnerTLSServerURI,
+		CallerRole:            vnextOwnerCallerScheduler,
 	}
+}
+
+func vnextOwnerTLSProducerTestClientConfig(
+	material vnextOwnerTLSTestMaterial,
+	endpoint string,
+) vnextOwnerTLSClientConfig {
+	config := vnextOwnerTLSTestClientConfig(material, endpoint)
+	config.ClientCertificatePath = material.producerCertificatePath
+	config.ClientPrivateKeyPath = material.producerPrivateKeyPath
+	config.CallerRole = vnextOwnerCallerProducer
+	return config
 }
 
 func startVNextOwnerTLSTestServer(
@@ -370,6 +419,71 @@ func TestVNextOwnerTLSInventoryUsesRealMutualTLSFramingWithoutMutation(t *testin
 	}
 }
 
+func TestVNextOwnerTLSProducerCertificateCannotInvokeSchedulerControl(t *testing.T) {
+	material := newVNextOwnerTLSTestMaterial(t)
+	server, fixture, _ := startVNextOwnerTLSTestServer(t, material,
+		func(config *vnextOwnerTLSServerConfig) {
+			config.AllowedProducerClientURISANs = []string{testVNextOwnerTLSProducerURI}
+		})
+	transport, err := newVNextOwnerTLSRoundTripper(
+		vnextOwnerTLSProducerTestClientConfig(material, server.Addr().String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Use the authenticated TLS connection directly so this test exercises the
+	// server policy rather than the client's identical defense-in-depth check.
+	conn, err := tls.Dial("tcp", server.Addr().String(), transport.tlsConfig)
+	if err != nil {
+		t.Fatalf("dial allowed Producer TLS identity: %v", err)
+	}
+	defer conn.Close()
+	body, err := json.Marshal(vnextOwnerTLSTestDaemonRequest(t, "producer-control-denied"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFrame(conn, body); err != nil {
+		t.Fatal(err)
+	}
+	responseBody, err := readFrame(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := decodeStrictVNextOwnerTLSExecResponse(responseBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Ok || response.ErrorCode != string(vnextOwnerServicePermissionDenied) ||
+		response.Operation != vnextOwnerRPCOperationReserve {
+		t.Fatalf("Producer control response = %#v", response)
+	}
+	if count := vnextOwnerTLSTestTransactionCount(fixture); count != 0 {
+		t.Fatalf("denied Producer control call created %d transactions", count)
+	}
+}
+
+func TestVNextOwnerTLSRejectsAmbiguousMultipleRoleCertificate(t *testing.T) {
+	material := newVNextOwnerTLSTestMaterial(t)
+	server, fixture, _ := startVNextOwnerTLSTestServer(t, material,
+		func(config *vnextOwnerTLSServerConfig) {
+			config.AllowedProducerClientURISANs = []string{testVNextOwnerTLSProducerURI}
+		})
+	config := vnextOwnerTLSTestClientConfig(material, server.Addr().String())
+	config.ClientCertificatePath = material.ambiguousCertificatePath
+	config.ClientPrivateKeyPath = material.ambiguousPrivateKeyPath
+	transport, err := newVNextOwnerTLSRoundTripper(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = transport.RoundTrip(
+		context.Background(), vnextOwnerTLSTestDaemonRequest(t, "ambiguous-role"))
+	if err == nil {
+		t.Fatalf("ambiguous-role certificate error = %v", err)
+	}
+	if count := vnextOwnerTLSTestTransactionCount(fixture); count != 0 {
+		t.Fatalf("ambiguous TLS identity created %d transactions", count)
+	}
+}
+
 func TestVNextOwnerTLSRejectsUntrustedOrUnallowlistedPeersBeforeDispatch(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -515,11 +629,22 @@ func TestVNextOwnerTLSConfigurationIsAllOrNothing(t *testing.T) {
 	if enabled, err := validateVNextOwnerTLSServerConfig(complete, rpc); err != nil || !enabled {
 		t.Fatalf("complete TLS listener config = enabled %v, error %v", enabled, err)
 	}
+	overlap := complete
+	overlap.AllowedProducerClientURISANs = []string{testVNextOwnerTLSClientURI}
+	if _, err := validateVNextOwnerTLSServerConfig(overlap, rpc); err == nil ||
+		!strings.Contains(err.Error(), "both scheduler and producer") {
+		t.Fatalf("overlapping role URI SAN error = %v", err)
+	}
 
 	client := vnextOwnerTLSTestClientConfig(material, "127.0.0.1:1")
 	client.ClientCertificatePath = ""
 	if _, err := newVNextOwnerTLSRoundTripper(client); err == nil {
 		t.Fatal("TLS client without an explicit client certificate was accepted")
+	}
+	client = vnextOwnerTLSTestClientConfig(material, "127.0.0.1:1")
+	client.CallerRole = vnextOwnerCallerUnknown
+	if _, err := newVNextOwnerTLSRoundTripper(client); err == nil {
+		t.Fatal("TLS client without an explicit transport role was accepted")
 	}
 	if _, err := parseVNextOwnerURIAllowlist(
 		testVNextOwnerTLSClientURI + "," + testVNextOwnerTLSClientURI); err == nil {

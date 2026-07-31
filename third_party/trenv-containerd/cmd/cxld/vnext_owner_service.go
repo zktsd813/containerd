@@ -42,6 +42,7 @@ const (
 	vnextOwnerServiceSidecarMissing            vnextOwnerServiceErrorCode = "crc_sidecar_missing"
 	vnextOwnerServiceSidecarInvalid            vnextOwnerServiceErrorCode = "crc_sidecar_invalid"
 	vnextOwnerServicePayloadMismatch           vnextOwnerServiceErrorCode = "payload_crc_mismatch"
+	vnextOwnerServicePermissionDenied          vnextOwnerServiceErrorCode = "permission_denied"
 	vnextOwnerServiceUnavailable               vnextOwnerServiceErrorCode = "owner_unavailable"
 )
 

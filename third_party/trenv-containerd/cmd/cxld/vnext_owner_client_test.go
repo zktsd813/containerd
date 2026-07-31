@@ -42,7 +42,7 @@ func (transport *vnextOwnerClientRecordingTransport) RoundTrip(
 		return execResponse{}, err
 	}
 	transport.requests = append(transport.requests, request)
-	return runCommandWithVNextOwnerRPC(request, transport.rpc), nil
+	return runCommandWithVNextOwnerRPCTestRole(request, transport.rpc), nil
 }
 
 func TestVNextOwnerClientReserveSealCommitThroughDaemonRoundTrip(t *testing.T) {

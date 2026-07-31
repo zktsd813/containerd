@@ -27,14 +27,17 @@ const (
 
 var activeVNextOwnerGateway *vnextOwnerGateway
 
-// vnextOwnerGatewayConfig is all-or-nothing. The shared client identity is
-// used only for outbound Scheduler-to-Owner mTLS; each route still pins the
-// exact server DNS name and URI SAN for one Owner incarnation.
+// vnextOwnerGatewayConfig has independent, role-bound outbound identities.
+// There is intentionally no shared certificate fallback: a route can be used
+// only when the authenticated inbound role has a configured transport for the
+// same role.
 type vnextOwnerGatewayConfig struct {
-	RouteFilePath         string
-	ClientCertificatePath string
-	ClientPrivateKeyPath  string
-	ServerCAPath          string
+	RouteFilePath                  string
+	SchedulerClientCertificatePath string
+	SchedulerClientPrivateKeyPath  string
+	ProducerClientCertificatePath  string
+	ProducerClientPrivateKeyPath   string
+	ServerCAPath                   string
 }
 
 type vnextOwnerGatewayRouteKey struct {
@@ -58,7 +61,7 @@ type vnextOwnerGatewayRouteFile struct {
 }
 
 type vnextOwnerGatewayRoute struct {
-	transport vnextOwnerClientRoundTripper
+	transports map[vnextOwnerCallerRole]vnextOwnerClientRoundTripper
 }
 
 type vnextOwnerGateway struct {
@@ -73,6 +76,62 @@ type vnextOwnerGateway struct {
 type vnextOwnerGatewayDependencies struct {
 	loadRouteFile func(string) ([]byte, error)
 	newTransport  func(vnextOwnerTLSClientConfig) (vnextOwnerClientRoundTripper, error)
+}
+
+type vnextOwnerGatewayCredential struct {
+	certificatePath string
+	privateKeyPath  string
+}
+
+func vnextOwnerGatewayCredentials(
+	config vnextOwnerGatewayConfig,
+) (map[vnextOwnerCallerRole]vnextOwnerGatewayCredential, error) {
+	credentials := make(map[vnextOwnerCallerRole]vnextOwnerGatewayCredential, 2)
+	add := func(
+		role vnextOwnerCallerRole,
+		certificatePath string,
+		privateKeyPath string,
+	) error {
+		if certificatePath == "" && privateKeyPath == "" {
+			return nil
+		}
+		if certificatePath == "" || privateKeyPath == "" {
+			return fmt.Errorf(
+				"VNext Owner gateway %s client certificate and private key must be configured together",
+				role)
+		}
+		credentials[role] = vnextOwnerGatewayCredential{
+			certificatePath: certificatePath,
+			privateKeyPath:  privateKeyPath,
+		}
+		return nil
+	}
+	if err := add(
+		vnextOwnerCallerScheduler,
+		config.SchedulerClientCertificatePath,
+		config.SchedulerClientPrivateKeyPath); err != nil {
+		return nil, err
+	}
+	if err := add(
+		vnextOwnerCallerProducer,
+		config.ProducerClientCertificatePath,
+		config.ProducerClientPrivateKeyPath); err != nil {
+		return nil, err
+	}
+	if len(credentials) == 0 {
+		return nil, errors.New(
+			"VNext Owner gateway requires at least one complete Scheduler or Producer client identity")
+	}
+	if len(credentials) == 2 {
+		scheduler := credentials[vnextOwnerCallerScheduler]
+		producer := credentials[vnextOwnerCallerProducer]
+		if scheduler.certificatePath == producer.certificatePath ||
+			scheduler.privateKeyPath == producer.privateKeyPath {
+			return nil, errors.New(
+				"VNext Owner gateway Scheduler and Producer client identities must use distinct certificate and key paths")
+		}
+	}
+	return credentials, nil
 }
 
 func defaultVNextOwnerGatewayDependencies() vnextOwnerGatewayDependencies {
@@ -97,33 +156,38 @@ func openVNextOwnerGatewayWithDependencies(
 	localRPC *vnextOwnerRPC,
 	dependencies vnextOwnerGatewayDependencies,
 ) (*vnextOwnerGateway, error) {
-	values := []string{
-		config.RouteFilePath,
-		config.ClientCertificatePath,
-		config.ClientPrivateKeyPath,
-		config.ServerCAPath,
-	}
-	configured := 0
-	for _, value := range values {
-		if value != "" {
-			configured++
-		}
-	}
-	if configured == 0 {
+	if config.RouteFilePath == "" && config.ServerCAPath == "" &&
+		config.SchedulerClientCertificatePath == "" &&
+		config.SchedulerClientPrivateKeyPath == "" &&
+		config.ProducerClientCertificatePath == "" &&
+		config.ProducerClientPrivateKeyPath == "" {
 		return nil, nil
 	}
-	if configured != len(values) {
+	if config.RouteFilePath == "" || config.ServerCAPath == "" {
 		return nil, errors.New(
-			"VNext Owner gateway requires route file, client certificate, client key, and server CA together")
+			"VNext Owner gateway requires route file and server CA together")
+	}
+	credentials, err := vnextOwnerGatewayCredentials(config)
+	if err != nil {
+		return nil, err
 	}
 	for role, path := range map[string]string{
-		"gateway route file":         config.RouteFilePath,
-		"gateway client certificate": config.ClientCertificatePath,
-		"gateway client private key": config.ClientPrivateKeyPath,
-		"gateway server CA":          config.ServerCAPath,
+		"gateway route file": config.RouteFilePath,
+		"gateway server CA":  config.ServerCAPath,
 	} {
 		if err := validateVNextOwnerRuntimePath(path, role); err != nil {
 			return nil, err
+		}
+	}
+	for role, credential := range credentials {
+		for kind, path := range map[string]string{
+			"client certificate": credential.certificatePath,
+			"client private key": credential.privateKeyPath,
+		} {
+			if err := validateVNextOwnerRuntimePath(
+				path, fmt.Sprintf("gateway %s %s", role, kind)); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if dependencies.loadRouteFile == nil || dependencies.newTransport == nil {
@@ -193,21 +257,29 @@ func openVNextOwnerGatewayWithDependencies(
 			return nil, fmt.Errorf(
 				"gateway route %d duplicates endpoint %q", index, wire.Endpoint)
 		}
-		transport, err := dependencies.newTransport(vnextOwnerTLSClientConfig{
-			Endpoint:              wire.Endpoint,
-			ServerName:            wire.ServerName,
-			ClientCertificatePath: config.ClientCertificatePath,
-			ClientPrivateKeyPath:  config.ClientPrivateKeyPath,
-			ServerCAPath:          config.ServerCAPath,
-			ExpectedServerURISAN:  wire.ServerURISAN,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("initialize gateway route %d: %w", index, err)
+		transports := make(map[vnextOwnerCallerRole]vnextOwnerClientRoundTripper, len(credentials))
+		for role, credential := range credentials {
+			transport, err := dependencies.newTransport(vnextOwnerTLSClientConfig{
+				Endpoint:              wire.Endpoint,
+				ServerName:            wire.ServerName,
+				ClientCertificatePath: credential.certificatePath,
+				ClientPrivateKeyPath:  credential.privateKeyPath,
+				ServerCAPath:          config.ServerCAPath,
+				ExpectedServerURISAN:  wire.ServerURISAN,
+				CallerRole:            role,
+			})
+			if err != nil {
+				return nil, fmt.Errorf(
+					"initialize gateway route %d %s transport: %w", index, role, err)
+			}
+			if transport == nil || vnextProducerInterfaceIsNil(transport) {
+				return nil, fmt.Errorf(
+					"initialize gateway route %d %s transport: transport is unavailable",
+					index, role)
+			}
+			transports[role] = transport
 		}
-		if transport == nil || vnextProducerInterfaceIsNil(transport) {
-			return nil, fmt.Errorf("initialize gateway route %d: transport is unavailable", index)
-		}
-		gateway.routes[key] = vnextOwnerGatewayRoute{transport: transport}
+		gateway.routes[key] = vnextOwnerGatewayRoute{transports: transports}
 		seenEndpoints[wire.Endpoint] = struct{}{}
 	}
 	return gateway, nil
@@ -475,7 +547,10 @@ func (transport *vnextOwnerGatewayCaptureTransport) RoundTrip(
 	return response, err
 }
 
-func (gateway *vnextOwnerGateway) dispatch(request daemonRequest) execResponse {
+func (gateway *vnextOwnerGateway) dispatch(
+	request daemonRequest,
+	callerRole vnextOwnerCallerRole,
+) execResponse {
 	startedAt := time.Now()
 	operation := strings.TrimSpace(request.Operation)
 	failure := func(code vnextOwnerServiceErrorCode, detail string, cause error) execResponse {
@@ -488,6 +563,10 @@ func (gateway *vnextOwnerGateway) dispatch(request daemonRequest) execResponse {
 	if !isVNextOwnerRPCOperation(operation) {
 		return failure(vnextOwnerServiceInvalidRequest,
 			"operation is not a strict VNext Owner operation", nil)
+	}
+	if err := authorizeVNextOwnerOperation(callerRole, operation); err != nil {
+		return failure(vnextOwnerServicePermissionDenied,
+			"caller is not authorized for this Owner operation", err)
 	}
 	call, err := decodeVNextOwnerGatewayCall(operation, request)
 	if err != nil {
@@ -506,7 +585,7 @@ func (gateway *vnextOwnerGateway) dispatch(request daemonRequest) execResponse {
 	if local {
 		// The exact local incarnation is always authoritative in-process. No
 		// route-file entry may shadow it, and this branch performs no network I/O.
-		response := runCommandWithVNextOwnerRPC(request, localRPC)
+		response := runCommandWithVNextOwnerRPCRole(request, localRPC, callerRole)
 		response.Operation = operation
 		if response.DurationMicros < 0 {
 			response.DurationMicros = 0
@@ -519,6 +598,13 @@ func (gateway *vnextOwnerGateway) dispatch(request daemonRequest) execResponse {
 			fmt.Sprintf("no exact route for Owner incarnation %q/%d", call.key.OwnerID, call.key.OwnerEpoch),
 			errVNextAuthority)
 	}
+	transport, transportConfigured := route.transports[callerRole]
+	if !transportConfigured || transport == nil || vnextProducerInterfaceIsNil(transport) {
+		return failure(
+			vnextOwnerServicePermissionDenied,
+			fmt.Sprintf("no %s gateway identity is configured", callerRole),
+			nil)
+	}
 	select {
 	case gateway.remoteAdmission <- struct{}{}:
 		defer func() { <-gateway.remoteAdmission }()
@@ -527,7 +613,7 @@ func (gateway *vnextOwnerGateway) dispatch(request daemonRequest) execResponse {
 			"remote Owner gateway concurrency limit is exhausted", nil)
 	}
 
-	capture := &vnextOwnerGatewayCaptureTransport{delegate: route.transport}
+	capture := &vnextOwnerGatewayCaptureTransport{delegate: transport}
 	client, err := newVNextOwnerClient(capture)
 	if err != nil {
 		return failure(vnextOwnerServiceUnavailable,
@@ -560,16 +646,17 @@ func (gateway *vnextOwnerGateway) dispatch(request daemonRequest) execResponse {
 	return capture.response
 }
 
-func runCommandWithVNextOwnerGateway(
+func runCommandWithVNextOwnerGatewayRole(
 	request daemonRequest,
 	localRPC *vnextOwnerRPC,
 	gateway *vnextOwnerGateway,
+	callerRole vnextOwnerCallerRole,
 ) execResponse {
 	operation := strings.TrimSpace(request.Operation)
 	if gateway != nil && isVNextOwnerRPCOperation(operation) {
-		return gateway.dispatch(request)
+		return gateway.dispatch(request, callerRole)
 	}
-	return runCommandWithVNextOwnerRPC(request, localRPC)
+	return runCommandWithVNextOwnerRPCRole(request, localRPC, callerRole)
 }
 
 func validateVNextOwnerGatewaySuccess(response execResponse, operation string) error {

@@ -27,9 +27,10 @@ import (
 )
 
 const (
-	daemonName           = "cxld"
-	defaultSocketPath    = "/run/" + daemonName + "/" + daemonName + ".sock"
-	daemonStateDirectory = daemonName + "-state"
+	daemonName                        = "cxld"
+	defaultSocketPath                 = "/run/" + daemonName + "/" + daemonName + ".sock"
+	defaultSchedulerControlSocketPath = "/run/" + daemonName + "-control/" + daemonName + ".sock"
+	daemonStateDirectory              = daemonName + "-state"
 	// The Unix socket remains a bounded control plane. Larger publication or
 	// CRC payloads require a future streaming or SCM_RIGHTS transport rather
 	// than increasing one JSON/base64 allocation without bound.
@@ -365,13 +366,15 @@ func writeDaemonResponse(conn net.Conn, payload []byte) {
 }
 
 func runCommand(req daemonRequest) execResponse {
-	return runCommandWithVNextOwnerGateway(
-		req, activeVNextOwnerRPC, activeVNextOwnerGateway)
+	return runCommandWithVNextOwnerGatewayRole(
+		req, activeVNextOwnerRPC, activeVNextOwnerGateway,
+		vnextOwnerCallerProducer)
 }
 
-func runCommandWithVNextOwnerRPC(
+func runCommandWithVNextOwnerRPCRole(
 	req daemonRequest,
 	vnextOwnerRPC *vnextOwnerRPC,
+	callerRole vnextOwnerCallerRole,
 ) (resp execResponse) {
 	startedAt := time.Now()
 	operation := strings.TrimSpace(req.Operation)
@@ -397,6 +400,9 @@ func runCommandWithVNextOwnerRPC(
 		resp.Operation = operation
 		resp.DurationMicros = elapsedMicros(startedAt)
 	}()
+	if err := authorizeDaemonOperation(callerRole, operation); err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
 	if vnextOwnerRPC != nil && vnextOwnerRejectsLegacyDAXOperation(operation) {
 		return execResponse{
 			Ok: false,
@@ -1122,6 +1128,21 @@ func envDefaultUint64(name string, fallback uint64) uint64 {
 		return fallback
 	}
 	return parsed
+}
+
+func envStrictInt64(name string, fallback int64) (int64, error) {
+	value, configured := os.LookupEnv(name)
+	if !configured {
+		return fallback, nil
+	}
+	if value == "" || strings.TrimSpace(value) != value {
+		return 0, fmt.Errorf("%s is empty or has surrounding whitespace", name)
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s=%q as int64: %w", name, value, err)
+	}
+	return parsed, nil
 }
 
 func safeJoin(root, name string) (string, error) {
@@ -2273,6 +2294,21 @@ func serveConnWithVNextOwnerGatewayLimits(
 	readTimeout time.Duration,
 	writeTimeout time.Duration,
 ) {
+	serveConnWithVNextOwnerGatewayPolicyLimits(
+		conn, vnextOwnerRPC, gateway, vnextOwnerRuntimeUnixPolicy,
+		requestAdmission, largeAdmission, readTimeout, writeTimeout)
+}
+
+func serveConnWithVNextOwnerGatewayPolicyLimits(
+	conn net.Conn,
+	vnextOwnerRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
+	unixPolicy vnextOwnerUnixListenerPolicy,
+	requestAdmission chan struct{},
+	largeAdmission chan struct{},
+	readTimeout time.Duration,
+	writeTimeout time.Duration,
+) {
 	if tryAcquireDaemonRequestAdmission(requestAdmission) {
 		defer func() { <-requestAdmission }()
 	} else {
@@ -2282,8 +2318,9 @@ func serveConnWithVNextOwnerGatewayLimits(
 		_ = conn.Close()
 		return
 	}
-	serveAdmittedConnWithVNextOwnerGatewayLimits(
-		conn, vnextOwnerRPC, gateway, largeAdmission, readTimeout, writeTimeout)
+	serveAdmittedConnWithVNextOwnerGatewayPolicyLimits(
+		conn, vnextOwnerRPC, gateway, unixPolicy, largeAdmission,
+		readTimeout, writeTimeout)
 }
 
 func serveAdmittedConnWithVNextOwnerRPCLimits(
@@ -2301,6 +2338,43 @@ func serveAdmittedConnWithVNextOwnerGatewayLimits(
 	conn net.Conn,
 	vnextOwnerRPC *vnextOwnerRPC,
 	gateway *vnextOwnerGateway,
+	largeAdmission chan struct{},
+	readTimeout time.Duration,
+	writeTimeout time.Duration,
+) {
+	serveAdmittedConnWithVNextOwnerGatewayPolicyLimits(
+		conn, vnextOwnerRPC, gateway, vnextOwnerRuntimeUnixPolicy,
+		largeAdmission, readTimeout, writeTimeout)
+}
+
+func serveAdmittedConnWithVNextOwnerGatewayPolicyLimits(
+	conn net.Conn,
+	vnextOwnerRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
+	unixPolicy vnextOwnerUnixListenerPolicy,
+	largeAdmission chan struct{},
+	readTimeout time.Duration,
+	writeTimeout time.Duration,
+) {
+	if err := unixPolicy.authenticate(conn); err != nil {
+		defer conn.Close()
+		_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		resp := vnextOwnerRPCErrorResponse(err)
+		resp.Operation = "unix-authentication"
+		respBody, _ := json.Marshal(resp)
+		writeDaemonResponse(conn, respBody)
+		return
+	}
+	serveAuthenticatedDaemonConnWithVNextOwnerGatewayRoleLimits(
+		conn, vnextOwnerRPC, gateway, unixPolicy.Role, largeAdmission,
+		readTimeout, writeTimeout)
+}
+
+func serveAuthenticatedDaemonConnWithVNextOwnerGatewayRoleLimits(
+	conn net.Conn,
+	vnextOwnerRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
+	callerRole vnextOwnerCallerRole,
 	largeAdmission chan struct{},
 	readTimeout time.Duration,
 	writeTimeout time.Duration,
@@ -2331,14 +2405,230 @@ func serveAdmittedConnWithVNextOwnerGatewayLimits(
 		return
 	}
 
-	respBody, _ := json.Marshal(runCommandWithVNextOwnerGateway(
-		req, vnextOwnerRPC, gateway))
+	respBody, _ := json.Marshal(runCommandWithVNextOwnerGatewayRole(
+		req, vnextOwnerRPC, gateway, callerRole))
 	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	writeDaemonResponse(conn, respBody)
 }
 
+type daemonUnixServer struct {
+	listener       net.Listener
+	socketPath     string
+	socketIdentity os.FileInfo
+	policy         vnextOwnerUnixListenerPolicy
+}
+
+func openDaemonUnixServer(
+	socketPath string,
+	directoryMode os.FileMode,
+	requireSetgidDirectory bool,
+	policy vnextOwnerUnixListenerPolicy,
+) (*daemonUnixServer, error) {
+	if socketPath == "" || strings.TrimSpace(socketPath) != socketPath {
+		return nil, errors.New("daemon Unix socket path is empty or has surrounding whitespace")
+	}
+	directoryPath := filepath.Dir(socketPath)
+	if requireSetgidDirectory {
+		directoryInfo, err := os.Lstat(directoryPath)
+		if err != nil {
+			return nil, fmt.Errorf("inspect pre-created control socket directory: %w", err)
+		}
+		if !directoryInfo.IsDir() || directoryInfo.Mode()&os.ModeSymlink != 0 {
+			return nil, errors.New(
+				"control socket parent must be a real pre-created directory")
+		}
+		if directoryInfo.Mode()&os.ModeSetgid == 0 {
+			return nil, errors.New(
+				"control socket directory must have the setgid bit")
+		}
+		if directoryInfo.Mode().Perm()&0o022 != 0 {
+			return nil, errors.New(
+				"control socket directory must not be group or world writable")
+		}
+		directoryStat, ok := directoryInfo.Sys().(*syscall.Stat_t)
+		if !ok || directoryStat.Uid != uint32(os.Geteuid()) {
+			return nil, errors.New(
+				"control socket directory must be owned by the cxld effective UID")
+		}
+	} else if err := os.MkdirAll(directoryPath, directoryMode); err != nil {
+		return nil, fmt.Errorf("create socket directory: %w", err)
+	}
+	if err := removeStaleDaemonUnixSocket(socketPath); err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("listen on %s: %w", socketPath, err)
+	}
+	unixListener, ok := listener.(*net.UnixListener)
+	if !ok {
+		_ = listener.Close()
+		return nil, fmt.Errorf("listener for %s is not a Unix listener", socketPath)
+	}
+	// Go's default UnixListener close path unlinks by pathname. Disable it so
+	// cleanup can verify the inode before removing anything a caller may have
+	// replaced after startup.
+	unixListener.SetUnlinkOnClose(false)
+	socketIdentity, err := os.Lstat(socketPath)
+	if err != nil {
+		_ = listener.Close()
+		return nil, fmt.Errorf("inspect newly created Unix socket: %w", err)
+	}
+	if socketIdentity.Mode()&os.ModeSocket == 0 {
+		_ = listener.Close()
+		return nil, errors.New("new Unix listener path is not a socket")
+	}
+	if err := os.Chmod(socketPath, 0o660); err != nil {
+		_ = listener.Close()
+		_ = removeDaemonUnixSocketIfSame(socketPath, socketIdentity)
+		return nil, fmt.Errorf("chmod socket: %w", err)
+	}
+	if requireSetgidDirectory {
+		if err := verifyDaemonUnixSocketInheritedGroup(directoryPath, socketPath); err != nil {
+			_ = listener.Close()
+			_ = removeDaemonUnixSocketIfSame(socketPath, socketIdentity)
+			return nil, err
+		}
+	}
+	return &daemonUnixServer{
+		listener:       listener,
+		socketPath:     socketPath,
+		socketIdentity: socketIdentity,
+		policy:         policy,
+	}, nil
+}
+
+func removeStaleDaemonUnixSocket(socketPath string) error {
+	info, err := os.Lstat(socketPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect stale socket: %w", err)
+	}
+	if info.Mode()&os.ModeSocket == 0 || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf(
+			"refuse to replace non-socket path %q with mode %s", socketPath, info.Mode())
+	}
+	if err := os.Remove(socketPath); err != nil {
+		return fmt.Errorf("remove stale socket: %w", err)
+	}
+	return nil
+}
+
+func removeDaemonUnixSocketIfSame(socketPath string, expected os.FileInfo) error {
+	if expected == nil || expected.Mode()&os.ModeSocket == 0 {
+		return errors.New("expected Unix socket identity is unavailable")
+	}
+	current, err := os.Lstat(socketPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect owned Unix socket during cleanup: %w", err)
+	}
+	if current.Mode()&os.ModeSocket == 0 || current.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(expected, current) {
+		return fmt.Errorf("refuse to remove replaced Unix socket path %q", socketPath)
+	}
+	if err := os.Remove(socketPath); err != nil {
+		return fmt.Errorf("remove owned Unix socket: %w", err)
+	}
+	return nil
+}
+
+func verifyDaemonUnixSocketInheritedGroup(directoryPath string, socketPath string) error {
+	directoryInfo, err := os.Lstat(directoryPath)
+	if err != nil {
+		return fmt.Errorf("inspect control socket directory group: %w", err)
+	}
+	socketInfo, err := os.Lstat(socketPath)
+	if err != nil {
+		return fmt.Errorf("inspect control socket group: %w", err)
+	}
+	directoryStat, directoryOK := directoryInfo.Sys().(*syscall.Stat_t)
+	socketStat, socketOK := socketInfo.Sys().(*syscall.Stat_t)
+	if !directoryOK || !socketOK {
+		return errors.New("control socket group metadata is unavailable")
+	}
+	if directoryStat.Gid != socketStat.Gid {
+		return fmt.Errorf(
+			"control socket GID %d did not inherit directory GID %d",
+			socketStat.Gid, directoryStat.Gid)
+	}
+	return nil
+}
+
+func (server *daemonUnixServer) close() {
+	if server == nil {
+		return
+	}
+	if server.listener != nil {
+		_ = server.listener.Close()
+	}
+	_ = removeDaemonUnixSocketIfSame(server.socketPath, server.socketIdentity)
+}
+
+func (server *daemonUnixServer) acceptLoop(
+	vnextOwnerRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
+	requestWG *sync.WaitGroup,
+) {
+	var acceptRetryDelay time.Duration
+	for {
+		conn, err := server.listener.Accept()
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if acceptRetryDelay == 0 {
+				acceptRetryDelay = 5 * time.Millisecond
+			} else {
+				acceptRetryDelay *= 2
+				if acceptRetryDelay > time.Second {
+					acceptRetryDelay = time.Second
+				}
+			}
+			time.Sleep(acceptRetryDelay)
+			continue
+		}
+		acceptRetryDelay = 0
+		if !tryAcquireDaemonRequestAdmission(daemonRequestAdmission) {
+			_ = conn.Close()
+			continue
+		}
+		requestWG.Add(1)
+		go func(admittedConn net.Conn) {
+			defer requestWG.Done()
+			defer func() { <-daemonRequestAdmission }()
+			serveAdmittedConnWithVNextOwnerGatewayPolicyLimits(
+				admittedConn,
+				vnextOwnerRPC,
+				gateway,
+				server.policy,
+				daemonLargeAdmission,
+				daemonFrameReadTimeout,
+				daemonFrameWriteTimeout)
+		}(conn)
+	}
+}
+
 func main() {
+	schedulerControlUIDDefault, err := envStrictInt64(
+		"CXLD_SCHEDULER_CONTROL_UID", vnextOwnerSchedulerUIDUnconfigured)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid Scheduler control UID environment: %v\n", err)
+		os.Exit(1)
+	}
 	socketPath := flag.String("socket-path", envDefault("CXLD_SOCKET_PATH", defaultSocketPath), "Unix socket path")
+	schedulerControlSocketPath := flag.String(
+		"scheduler-control-socket-path",
+		envDefault("CXLD_SCHEDULER_CONTROL_SOCKET_PATH", defaultSchedulerControlSocketPath),
+		"Scheduler-only Unix control socket path; enabled only with scheduler-control-uid")
+	schedulerControlUID := flag.Int64(
+		"scheduler-control-uid",
+		schedulerControlUIDDefault,
+		"exact host UID allowed on the Scheduler control socket; -1 disables the socket")
 	writerID := flag.String("writer-id", envDefault("CXLD_WRITER_ID", ""), "checkpoint writer identity; defaults to host name")
 	writerEpoch := flag.Uint64("writer-epoch", envDefaultUint64("CXLD_WRITER_EPOCH", uint64(time.Now().UTC().UnixNano())), "monotonic writer incarnation used to fence stale publications")
 	writerStateRoot := flag.String("writer-state-root", envDefault("CXLD_WRITER_STATE_ROOT", ""), "writer-owned allocator state root; defaults beside the OpenWhisk checkpoint root")
@@ -2394,22 +2684,34 @@ func main() {
 		"vnext-owner-tls-client-ca",
 		envDefault("CXLD_VNEXT_OWNER_TLS_CLIENT_CA", ""),
 		"PEM CA used to authenticate strict VNext Owner mTLS clients")
-	vnextOwnerTLSAllowedClientURISANs := flag.String(
-		"vnext-owner-tls-allowed-client-uri-sans",
-		envDefault("CXLD_VNEXT_OWNER_TLS_ALLOWED_CLIENT_URI_SANS", ""),
-		"comma-separated exact URI SAN identities allowed to call the strict VNext Owner mTLS listener")
+	vnextOwnerTLSAllowedSchedulerClientURISANs := flag.String(
+		"vnext-owner-tls-allowed-scheduler-client-uri-sans",
+		envDefault("CXLD_VNEXT_OWNER_TLS_ALLOWED_SCHEDULER_CLIENT_URI_SANS", ""),
+		"comma-separated exact Scheduler client URI SAN identities")
+	vnextOwnerTLSAllowedProducerClientURISANs := flag.String(
+		"vnext-owner-tls-allowed-producer-client-uri-sans",
+		envDefault("CXLD_VNEXT_OWNER_TLS_ALLOWED_PRODUCER_CLIENT_URI_SANS", ""),
+		"comma-separated exact Producer client URI SAN identities")
 	vnextOwnerGatewayRoutes := flag.String(
 		"vnext-owner-gateway-routes",
 		envDefault("CXLD_VNEXT_OWNER_GATEWAY_ROUTES", ""),
 		"strict bounded VNext Owner gateway route-file v1")
-	vnextOwnerGatewayClientCertificate := flag.String(
-		"vnext-owner-gateway-client-cert",
-		envDefault("CXLD_VNEXT_OWNER_GATEWAY_CLIENT_CERT", ""),
-		"shared PEM client certificate for outbound VNext Owner gateway mTLS")
-	vnextOwnerGatewayClientPrivateKey := flag.String(
-		"vnext-owner-gateway-client-key",
-		envDefault("CXLD_VNEXT_OWNER_GATEWAY_CLIENT_KEY", ""),
-		"shared PEM client private key for outbound VNext Owner gateway mTLS")
+	vnextOwnerGatewaySchedulerClientCertificate := flag.String(
+		"vnext-owner-gateway-scheduler-client-cert",
+		envDefault("CXLD_VNEXT_OWNER_GATEWAY_SCHEDULER_CLIENT_CERT", ""),
+		"Scheduler PEM client certificate for outbound VNext Owner gateway mTLS")
+	vnextOwnerGatewaySchedulerClientPrivateKey := flag.String(
+		"vnext-owner-gateway-scheduler-client-key",
+		envDefault("CXLD_VNEXT_OWNER_GATEWAY_SCHEDULER_CLIENT_KEY", ""),
+		"Scheduler PEM client private key for outbound VNext Owner gateway mTLS")
+	vnextOwnerGatewayProducerClientCertificate := flag.String(
+		"vnext-owner-gateway-producer-client-cert",
+		envDefault("CXLD_VNEXT_OWNER_GATEWAY_PRODUCER_CLIENT_CERT", ""),
+		"Producer PEM client certificate for outbound VNext Owner gateway mTLS")
+	vnextOwnerGatewayProducerClientPrivateKey := flag.String(
+		"vnext-owner-gateway-producer-client-key",
+		envDefault("CXLD_VNEXT_OWNER_GATEWAY_PRODUCER_CLIENT_KEY", ""),
+		"Producer PEM client private key for outbound VNext Owner gateway mTLS")
 	vnextOwnerGatewayServerCA := flag.String(
 		"vnext-owner-gateway-server-ca",
 		envDefault("CXLD_VNEXT_OWNER_GATEWAY_SERVER_CA", ""),
@@ -2534,10 +2836,12 @@ func main() {
 	}
 	activeVNextOwnerGateway, err = openVNextOwnerGateway(
 		vnextOwnerGatewayConfig{
-			RouteFilePath:         *vnextOwnerGatewayRoutes,
-			ClientCertificatePath: *vnextOwnerGatewayClientCertificate,
-			ClientPrivateKeyPath:  *vnextOwnerGatewayClientPrivateKey,
-			ServerCAPath:          *vnextOwnerGatewayServerCA,
+			RouteFilePath:                  *vnextOwnerGatewayRoutes,
+			SchedulerClientCertificatePath: *vnextOwnerGatewaySchedulerClientCertificate,
+			SchedulerClientPrivateKeyPath:  *vnextOwnerGatewaySchedulerClientPrivateKey,
+			ProducerClientCertificatePath:  *vnextOwnerGatewayProducerClientCertificate,
+			ProducerClientPrivateKeyPath:   *vnextOwnerGatewayProducerClientPrivateKey,
+			ServerCAPath:                   *vnextOwnerGatewayServerCA,
 		},
 		activeVNextOwnerRPC)
 	if err != nil {
@@ -2547,19 +2851,26 @@ func main() {
 	if activeVNextOwnerGateway != nil {
 		defer activeVNextOwnerGateway.Close()
 	}
-	allowedVNextOwnerClientURISANs, err := parseVNextOwnerURIAllowlist(
-		*vnextOwnerTLSAllowedClientURISANs)
+	allowedVNextOwnerSchedulerClientURISANs, err := parseVNextOwnerURIAllowlist(
+		*vnextOwnerTLSAllowedSchedulerClientURISANs)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid VNext Owner TLS client URI SAN allowlist: %v\n", err)
+		fmt.Fprintf(os.Stderr, "invalid VNext Owner TLS Scheduler client URI SAN allowlist: %v\n", err)
+		os.Exit(1)
+	}
+	allowedVNextOwnerProducerClientURISANs, err := parseVNextOwnerURIAllowlist(
+		*vnextOwnerTLSAllowedProducerClientURISANs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid VNext Owner TLS Producer client URI SAN allowlist: %v\n", err)
 		os.Exit(1)
 	}
 	vnextOwnerTLSServer, err := startVNextOwnerTLSServer(
 		vnextOwnerTLSServerConfig{
-			ListenAddress:         *vnextOwnerTLSListen,
-			ServerCertificatePath: *vnextOwnerTLSServerCertificate,
-			ServerPrivateKeyPath:  *vnextOwnerTLSServerPrivateKey,
-			ClientCAPath:          *vnextOwnerTLSClientCA,
-			AllowedClientURISANs:  allowedVNextOwnerClientURISANs,
+			ListenAddress:                 *vnextOwnerTLSListen,
+			ServerCertificatePath:         *vnextOwnerTLSServerCertificate,
+			ServerPrivateKeyPath:          *vnextOwnerTLSServerPrivateKey,
+			ClientCAPath:                  *vnextOwnerTLSClientCA,
+			AllowedSchedulerClientURISANs: allowedVNextOwnerSchedulerClientURISANs,
+			AllowedProducerClientURISANs:  allowedVNextOwnerProducerClientURISANs,
 		},
 		activeVNextOwnerRPC,
 		daemonRequestAdmission,
@@ -2581,88 +2892,81 @@ func main() {
 		defer metadataListener.Close()
 	}
 
-	if err := os.MkdirAll(filepath.Dir(*socketPath), 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to create socket directory: %v\n", err)
+	if err := validateVNextOwnerSchedulerControlUID(*schedulerControlUID); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid --scheduler-control-uid: %v\n", err)
 		os.Exit(1)
 	}
-
-	if err := os.RemoveAll(*socketPath); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to remove stale socket: %v\n", err)
-		os.Exit(1)
-	}
-
-	listener, err := net.Listen("unix", *socketPath)
+	runtimeUnixServer, err := openDaemonUnixServer(
+		*socketPath, 0o755, false, vnextOwnerRuntimeUnixPolicy)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to listen on %s: %v\n", *socketPath, err)
+		fmt.Fprintf(os.Stderr, "failed to open runtime Unix socket: %v\n", err)
 		os.Exit(1)
 	}
-	defer listener.Close()
-
-	if err := os.Chmod(*socketPath, 0o660); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to chmod socket: %v\n", err)
-		os.Exit(1)
+	unixServers := []*daemonUnixServer{runtimeUnixServer}
+	if *schedulerControlUID >= 0 {
+		if activeVNextOwnerRPC == nil && activeVNextOwnerGateway == nil {
+			runtimeUnixServer.close()
+			fmt.Fprintln(os.Stderr,
+				"Scheduler control socket requires an active local Owner or Owner gateway")
+			os.Exit(1)
+		}
+		if filepath.Clean(filepath.Dir(*schedulerControlSocketPath)) ==
+			filepath.Clean(filepath.Dir(*socketPath)) {
+			runtimeUnixServer.close()
+			fmt.Fprintln(os.Stderr,
+				"Scheduler control socket must use a directory separate from the runtime socket")
+			os.Exit(1)
+		}
+		controlUnixServer, err := openDaemonUnixServer(
+			*schedulerControlSocketPath,
+			0o750,
+			true,
+			vnextOwnerUnixListenerPolicy{
+				Role:                 vnextOwnerCallerScheduler,
+				RequiredSchedulerUID: *schedulerControlUID,
+			})
+		if err != nil {
+			runtimeUnixServer.close()
+			fmt.Fprintf(os.Stderr, "failed to open Scheduler control Unix socket: %v\n", err)
+			os.Exit(1)
+		}
+		unixServers = append(unixServers, controlUnixServer)
 	}
+	defer func() {
+		for _, server := range unixServers {
+			server.close()
+		}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
 	var requestWG sync.WaitGroup
-	go func() {
-		<-sigCh
-		if vnextOwnerTLSServer != nil {
-			_ = vnextOwnerTLSServer.Stop()
-		}
-		if metadataServer != nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_ = metadataServer.Shutdown(ctx)
-			cancel()
-		}
-		_ = listener.Close()
-		_ = os.Remove(*socketPath)
-	}()
-
-	var acceptRetryDelay time.Duration
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				requestWG.Wait()
-				if vnextOwnerTLSServer != nil {
-					_ = vnextOwnerTLSServer.Stop()
-					vnextOwnerTLSServer.Wait()
-				}
-				return
-			}
-			if acceptRetryDelay == 0 {
-				acceptRetryDelay = 5 * time.Millisecond
-			} else {
-				acceptRetryDelay *= 2
-				if acceptRetryDelay > time.Second {
-					acceptRetryDelay = time.Second
-				}
-			}
-			time.Sleep(acceptRetryDelay)
-			continue
-		}
-		acceptRetryDelay = 0
-		if !tryAcquireDaemonRequestAdmission(daemonRequestAdmission) {
-			// Bound accepted file descriptors and goroutines before spawning
-			// request work, not after the scheduler happens to run it.
-			_ = conn.Close()
-			continue
-		}
-		requestWG.Add(1)
-		go func(admittedConn net.Conn) {
-			defer requestWG.Done()
-			defer func() { <-daemonRequestAdmission }()
-			serveAdmittedConnWithVNextOwnerGatewayLimits(
-				admittedConn,
-				activeVNextOwnerRPC,
-				activeVNextOwnerGateway,
-				daemonLargeAdmission,
-				daemonFrameReadTimeout,
-				daemonFrameWriteTimeout)
-		}(conn)
+	var acceptWG sync.WaitGroup
+	for _, server := range unixServers {
+		acceptWG.Add(1)
+		go func(unixServer *daemonUnixServer) {
+			defer acceptWG.Done()
+			unixServer.acceptLoop(
+				activeVNextOwnerRPC, activeVNextOwnerGateway, &requestWG)
+		}(server)
+	}
+	<-sigCh
+	if vnextOwnerTLSServer != nil {
+		_ = vnextOwnerTLSServer.Stop()
+	}
+	if metadataServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = metadataServer.Shutdown(ctx)
+		cancel()
+	}
+	for _, server := range unixServers {
+		server.close()
+	}
+	acceptWG.Wait()
+	requestWG.Wait()
+	if vnextOwnerTLSServer != nil {
+		vnextOwnerTLSServer.Wait()
 	}
 }
 

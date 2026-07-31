@@ -128,7 +128,9 @@ func vnextOwnerRPCTestRoundTrip(
 	server, client := net.Pipe()
 	done := make(chan struct{})
 	go func() {
-		serveConnWithVNextOwnerRPC(server, rpc)
+		serveAuthenticatedDaemonConnWithVNextOwnerGatewayRoleLimits(
+			server, rpc, nil, vnextOwnerAuthorizedTestRole(request.Operation),
+			daemonLargeAdmission, daemonFrameReadTimeout, daemonFrameWriteTimeout)
 		close(done)
 	}()
 	requestBytes, err := json.Marshal(request)
@@ -432,7 +434,7 @@ func TestVNextOwnerRPCV1AndMalformedAdmissionRequestsFailClosed(t *testing.T) {
 			`"expectedAdmissionSequence":2}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			response := runCommandWithVNextOwnerRPC(daemonRequest{
+			response := runCommandWithVNextOwnerRPCTestRole(daemonRequest{
 				Operation:              vnextOwnerRPCOperationSetAdmission,
 				VNextOwnerSetAdmission: json.RawMessage(raw),
 			}, rpc)
@@ -600,7 +602,7 @@ func TestVNextOwnerRPCReservationStatusCarriesDurableNoSpaceWithoutGrant(t *test
 func TestVNextOwnerRPCReservationStatusRejectsMixedPayloadBeforeLookup(t *testing.T) {
 	wire := marshalVNextOwnerRPCTestPayload(
 		t, vnextOwnerRPCTestReserveRequest("owner-0"))
-	response := runCommandWithVNextOwnerRPC(daemonRequest{
+	response := runCommandWithVNextOwnerRPCTestRole(daemonRequest{
 		Operation:                   vnextOwnerRPCOperationReservationStatus,
 		VNextOwnerReservationStatus: wire,
 		VNextOwnerReserve:           wire,
@@ -670,7 +672,7 @@ func TestVNextOwnerRPCStrictlyRejectsUnknownAndTrailingJSON(t *testing.T) {
 		{UUID: "rpc-strict-device", Size: 128 << 10},
 	})
 	rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
-	unknown := runCommandWithVNextOwnerRPC(daemonRequest{
+	unknown := runCommandWithVNextOwnerRPCTestRole(daemonRequest{
 		Operation: vnextOwnerRPCOperationReserve,
 		VNextOwnerReserve: json.RawMessage(`{
 			"protocol":"cxld.vnext-owner.v2",
@@ -684,7 +686,7 @@ func TestVNextOwnerRPCStrictlyRejectsUnknownAndTrailingJSON(t *testing.T) {
 
 	valid := marshalVNextOwnerRPCTestPayload(t, vnextOwnerRPCTestReserveRequest("owner-0"))
 	trailingRaw := append(append(json.RawMessage(nil), valid...), []byte(` {}`)...)
-	trailing := runCommandWithVNextOwnerRPC(daemonRequest{
+	trailing := runCommandWithVNextOwnerRPCTestRole(daemonRequest{
 		Operation:         vnextOwnerRPCOperationReserve,
 		VNextOwnerReserve: trailingRaw,
 	}, rpc)
@@ -710,7 +712,7 @@ func TestVNextOwnerRPCStrictlyRejectsUnknownAndTrailingJSON(t *testing.T) {
 		t.Fatal("trailing VNext daemon JSON value was not rejected")
 	}
 
-	mixed := runCommandWithVNextOwnerRPC(daemonRequest{
+	mixed := runCommandWithVNextOwnerRPCTestRole(daemonRequest{
 		Operation:         vnextOwnerRPCOperationReserve,
 		VNextOwnerReserve: valid,
 		Container:         &containerRequest{},
@@ -1087,7 +1089,7 @@ func TestVNextOwnerRPCExternalContentCRCUnsignedAndEngineContract(t *testing.T) 
 
 func TestVNextOwnerRPCFailsClosedWhenUnavailableOrPayloadShapeIsAmbiguous(t *testing.T) {
 	reserve := marshalVNextOwnerRPCTestPayload(t, vnextOwnerRPCTestReserveRequest("owner-0"))
-	unavailable := runCommandWithVNextOwnerRPC(daemonRequest{
+	unavailable := runCommandWithVNextOwnerRPCTestRole(daemonRequest{
 		Operation:         vnextOwnerRPCOperationReserve,
 		VNextOwnerReserve: reserve,
 	}, nil)
@@ -1095,7 +1097,7 @@ func TestVNextOwnerRPCFailsClosedWhenUnavailableOrPayloadShapeIsAmbiguous(t *tes
 		t.Fatalf("unconfigured VNext Owner did not fail closed: %#v", unavailable)
 	}
 
-	ambiguous := runCommandWithVNextOwnerRPC(daemonRequest{
+	ambiguous := runCommandWithVNextOwnerRPCTestRole(daemonRequest{
 		Operation:         vnextOwnerRPCOperationReserve,
 		VNextOwnerReserve: reserve,
 		VNextOwnerAbort:   json.RawMessage(`{}`),
@@ -1105,7 +1107,7 @@ func TestVNextOwnerRPCFailsClosedWhenUnavailableOrPayloadShapeIsAmbiguous(t *tes
 		t.Fatalf("ambiguous operation payload did not fail closed: %#v", ambiguous)
 	}
 
-	timeout := runCommandWithVNextOwnerRPC(daemonRequest{
+	timeout := runCommandWithVNextOwnerRPCTestRole(daemonRequest{
 		Operation:         vnextOwnerRPCOperationReserve,
 		TimeoutMillis:     1,
 		VNextOwnerReserve: reserve,
@@ -1125,7 +1127,7 @@ func TestVNextOwnerRPCActiveModeRejectsEveryLegacyDAXOperation(t *testing.T) {
 		"metadataResolve",
 	} {
 		t.Run(operation, func(t *testing.T) {
-			response := runCommandWithVNextOwnerRPC(
+			response := runCommandWithVNextOwnerRPCTestRole(
 				daemonRequest{Operation: operation}, rpc)
 			if response.Ok ||
 				response.ErrorCode != string(vnextOwnerServicePublicationIncompatible) ||
@@ -1165,7 +1167,7 @@ func TestVNextOwnerRPCPreservesTypedOwnerServiceErrors(t *testing.T) {
 	})
 	rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
 	wrongOwner := vnextOwnerRPCTestReserveRequest("different-owner")
-	response := runCommandWithVNextOwnerRPC(daemonRequest{
+	response := runCommandWithVNextOwnerRPCTestRole(daemonRequest{
 		Operation:         vnextOwnerRPCOperationReserve,
 		VNextOwnerReserve: marshalVNextOwnerRPCTestPayload(t, wrongOwner),
 	}, rpc)
@@ -1181,7 +1183,7 @@ func TestVNextOwnerRPCRejectsResponseUnsafeExtentBudgetBeforeReservation(t *test
 	rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
 	request := vnextOwnerRPCTestReserveRequest("owner-0")
 	request.MaxExtents = vnextOwnerRPCMaxExtents + 1
-	response := runCommandWithVNextOwnerRPC(daemonRequest{
+	response := runCommandWithVNextOwnerRPCTestRole(daemonRequest{
 		Operation:         vnextOwnerRPCOperationReserve,
 		VNextOwnerReserve: marshalVNextOwnerRPCTestPayload(t, request),
 	}, rpc)
@@ -1389,7 +1391,7 @@ func TestVNextOwnerRPCSealRejectsDuplicateSidecarBeforeServiceMutation(t *testin
 		{UUID: "rpc-sidecar-device", Size: 128 << 10},
 	})
 	rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
-	response := runCommandWithVNextOwnerRPC(daemonRequest{
+	response := runCommandWithVNextOwnerRPCTestRole(daemonRequest{
 		Operation: vnextOwnerRPCOperationSeal,
 		VNextOwnerSeal: marshalVNextOwnerRPCTestPayload(t, vnextOwnerRPCSealRequest{
 			Protocol:            vnextOwnerRPCProtocol,

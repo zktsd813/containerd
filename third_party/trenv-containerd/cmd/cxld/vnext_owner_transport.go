@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	vnextOwnerTLSALPN             = "cxld-vnext-owner/2"
+	vnextOwnerTLSALPN             = "cxld-vnext-owner/3"
 	vnextOwnerTLSDialTimeout      = 10 * time.Second
 	vnextOwnerTLSHandshakeTimeout = 10 * time.Second
 	vnextOwnerTLSMaxHandshakes    = 32
@@ -25,18 +25,19 @@ const (
 
 // vnextOwnerTLSServerConfig is an all-or-nothing, opt-in remote transport.
 // It deliberately does not share the legacy metadata HTTP listener. The
-// existing Unix daemon socket remains unchanged and continues to serve local
-// callers. Mutual TLS authenticates a peer identity; it does not implement a
-// Scheduler-issued per-request capability or distributed writer fencing.
+// remote listener does not accept a caller-selected role. Mutual TLS binds an
+// exact, unambiguous URI SAN to either the Scheduler or Producer operation
+// policy before any Owner request is dispatched.
 type vnextOwnerTLSServerConfig struct {
-	ListenAddress         string
-	ServerCertificatePath string
-	ServerPrivateKeyPath  string
-	ClientCAPath          string
-	AllowedClientURISANs  []string
-	HandshakeTimeout      time.Duration
-	RequestReadTimeout    time.Duration
-	ResponseWriteTimeout  time.Duration
+	ListenAddress                 string
+	ServerCertificatePath         string
+	ServerPrivateKeyPath          string
+	ClientCAPath                  string
+	AllowedSchedulerClientURISANs []string
+	AllowedProducerClientURISANs  []string
+	HandshakeTimeout              time.Duration
+	RequestReadTimeout            time.Duration
+	ResponseWriteTimeout          time.Duration
 }
 
 type vnextOwnerTLSClientConfig struct {
@@ -46,6 +47,7 @@ type vnextOwnerTLSClientConfig struct {
 	ClientPrivateKeyPath  string
 	ServerCAPath          string
 	ExpectedServerURISAN  string
+	CallerRole            vnextOwnerCallerRole
 	DialTimeout           time.Duration
 	HandshakeTimeout      time.Duration
 	RequestWriteTimeout   time.Duration
@@ -78,6 +80,7 @@ type vnextOwnerTLSServer struct {
 	handshakeTimeout   time.Duration
 	readTimeout        time.Duration
 	writeTimeout       time.Duration
+	allowedClientRoles map[string]vnextOwnerCallerRole
 
 	stopOnce sync.Once
 	wg       sync.WaitGroup
@@ -90,6 +93,7 @@ type vnextOwnerTLSRoundTripper struct {
 	handshakeTimeout time.Duration
 	writeTimeout     time.Duration
 	readTimeout      time.Duration
+	callerRole       vnextOwnerCallerRole
 }
 
 func parseVNextOwnerURIAllowlist(value string) ([]string, error) {
@@ -119,6 +123,47 @@ func parseVNextOwnerURIAllowlist(value string) ([]string, error) {
 		identities = append(identities, identity)
 	}
 	return identities, nil
+}
+
+func vnextOwnerTLSAllowedClientRoles(
+	config vnextOwnerTLSServerConfig,
+) (map[string]vnextOwnerCallerRole, error) {
+	roles := make(map[string]vnextOwnerCallerRole,
+		len(config.AllowedSchedulerClientURISANs)+
+			len(config.AllowedProducerClientURISANs))
+	add := func(role vnextOwnerCallerRole, identities []string) error {
+		for _, identity := range identities {
+			if err := validateVNextOwnerTLSURI(
+				identity, fmt.Sprintf("%s client URI SAN", role)); err != nil {
+				return err
+			}
+			if existing, duplicate := roles[identity]; duplicate {
+				if existing == role {
+					return fmt.Errorf(
+						"VNext Owner %s client URI SAN %q is duplicated",
+						role, identity)
+				}
+				return fmt.Errorf(
+					"VNext Owner client URI SAN %q is assigned to both %s and %s roles",
+					identity, existing, role)
+			}
+			roles[identity] = role
+		}
+		return nil
+	}
+	if err := add(vnextOwnerCallerScheduler,
+		config.AllowedSchedulerClientURISANs); err != nil {
+		return nil, err
+	}
+	if err := add(vnextOwnerCallerProducer,
+		config.AllowedProducerClientURISANs); err != nil {
+		return nil, err
+	}
+	if len(roles) == 0 {
+		return nil, errors.New(
+			"VNext Owner TLS listener requires at least one Scheduler or Producer client URI SAN")
+	}
+	return roles, nil
 }
 
 func validateVNextOwnerTLSURI(value string, role string) error {
@@ -155,7 +200,8 @@ func validateVNextOwnerTLSServerConfig(
 			configured++
 		}
 	}
-	if len(config.AllowedClientURISANs) != 0 {
+	if len(config.AllowedSchedulerClientURISANs) != 0 ||
+		len(config.AllowedProducerClientURISANs) != 0 {
 		configured++
 	}
 	if configured == 0 {
@@ -164,7 +210,7 @@ func validateVNextOwnerTLSServerConfig(
 	if configured != 5 {
 		return false, errors.New(
 			"VNext Owner TLS listener requires listen address, server certificate, " +
-				"server private key, client CA, and a non-empty client URI SAN allowlist together")
+				"server private key, client CA, and non-empty role-specific client URI SAN allowlists together")
 	}
 	if rpc == nil || rpc.service == nil {
 		return false, errors.New(
@@ -182,16 +228,8 @@ func validateVNextOwnerTLSServerConfig(
 			return false, err
 		}
 	}
-	seen := make(map[string]struct{}, len(config.AllowedClientURISANs))
-	for _, identity := range config.AllowedClientURISANs {
-		if err := validateVNextOwnerTLSURI(identity, "client URI SAN"); err != nil {
-			return false, err
-		}
-		if _, duplicate := seen[identity]; duplicate {
-			return false, fmt.Errorf(
-				"VNext Owner client URI SAN %q is duplicated", identity)
-		}
-		seen[identity] = struct{}{}
+	if _, err := vnextOwnerTLSAllowedClientRoles(config); err != nil {
+		return false, err
 	}
 	if config.HandshakeTimeout < 0 || config.RequestReadTimeout < 0 ||
 		config.ResponseWriteTimeout < 0 {
@@ -267,9 +305,9 @@ func newVNextOwnerTLSServerConfig(
 	if err != nil {
 		return nil, err
 	}
-	allowed := make(map[string]struct{}, len(config.AllowedClientURISANs))
-	for _, identity := range config.AllowedClientURISANs {
-		allowed[identity] = struct{}{}
+	allowedRoles, err := vnextOwnerTLSAllowedClientRoles(config)
+	if err != nil {
+		return nil, err
 	}
 	tlsConfig := &tls.Config{
 		MinVersion:   tls.VersionTLS13,
@@ -289,14 +327,34 @@ func newVNextOwnerTLSServerConfig(
 		if len(state.VerifiedChains) == 0 || len(state.PeerCertificates) == 0 {
 			return errors.New("VNext Owner TLS client certificate was not verified")
 		}
-		for _, identity := range state.PeerCertificates[0].URIs {
-			if _, permitted := allowed[identity.String()]; permitted {
-				return nil
-			}
-		}
-		return errors.New("VNext Owner TLS client URI SAN is not allowlisted")
+		_, err := vnextOwnerTLSCallerRole(state, allowedRoles)
+		return err
 	}
 	return tlsConfig, nil
+}
+
+func vnextOwnerTLSCallerRole(
+	state tls.ConnectionState,
+	allowedRoles map[string]vnextOwnerCallerRole,
+) (vnextOwnerCallerRole, error) {
+	if len(state.VerifiedChains) == 0 || len(state.PeerCertificates) == 0 {
+		return vnextOwnerCallerUnknown,
+			errors.New("VNext Owner TLS client certificate was not verified")
+	}
+	identities := state.PeerCertificates[0].URIs
+	if len(identities) != 1 {
+		return vnextOwnerCallerUnknown, fmt.Errorf(
+			"VNext Owner TLS client certificate has %d URI SANs; exactly one is required",
+			len(identities))
+	}
+	identity := identities[0].String()
+	role, permitted := allowedRoles[identity]
+	if !permitted {
+		return vnextOwnerCallerUnknown, fmt.Errorf(
+			"VNext Owner TLS client URI SAN %q is not assigned to an allowed role",
+			identity)
+	}
+	return role, nil
 }
 
 func loadVNextOwnerTLSCertificatePool(path string, role string) (*x509.CertPool, error) {
@@ -328,6 +386,10 @@ func startVNextOwnerTLSServer(
 		return nil, errors.New("VNext Owner TLS admission controls are unavailable")
 	}
 	config = normalizedVNextOwnerTLSServerTimeouts(config)
+	allowedClientRoles, err := vnextOwnerTLSAllowedClientRoles(config)
+	if err != nil {
+		return nil, err
+	}
 	tlsConfig, err := newVNextOwnerTLSServerConfig(config)
 	if err != nil {
 		return nil, err
@@ -347,6 +409,7 @@ func startVNextOwnerTLSServer(
 		handshakeTimeout:   config.HandshakeTimeout,
 		readTimeout:        config.RequestReadTimeout,
 		writeTimeout:       config.ResponseWriteTimeout,
+		allowedClientRoles: allowedClientRoles,
 	}
 	server.wg.Add(1)
 	go server.acceptLoop()
@@ -441,6 +504,11 @@ func (server *vnextOwnerTLSServer) serveAccepted(rawConn net.Conn) {
 	if err := tlsConn.HandshakeContext(handshakeContext); err != nil {
 		return
 	}
+	callerRole, err := vnextOwnerTLSCallerRole(
+		tlsConn.ConnectionState(), server.allowedClientRoles)
+	if err != nil {
+		return
+	}
 	<-server.handshakeAdmission
 	handshakeAdmissionHeld = false
 	if !tryAcquireDaemonRequestAdmission(server.requestAdmission) {
@@ -451,12 +519,14 @@ func (server *vnextOwnerTLSServer) serveAccepted(rawConn net.Conn) {
 		return
 	}
 	serveAuthenticatedVNextOwnerTLSConn(
-		tlsConn, server.rpc, server.largeAdmission, server.readTimeout, server.writeTimeout)
+		tlsConn, server.rpc, callerRole, server.largeAdmission,
+		server.readTimeout, server.writeTimeout)
 }
 
 func serveAuthenticatedVNextOwnerTLSConn(
 	conn net.Conn,
 	rpc *vnextOwnerRPC,
+	callerRole vnextOwnerCallerRole,
 	largeAdmission chan struct{},
 	readTimeout time.Duration,
 	writeTimeout time.Duration,
@@ -482,7 +552,7 @@ func serveAuthenticatedVNextOwnerTLSConn(
 		return
 	}
 	writeVNextOwnerTLSResponse(
-		conn, runCommandWithVNextOwnerRPC(request, rpc), writeTimeout)
+		conn, runCommandWithVNextOwnerRPCRole(request, rpc, callerRole), writeTimeout)
 }
 
 func decodeVNextOwnerRemoteDaemonRequest(body []byte) (daemonRequest, error) {
@@ -633,6 +703,7 @@ func newVNextOwnerTLSRoundTripper(
 		handshakeTimeout: config.HandshakeTimeout,
 		writeTimeout:     config.RequestWriteTimeout,
 		readTimeout:      config.ResponseReadTimeout,
+		callerRole:       config.CallerRole,
 	}, nil
 }
 
@@ -672,6 +743,11 @@ func validateVNextOwnerTLSClientConfig(config vnextOwnerTLSClientConfig) error {
 		config.RequestWriteTimeout <= 0 || config.ResponseReadTimeout <= 0 {
 		return errors.New("VNext Owner TLS client timeouts must be positive")
 	}
+	if config.CallerRole != vnextOwnerCallerScheduler &&
+		config.CallerRole != vnextOwnerCallerProducer {
+		return errors.New(
+			"VNext Owner TLS client requires an explicit Scheduler or Producer role")
+	}
 	return nil
 }
 
@@ -691,6 +767,10 @@ func (transport *vnextOwnerTLSRoundTripper) RoundTrip(
 	if !isVNextOwnerRPCOperation(strings.TrimSpace(request.Operation)) {
 		return execResponse{}, errors.New(
 			"VNext Owner TLS transport accepts only strict VNext Owner operations")
+	}
+	if err := authorizeVNextOwnerOperation(
+		transport.callerRole, strings.TrimSpace(request.Operation)); err != nil {
+		return execResponse{}, err
 	}
 	if _, err := vnextOwnerRPCPayload(strings.TrimSpace(request.Operation), request); err != nil {
 		return execResponse{}, fmt.Errorf("validate VNext Owner TLS request: %w", err)

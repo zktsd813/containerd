@@ -40,10 +40,10 @@ func vnextOwnerGatewayTestRouteFile(
 
 func vnextOwnerGatewayTestConfig(routePath string) vnextOwnerGatewayConfig {
 	return vnextOwnerGatewayConfig{
-		RouteFilePath:         routePath,
-		ClientCertificatePath: "/test/client.pem",
-		ClientPrivateKeyPath:  "/test/client-key.pem",
-		ServerCAPath:          "/test/ca.pem",
+		RouteFilePath:                  routePath,
+		SchedulerClientCertificatePath: "/test/scheduler-client.pem",
+		SchedulerClientPrivateKeyPath:  "/test/scheduler-client-key.pem",
+		ServerCAPath:                   "/test/ca.pem",
 	}
 }
 
@@ -131,6 +131,40 @@ func vnextOwnerGatewayTestReservationStatusDaemonRequest(
 	}
 }
 
+func vnextOwnerGatewayTestLifecycleDaemonRequest(
+	t *testing.T,
+	operation string,
+) daemonRequest {
+	t.Helper()
+	raw, err := json.Marshal(vnextOwnerRPCLifecycleRequest{
+		Protocol: vnextOwnerRPCProtocol,
+		Identity: vnextOwnerRPCOperationIdentity{
+			RequestID:          "gateway-lifecycle-request",
+			CheckpointID:       "gateway-lifecycle-checkpoint",
+			ProducerID:         "gateway-lifecycle-producer",
+			OwnerID:            "owner-0",
+			OwnerEpoch:         7,
+			AllocationRecordID: 1,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := daemonRequest{
+		CommandLabel: "gateway-role-test",
+		Operation:    operation,
+	}
+	switch operation {
+	case vnextOwnerRPCOperationCommit:
+		request.VNextOwnerCommit = raw
+	case vnextOwnerRPCOperationAbort:
+		request.VNextOwnerAbort = raw
+	default:
+		t.Fatalf("unsupported lifecycle test operation %q", operation)
+	}
+	return request
+}
+
 func vnextOwnerGatewayTestInventoryTransport(
 	calls *int64,
 	entered chan<- struct{},
@@ -185,12 +219,23 @@ func vnextOwnerGatewayUnixRoundTrip(
 	gateway *vnextOwnerGateway,
 	request daemonRequest,
 ) execResponse {
+	return vnextOwnerGatewayUnixRoundTripAs(
+		t, localRPC, gateway, vnextOwnerCallerScheduler, request)
+}
+
+func vnextOwnerGatewayUnixRoundTripAs(
+	t *testing.T,
+	localRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
+	callerRole vnextOwnerCallerRole,
+	request daemonRequest,
+) execResponse {
 	t.Helper()
 	server, client := net.Pipe()
 	done := make(chan struct{})
 	go func() {
-		serveConnWithVNextOwnerGatewayLimits(
-			server, localRPC, gateway, make(chan struct{}, 4),
+		serveAuthenticatedDaemonConnWithVNextOwnerGatewayRoleLimits(
+			server, localRPC, gateway, callerRole,
 			make(chan struct{}, 1), time.Second, time.Second)
 		close(done)
 	}()
@@ -225,6 +270,108 @@ func TestVNextOwnerGatewayConfigurationIsAllOrNothing(t *testing.T) {
 	}, nil)
 	if err == nil || !strings.Contains(err.Error(), "requires route file") {
 		t.Fatalf("partial gateway config error = %v", err)
+	}
+}
+
+func TestVNextOwnerGatewayRequiresDistinctCompleteRoleCredentials(t *testing.T) {
+	partialProducer := vnextOwnerGatewayTestConfig("/test/routes.json")
+	partialProducer.ProducerClientCertificatePath = "/test/producer.pem"
+	if _, err := openVNextOwnerGatewayWithDependencies(
+		partialProducer, nil, vnextOwnerGatewayDependencies{}); err == nil ||
+		!strings.Contains(err.Error(), "producer client certificate and private key") {
+		t.Fatalf("partial Producer identity error = %v", err)
+	}
+	shared := vnextOwnerGatewayTestConfig("/test/routes.json")
+	shared.ProducerClientCertificatePath = shared.SchedulerClientCertificatePath
+	shared.ProducerClientPrivateKeyPath = "/test/producer-key.pem"
+	if _, err := openVNextOwnerGatewayWithDependencies(
+		shared, nil, vnextOwnerGatewayDependencies{}); err == nil ||
+		!strings.Contains(err.Error(), "distinct certificate and key paths") {
+		t.Fatalf("shared role identity error = %v", err)
+	}
+}
+
+func TestVNextOwnerGatewayPreservesRoleAndUsesDistinctCredentials(t *testing.T) {
+	config := vnextOwnerGatewayTestConfig("/test/routes.json")
+	config.ProducerClientCertificatePath = "/test/producer.pem"
+	config.ProducerClientPrivateKeyPath = "/test/producer-key.pem"
+	configs := make(map[vnextOwnerCallerRole]vnextOwnerTLSClientConfig)
+	calls := make(map[vnextOwnerCallerRole]int)
+	gateway, err := openVNextOwnerGatewayWithDependencies(
+		config,
+		nil,
+		vnextOwnerGatewayDependencies{
+			loadRouteFile: func(string) ([]byte, error) {
+				return vnextOwnerGatewayTestRouteFile("owner-0", 7, "127.0.0.1:1"), nil
+			},
+			newTransport: func(clientConfig vnextOwnerTLSClientConfig) (
+				vnextOwnerClientRoundTripper, error,
+			) {
+				configs[clientConfig.CallerRole] = clientConfig
+				role := clientConfig.CallerRole
+				return &vnextOwnerGatewayTestTransport{roundTrip: func(
+					_ context.Context,
+					request daemonRequest,
+				) (execResponse, error) {
+					calls[role]++
+					response := marshalVNextOwnerRPCResponse(
+						vnextOwnerRPCLifecycleResponse{
+							Protocol:  vnextOwnerRPCProtocol,
+							Operation: request.Operation,
+							State:     "ABORTED",
+						})
+					response.Operation = request.Operation
+					response.DurationMicros = 1
+					return response, nil
+				}}, nil
+			},
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.Close()
+	if len(configs) != 2 ||
+		configs[vnextOwnerCallerScheduler].ClientCertificatePath !=
+			config.SchedulerClientCertificatePath ||
+		configs[vnextOwnerCallerProducer].ClientCertificatePath !=
+			config.ProducerClientCertificatePath {
+		t.Fatalf("role transport configs = %#v", configs)
+	}
+	abort := vnextOwnerGatewayTestLifecycleDaemonRequest(
+		t, vnextOwnerRPCOperationAbort)
+	for _, role := range []vnextOwnerCallerRole{
+		vnextOwnerCallerScheduler, vnextOwnerCallerProducer,
+	} {
+		response := gateway.dispatch(abort, role)
+		if !response.Ok {
+			t.Fatalf("%s Abort response = %#v", role, response)
+		}
+	}
+	if calls[vnextOwnerCallerScheduler] != 1 ||
+		calls[vnextOwnerCallerProducer] != 1 {
+		t.Fatalf("role-specific calls = %#v", calls)
+	}
+
+	before := calls[vnextOwnerCallerProducer]
+	commit := vnextOwnerGatewayTestLifecycleDaemonRequest(
+		t, vnextOwnerRPCOperationCommit)
+	if response := gateway.dispatch(commit, vnextOwnerCallerProducer); response.Ok ||
+		response.ErrorCode != string(vnextOwnerServicePermissionDenied) {
+		t.Fatalf("Producer Commit response = %#v", response)
+	}
+	if calls[vnextOwnerCallerProducer] != before {
+		t.Fatal("denied Producer Commit reached its remote transport")
+	}
+
+	schedulerCalls := calls[vnextOwnerCallerScheduler]
+	if response := gateway.dispatch(daemonRequest{
+		Operation: vnextOwnerRPCOperationSeal,
+	}, vnextOwnerCallerScheduler); response.Ok ||
+		response.ErrorCode != string(vnextOwnerServicePermissionDenied) {
+		t.Fatalf("Scheduler Seal response = %#v", response)
+	}
+	if calls[vnextOwnerCallerScheduler] != schedulerCalls {
+		t.Fatal("denied Scheduler Seal reached its remote transport")
 	}
 }
 
@@ -376,7 +523,7 @@ func TestVNextOwnerGatewayUnknownAndStaleOwnersFailBeforeNetwork(t *testing.T) {
 				return request
 			}()),
 	} {
-		response := gateway.dispatch(request)
+		response := gateway.dispatch(request, vnextOwnerCallerScheduler)
 		if response.Ok || response.ErrorCode != string(vnextOwnerServiceIdentityMismatch) ||
 			response.Operation != request.Operation || response.DurationMicros < 0 {
 			t.Fatalf("unexpected exact-route rejection: %#v", response)
@@ -407,7 +554,7 @@ func TestVNextOwnerGatewayForwardsAuthenticatedBoundedRemoteFailureUnchanged(t *
 		t, vnextOwnerGatewayTestRouteFile("owner-0", 7, "127.0.0.1:1"),
 		nil, transport)
 	got := gateway.dispatch(vnextOwnerGatewayTestInventoryDaemonRequest(
-		t, "owner-0", 7, "remote-failure"))
+		t, "owner-0", 7, "remote-failure"), vnextOwnerCallerScheduler)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("forwarded remote failure = %#v, want %#v", got, want)
 	}
@@ -506,12 +653,66 @@ func TestVNextOwnerGatewayRoutesAdmissionStatusAndTransitionByExactIncarnation(t
 		CommandLabel:              "scheduler-gateway-test",
 		Operation:                 vnextOwnerRPCOperationAdmissionStatus,
 		VNextOwnerAdmissionStatus: unknownRaw,
-	})
+	}, vnextOwnerCallerScheduler)
 	if unknown.Ok || unknown.ErrorCode != string(vnextOwnerServiceIdentityMismatch) {
 		t.Fatalf("unknown admission route was not rejected: %#v", unknown)
 	}
 	if got := atomic.LoadInt64(&calls); got != 0 {
 		t.Fatalf("unknown admission route made %d network calls", got)
+	}
+}
+
+func TestRuntimeRoleAdmissionDenialPrecedesLocalMutationAndRemoteForward(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "gateway-denied-admission", Size: 256 << 10,
+	}})
+	localRPC := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+	var calls int64
+	gateway := openVNextOwnerGatewayForTest(
+		t,
+		vnextOwnerGatewayTestRouteFile("remote-owner", 9, "127.0.0.1:1"),
+		localRPC,
+		vnextOwnerGatewayTestInventoryTransport(&calls, nil, nil))
+	raw, err := json.Marshal(vnextOwnerRPCSetAdmissionRequest{
+		Protocol:                  vnextOwnerRPCProtocol,
+		RequestID:                 "runtime-must-not-close-admission",
+		ExpectedOwnerID:           "owner-0",
+		ExpectedOwnerEpoch:        7,
+		FromState:                 "ACTIVE",
+		TargetState:               "READ_ONLY",
+		ExpectedAdmissionSequence: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.group.mu.Lock()
+	beforeState := fixture.group.journal.AdmissionState
+	beforeAdmissionSequence := fixture.group.journal.AdmissionSequence
+	beforeSnapshotSequence := fixture.group.journal.SnapshotSequence
+	fixture.group.mu.Unlock()
+	response := vnextOwnerGatewayUnixRoundTripAs(t, localRPC, gateway,
+		vnextOwnerCallerProducer, daemonRequest{
+			CommandLabel:           "forged-runtime-admission",
+			Operation:              vnextOwnerRPCOperationSetAdmission,
+			VNextOwnerSetAdmission: raw,
+		})
+	if response.Ok || response.ErrorCode != string(vnextOwnerServicePermissionDenied) {
+		t.Fatalf("runtime admission response = %#v", response)
+	}
+	fixture.group.mu.Lock()
+	afterState := fixture.group.journal.AdmissionState
+	afterAdmissionSequence := fixture.group.journal.AdmissionSequence
+	afterSnapshotSequence := fixture.group.journal.SnapshotSequence
+	fixture.group.mu.Unlock()
+	if afterState != beforeState || afterAdmissionSequence != beforeAdmissionSequence ||
+		afterSnapshotSequence != beforeSnapshotSequence {
+		t.Fatalf(
+			"denied runtime admission mutated Owner head: %s/%d/%d -> %s/%d/%d",
+			beforeState, beforeAdmissionSequence, beforeSnapshotSequence,
+			afterState, afterAdmissionSequence, afterSnapshotSequence)
+	}
+	if got := atomic.LoadInt64(&calls); got != 0 {
+		t.Fatalf("denied runtime admission made %d remote calls", got)
 	}
 }
 
@@ -568,7 +769,9 @@ func TestVNextOwnerGatewayRejectsMalformedReserveIdentityBeforeRemoteNetwork(t *
 		vnextOwnerGatewayTestInventoryTransport(&calls, nil, nil))
 	wire := vnextOwnerRPCTestReserveRequest("owner-0")
 	wire.ProducerID = "remote-producer\x00"
-	response := gateway.dispatch(vnextOwnerGatewayTestReserveDaemonRequest(t, wire))
+	response := gateway.dispatch(
+		vnextOwnerGatewayTestReserveDaemonRequest(t, wire),
+		vnextOwnerCallerScheduler)
 	if response.Ok || response.ErrorCode != string(vnextOwnerServiceInvalidRequest) {
 		t.Fatalf("malformed remote Reserve response: %#v", response)
 	}
@@ -582,7 +785,7 @@ func TestVNextOwnerGatewayRejectsMalformedReserveIdentityBeforeRemoteNetwork(t *
 		CommandLabel:      "scheduler-gateway-test",
 		Operation:         vnextOwnerRPCOperationReserve,
 		VNextOwnerReserve: invalidRaw,
-	})
+	}, vnextOwnerCallerScheduler)
 	if response.Ok || response.ErrorCode != string(vnextOwnerServiceInvalidRequest) {
 		t.Fatalf("invalid-UTF-8 remote Reserve response: %#v", response)
 	}
@@ -601,10 +804,10 @@ func TestVNextOwnerGatewaySchedulerOnlyInventoryAndReserveUseRealMutualTLS(t *te
 		t.Fatalf("write gateway route file: %v", err)
 	}
 	gateway, err := openVNextOwnerGateway(vnextOwnerGatewayConfig{
-		RouteFilePath:         routePath,
-		ClientCertificatePath: material.clientCertificatePath,
-		ClientPrivateKeyPath:  material.clientPrivateKeyPath,
-		ServerCAPath:          material.caPath,
+		RouteFilePath:                  routePath,
+		SchedulerClientCertificatePath: material.clientCertificatePath,
+		SchedulerClientPrivateKeyPath:  material.clientPrivateKeyPath,
+		ServerCAPath:                   material.caPath,
 	}, nil)
 	if err != nil {
 		t.Fatalf("open Scheduler-only VNext Owner gateway: %v", err)
@@ -683,7 +886,7 @@ func TestVNextOwnerGatewayRemoteConcurrencyIsBounded(t *testing.T) {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			responses <- gateway.dispatch(request)
+			responses <- gateway.dispatch(request, vnextOwnerCallerScheduler)
 		}()
 	}
 	for index := 0; index < 2; index++ {
@@ -693,7 +896,7 @@ func TestVNextOwnerGatewayRemoteConcurrencyIsBounded(t *testing.T) {
 			t.Fatal("timed out waiting for admitted remote gateway request")
 		}
 	}
-	overflow := gateway.dispatch(request)
+	overflow := gateway.dispatch(request, vnextOwnerCallerScheduler)
 	if overflow.Ok || overflow.ErrorCode != string(vnextOwnerServiceUnavailable) {
 		t.Fatalf("unexpected concurrency overflow response: %#v", overflow)
 	}
