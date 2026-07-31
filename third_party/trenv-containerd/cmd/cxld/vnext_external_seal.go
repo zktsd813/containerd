@@ -30,17 +30,20 @@ type vnextPreparedExternalSeal struct {
 
 var vnextExternalPayloadVisibilityHook = func(
 	fileData []byte,
-	fileSync func([]byte) error,
+	_ func([]byte) error,
 	invalidate func([]byte) error,
 	engine vnextCRCCopyEngine,
 ) error {
 	switch engine {
-	case vnextCRCCopyEngineCPU, vnextCRCCopyEngineDMLSoftware:
-		return fileSync(fileData)
-	case vnextCRCCopyEngineDMLHardware:
-		// A hardware engine writes behind the CPU cache. Invalidate before
-		// reading the completed page so an old cache line cannot be used as
-		// the authoritative payload.
+	case vnextCRCCopyEngineCPU,
+		vnextCRCCopyEngineDMLSoftware,
+		vnextCRCCopyEngineDMLHardware:
+		// The producer and Owner can be different nodes connected through
+		// non-coherent CXL. The producer's completed writeback does not
+		// invalidate a cache line already held by the Owner, regardless of
+		// whether CPU, DML software, or DML hardware performed the copy.
+		// Never write back the Owner's potentially stale line here: discard
+		// it, then let the caller copy the page from the shared mapping.
 		return invalidate(fileData)
 	default:
 		return fmt.Errorf("unsupported external copy engine %d", engine)

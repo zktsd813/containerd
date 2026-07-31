@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"os"
 	"testing"
@@ -563,7 +564,7 @@ func TestVNextExternalCRIUSealVisibilityFailureLeavesAbortableCheckpoint(t *test
 	}
 }
 
-func TestVNextExternalCRIUSealRoutesCPUAndDMLHardwareVisibility(t *testing.T) {
+func TestVNextExternalCRIUSealInvalidatesOwnerCacheForEveryCopyEngine(t *testing.T) {
 	originalFlush := directDaxFlushHook
 	originalInvalidate := directDaxInvalidateHook
 	var flushCalls, invalidateCalls int
@@ -580,30 +581,30 @@ func TestVNextExternalCRIUSealRoutesCPUAndDMLHardwareVisibility(t *testing.T) {
 		directDaxInvalidateHook = originalInvalidate
 	})
 
-	cpu := newVNextExternalSealTestFixture(t, vnextCRCCopyEngineCPU)
-	if err := cpu.owner.group.sealExternalCRIUOutput(
-		cpu.grant, cpu.publication, cpu.directory, cpu.cloneSidecars()); err != nil {
-		t.Fatalf("seal CPU external pages: %v", err)
-	}
-	if flushCalls != len(cpu.pages) || invalidateCalls != 0 {
-		t.Fatalf("CPU route called flush/invalidate %d/%d, expected %d/0",
-			flushCalls, invalidateCalls, len(cpu.pages))
-	}
-	if err := cpu.owner.group.abort(cpu.grant); err != nil {
-		t.Fatalf("abort CPU routing fixture: %v", err)
-	}
-
-	flushCalls, invalidateCalls = 0, 0
-	hardware := newVNextExternalSealTestFixture(t, vnextCRCCopyEngineDMLHardware)
-	if err := hardware.owner.group.sealExternalCRIUOutput(
-		hardware.grant, hardware.publication, hardware.directory, hardware.cloneSidecars()); err != nil {
-		t.Fatalf("seal DML hardware external pages: %v", err)
-	}
-	if flushCalls != 0 || invalidateCalls != len(hardware.pages) {
-		t.Fatalf("DML hardware route called flush/invalidate %d/%d, expected 0/%d",
-			flushCalls, invalidateCalls, len(hardware.pages))
-	}
-	if err := hardware.owner.group.abort(hardware.grant); err != nil {
-		t.Fatalf("abort DML hardware routing fixture: %v", err)
+	for _, engine := range []vnextCRCCopyEngine{
+		vnextCRCCopyEngineCPU,
+		vnextCRCCopyEngineDMLSoftware,
+		vnextCRCCopyEngineDMLHardware,
+	} {
+		t.Run(fmt.Sprintf("engine-%d", engine), func(t *testing.T) {
+			flushCalls, invalidateCalls = 0, 0
+			fixture := newVNextExternalSealTestFixture(t, engine)
+			if err := fixture.owner.group.sealExternalCRIUOutput(
+				fixture.grant,
+				fixture.publication,
+				fixture.directory,
+				fixture.cloneSidecars(),
+			); err != nil {
+				t.Fatalf("seal external pages with engine %d: %v", engine, err)
+			}
+			if flushCalls != 0 || invalidateCalls != len(fixture.pages) {
+				t.Fatalf(
+					"engine %d called Owner flush/invalidate %d/%d, expected 0/%d",
+					engine, flushCalls, invalidateCalls, len(fixture.pages))
+			}
+			if err := fixture.owner.group.abort(fixture.grant); err != nil {
+				t.Fatalf("abort engine %d routing fixture: %v", engine, err)
+			}
+		})
 	}
 }

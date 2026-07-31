@@ -1,0 +1,658 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"sync"
+
+	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/cxlcheckpoint"
+)
+
+// vnextOwnerService is the strict in-process boundary that a later cxld RPC
+// adapter can call. It deliberately owns no compatibility decoder and returns
+// no device-local path, file descriptor, allocator pointer, or writer token.
+//
+// The service mutex serializes one Owner's externally initiated lifecycle
+// operations. The durable authority remains the Owner journal and the device
+// allocator snapshots; this mutex is not a recovery mechanism.
+type vnextOwnerService struct {
+	mu sync.Mutex
+
+	group     *vnextOwnerGroup
+	directory *vnextLocalDAXDirectory
+}
+
+type vnextOwnerServiceErrorCode string
+
+const (
+	vnextOwnerServiceInvalidRequest          vnextOwnerServiceErrorCode = "invalid_request"
+	vnextOwnerServiceIdentityMismatch        vnextOwnerServiceErrorCode = "identity_mismatch"
+	vnextOwnerServiceTransactionNotFound     vnextOwnerServiceErrorCode = "transaction_not_found"
+	vnextOwnerServiceTransactionState        vnextOwnerServiceErrorCode = "transaction_state_mismatch"
+	vnextOwnerServiceConflict                vnextOwnerServiceErrorCode = "identity_conflict"
+	vnextOwnerServiceNoSpace                 vnextOwnerServiceErrorCode = "content_space_exhausted"
+	vnextOwnerServicePublicationIncompatible vnextOwnerServiceErrorCode = "publication_incompatible"
+	vnextOwnerServicePublicationInvalid      vnextOwnerServiceErrorCode = "publication_invalid"
+	vnextOwnerServiceSidecarMissing          vnextOwnerServiceErrorCode = "crc_sidecar_missing"
+	vnextOwnerServiceSidecarInvalid          vnextOwnerServiceErrorCode = "crc_sidecar_invalid"
+	vnextOwnerServicePayloadMismatch         vnextOwnerServiceErrorCode = "payload_crc_mismatch"
+	vnextOwnerServiceUnavailable             vnextOwnerServiceErrorCode = "owner_unavailable"
+)
+
+// vnextOwnerServiceError is safe for a transport adapter to convert into a
+// stable RPC error. Detail contains no write token or local DAX path added by
+// this service. Cause remains process-local and is available through errors.Is
+// and errors.As for logging and tests.
+type vnextOwnerServiceError struct {
+	Code      vnextOwnerServiceErrorCode
+	Operation string
+	Detail    string
+	cause     error
+}
+
+func (e *vnextOwnerServiceError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	if e.Detail == "" {
+		return fmt.Sprintf("VNext Owner %s failed (%s)", e.Operation, e.Code)
+	}
+	return fmt.Sprintf("VNext Owner %s failed (%s): %s", e.Operation, e.Code, e.Detail)
+}
+
+func (e *vnextOwnerServiceError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func vnextOwnerServiceFailure(
+	operation string,
+	code vnextOwnerServiceErrorCode,
+	detail string,
+	cause error,
+) error {
+	return &vnextOwnerServiceError{
+		Code:      code,
+		Operation: operation,
+		Detail:    detail,
+		cause:     cause,
+	}
+}
+
+// vnextOwnerOperationIdentity is the complete durable lookup key accepted by
+// seal, commit, and abort. It is an opaque lifecycle handle to callers: none
+// of its fields grants device write authority by itself, and no write token is
+// echoed from reserve.
+type vnextOwnerOperationIdentity struct {
+	RequestID          string
+	CheckpointID       string
+	ProducerID         string
+	OwnerID            string
+	OwnerEpoch         uint64
+	AllocationRecordID uint64
+}
+
+// The portable content-kind values intentionally match the strict V6 content
+// ABI, while remaining separate from cxld's allocator implementation type.
+type vnextOwnerServiceContentKind uint8
+
+const (
+	vnextOwnerServiceContentMemory vnextOwnerServiceContentKind = iota + 1
+	vnextOwnerServiceContentArtifact
+	vnextOwnerServiceContentMMTemplate
+	vnextOwnerServiceContentPageMap
+	vnextOwnerServiceContentRestoreBlob
+)
+
+func (kind vnextOwnerServiceContentKind) internal() (vnextContentKind, bool) {
+	switch kind {
+	case vnextOwnerServiceContentMemory:
+		return vnextContentMemory, true
+	case vnextOwnerServiceContentArtifact:
+		return vnextContentArtifact, true
+	case vnextOwnerServiceContentMMTemplate:
+		return vnextContentMMTemplate, true
+	case vnextOwnerServiceContentPageMap:
+		return vnextContentPageMap, true
+	case vnextOwnerServiceContentRestoreBlob:
+		return vnextContentRestoreBlob, true
+	default:
+		return 0, false
+	}
+}
+
+func vnextOwnerServiceKindFromInternal(kind vnextContentKind) (vnextOwnerServiceContentKind, bool) {
+	switch kind {
+	case vnextContentMemory:
+		return vnextOwnerServiceContentMemory, true
+	case vnextContentArtifact:
+		return vnextOwnerServiceContentArtifact, true
+	case vnextContentMMTemplate:
+		return vnextOwnerServiceContentMMTemplate, true
+	case vnextContentPageMap:
+		return vnextOwnerServiceContentPageMap, true
+	case vnextContentRestoreBlob:
+		return vnextOwnerServiceContentRestoreBlob, true
+	default:
+		return 0, false
+	}
+}
+
+type vnextOwnerReserveContent struct {
+	Kind       vnextOwnerServiceContentKind
+	ObjectID   uint64
+	ByteLength uint64
+}
+
+type vnextOwnerReserveRequest struct {
+	RequestID    string
+	CheckpointID string
+	ProducerID   string
+	OwnerID      string
+	OwnerEpoch   uint64
+	Contents     []vnextOwnerReserveContent
+	MaxExtents   uint32
+}
+
+type vnextOwnerPortableContentSegment struct {
+	Kind             vnextOwnerServiceContentKind
+	ObjectID         uint64
+	ByteLength       uint64
+	LogicalPageStart uint64
+	PageCount        uint64
+}
+
+type vnextOwnerPortableExtent struct {
+	DeviceUUID         string
+	StartDataPageIndex uint64
+	PageCount          uint64
+	LogicalPageStart   uint64
+}
+
+type vnextOwnerPortableDevice struct {
+	DeviceUUID        string
+	DataPageCount     uint64
+	ContentRegionBase uint64
+}
+
+// vnextOwnerReserveResponse is the complete producer-visible placement. The
+// device table includes only devices used by this allocation and is sorted by
+// stable UUID. Extents are ordered by LogicalPageStart and exactly cover
+// TotalPages. ContentRegionBase is portable device geometry, not a host path.
+type vnextOwnerReserveResponse struct {
+	Operation  vnextOwnerOperationIdentity
+	TotalPages uint64
+	Contents   []vnextOwnerPortableContentSegment
+	Extents    []vnextOwnerPortableExtent
+	Devices    []vnextOwnerPortableDevice
+}
+
+type vnextOwnerSealRequest struct {
+	Operation           vnextOwnerOperationIdentity
+	PublicationEnvelope []byte
+	CRCPageSidecars     map[uint32][]byte
+}
+
+func newVNextOwnerService(
+	group *vnextOwnerGroup,
+	directory *vnextLocalDAXDirectory,
+) (*vnextOwnerService, error) {
+	const operation = "initialize"
+	if group == nil || directory == nil || len(directory.byUUID) == 0 {
+		return nil, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceInvalidRequest,
+			"Owner group and local DAX directory are required",
+			nil)
+	}
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	if err := group.checkUsableLocked(); err != nil {
+		return nil, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable, "Owner group is not usable", err)
+	}
+	for _, deviceUUID := range group.deviceOrder {
+		device := group.devices[deviceUUID]
+		binding, exists := directory.byUUID[deviceUUID]
+		if device == nil || !exists {
+			return nil, vnextOwnerServiceFailure(
+				operation,
+				vnextOwnerServiceInvalidRequest,
+				fmt.Sprintf("local DAX binding for Owner device %q is missing", deviceUUID),
+				nil)
+		}
+		if binding.OwnerID != group.ownerID ||
+			binding.OwnerEpoch != group.ownerEpoch ||
+			binding.DataPageCount != device.superblock.Geometry.DataPageCount ||
+			binding.ContentRegionBase != device.superblock.Geometry.ContentRegionBase {
+			return nil, vnextOwnerServiceFailure(
+				operation,
+				vnextOwnerServiceIdentityMismatch,
+				fmt.Sprintf("local DAX binding %q does not match Owner geometry", deviceUUID),
+				errVNextAuthority)
+		}
+	}
+	return &vnextOwnerService{group: group, directory: directory}, nil
+}
+
+func (service *vnextOwnerService) reserve(
+	request vnextOwnerReserveRequest,
+) (vnextOwnerReserveResponse, error) {
+	const operation = "reserve"
+	service.mu.Lock()
+	defer service.mu.Unlock()
+
+	internal, err := request.internal()
+	if err != nil {
+		return vnextOwnerReserveResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceInvalidRequest, err.Error(), err)
+	}
+	grant, err := service.group.reserve(internal)
+	if err != nil {
+		return vnextOwnerReserveResponse{}, vnextOwnerServiceWrap(operation, err)
+	}
+	response, err := service.reserveResponse(internal, grant)
+	if err != nil {
+		return vnextOwnerReserveResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable, "reserved placement cannot be represented", err)
+	}
+	return response, nil
+}
+
+func (request vnextOwnerReserveRequest) internal() (vnextCheckpointAllocationRequest, error) {
+	if request.RequestID == "" || len(request.RequestID) > vnextMaxIdentityBytes ||
+		request.CheckpointID == "" || len(request.CheckpointID) > vnextMaxIdentityBytes ||
+		request.ProducerID == "" || len(request.ProducerID) > vnextMaxIdentityBytes ||
+		request.OwnerID == "" || len(request.OwnerID) > vnextMaxIdentityBytes {
+		return vnextCheckpointAllocationRequest{}, errors.New("reserve identity is empty or too long")
+	}
+	if request.OwnerEpoch == 0 || request.OwnerEpoch > uint64(math.MaxInt64) {
+		return vnextCheckpointAllocationRequest{}, errors.New("Owner epoch is outside the signed ABI")
+	}
+	if request.MaxExtents == 0 || request.MaxExtents > vnextMaxExtentsPerRecord {
+		return vnextCheckpointAllocationRequest{}, fmt.Errorf(
+			"extent limit %d is outside 1..%d", request.MaxExtents, vnextMaxExtentsPerRecord)
+	}
+	if len(request.Contents) == 0 || len(request.Contents) > vnextMaxContentsPerRecord {
+		return vnextCheckpointAllocationRequest{}, fmt.Errorf(
+			"content count %d is outside 1..%d", len(request.Contents), vnextMaxContentsPerRecord)
+	}
+	contents := make([]vnextContentRequest, len(request.Contents))
+	objects := make(map[uint64]struct{}, len(request.Contents))
+	var totalPages uint64
+	for index, portable := range request.Contents {
+		kind, ok := portable.Kind.internal()
+		if !ok {
+			return vnextCheckpointAllocationRequest{}, fmt.Errorf(
+				"content %d has unknown kind %d", index, portable.Kind)
+		}
+		if portable.ObjectID == 0 || portable.ByteLength == 0 {
+			return vnextCheckpointAllocationRequest{}, fmt.Errorf(
+				"content %d has a zero object ID or byte length", index)
+		}
+		if _, duplicate := objects[portable.ObjectID]; duplicate {
+			return vnextCheckpointAllocationRequest{}, fmt.Errorf(
+				"content object ID %d is duplicated", portable.ObjectID)
+		}
+		objects[portable.ObjectID] = struct{}{}
+		if kind == vnextContentMemory && portable.ByteLength%vnextContentPageSize != 0 {
+			return vnextCheckpointAllocationRequest{}, fmt.Errorf(
+				"memory content %d is not page aligned", portable.ObjectID)
+		}
+		rounded, ok := vnextAdd(portable.ByteLength, vnextContentPageSize-1)
+		if !ok {
+			return vnextCheckpointAllocationRequest{}, fmt.Errorf(
+				"content %d byte length overflows", index)
+		}
+		pages := rounded / vnextContentPageSize
+		totalPages, ok = vnextAdd(totalPages, pages)
+		if !ok || totalPages > uint64(math.MaxInt64) {
+			return vnextCheckpointAllocationRequest{}, errors.New(
+				"checkpoint page count exceeds the signed ABI")
+		}
+		contents[index] = vnextContentRequest{
+			Kind:       kind,
+			ObjectID:   portable.ObjectID,
+			ByteLength: portable.ByteLength,
+		}
+	}
+	return vnextCheckpointAllocationRequest{
+		RequestID:    request.RequestID,
+		CheckpointID: request.CheckpointID,
+		ProducerID:   request.ProducerID,
+		OwnerID:      request.OwnerID,
+		OwnerEpoch:   request.OwnerEpoch,
+		Contents:     contents,
+		MaxExtents:   request.MaxExtents,
+	}, nil
+}
+
+func (service *vnextOwnerService) reserveResponse(
+	request vnextCheckpointAllocationRequest,
+	grant vnextOwnerWriteGrant,
+) (vnextOwnerReserveResponse, error) {
+	response := vnextOwnerReserveResponse{
+		Operation: vnextOwnerOperationIdentity{
+			RequestID:          grant.RequestID,
+			CheckpointID:       grant.CheckpointID,
+			ProducerID:         grant.ProducerID,
+			OwnerID:            grant.OwnerID,
+			OwnerEpoch:         grant.OwnerEpoch,
+			AllocationRecordID: grant.AllocationRecordID,
+		},
+		Contents: make([]vnextOwnerPortableContentSegment, len(request.Contents)),
+		Extents:  make([]vnextOwnerPortableExtent, len(grant.Extents)),
+	}
+	var logicalPage uint64
+	for index, content := range request.Contents {
+		kind, ok := vnextOwnerServiceKindFromInternal(content.Kind)
+		if !ok {
+			return vnextOwnerReserveResponse{}, fmt.Errorf("unknown internal content kind %d", content.Kind)
+		}
+		rounded, ok := vnextAdd(content.ByteLength, vnextContentPageSize-1)
+		if !ok {
+			return vnextOwnerReserveResponse{}, errors.New("content size overflows")
+		}
+		pages := rounded / vnextContentPageSize
+		response.Contents[index] = vnextOwnerPortableContentSegment{
+			Kind:             kind,
+			ObjectID:         content.ObjectID,
+			ByteLength:       content.ByteLength,
+			LogicalPageStart: logicalPage,
+			PageCount:        pages,
+		}
+		logicalPage, ok = vnextAdd(logicalPage, pages)
+		if !ok {
+			return vnextOwnerReserveResponse{}, errors.New("logical content coverage overflows")
+		}
+	}
+	response.TotalPages = logicalPage
+
+	usedDevices := make(map[string]struct{})
+	var extentLogical uint64
+	for index, extent := range grant.Extents {
+		if extent.GlobalLogicalStart != extentLogical || extent.PageCount == 0 {
+			return vnextOwnerReserveResponse{}, fmt.Errorf(
+				"grant extent %d is not in logical order", index)
+		}
+		response.Extents[index] = vnextOwnerPortableExtent{
+			DeviceUUID:         extent.DeviceUUID,
+			StartDataPageIndex: extent.StartDataPageIndex,
+			PageCount:          extent.PageCount,
+			LogicalPageStart:   extent.GlobalLogicalStart,
+		}
+		var ok bool
+		extentLogical, ok = vnextAdd(extentLogical, extent.PageCount)
+		if !ok {
+			return vnextOwnerReserveResponse{}, errors.New("extent logical coverage overflows")
+		}
+		usedDevices[extent.DeviceUUID] = struct{}{}
+	}
+	if extentLogical != response.TotalPages {
+		return vnextOwnerReserveResponse{}, fmt.Errorf(
+			"grant covers %d pages, content segmentation covers %d",
+			extentLogical, response.TotalPages)
+	}
+
+	deviceUUIDs := make([]string, 0, len(usedDevices))
+	for deviceUUID := range usedDevices {
+		deviceUUIDs = append(deviceUUIDs, deviceUUID)
+	}
+	sort.Strings(deviceUUIDs)
+	response.Devices = make([]vnextOwnerPortableDevice, 0, len(deviceUUIDs))
+	for _, deviceUUID := range deviceUUIDs {
+		device := service.group.devices[deviceUUID]
+		if device == nil {
+			return vnextOwnerReserveResponse{}, fmt.Errorf(
+				"grant references detached device %q", deviceUUID)
+		}
+		response.Devices = append(response.Devices, vnextOwnerPortableDevice{
+			DeviceUUID:        deviceUUID,
+			DataPageCount:     device.superblock.Geometry.DataPageCount,
+			ContentRegionBase: device.superblock.Geometry.ContentRegionBase,
+		})
+	}
+	return response, nil
+}
+
+func (service *vnextOwnerService) seal(request vnextOwnerSealRequest) error {
+	const operation = "seal"
+	service.mu.Lock()
+	defer service.mu.Unlock()
+
+	grant, _, err := service.resolveOperation(
+		operation, request.Operation, vnextOwnerGranted, true)
+	if err != nil {
+		return err
+	}
+	if len(request.PublicationEnvelope) >= len(cxlcheckpoint.MagicString) &&
+		string(request.PublicationEnvelope[:len(cxlcheckpoint.MagicString)]) != cxlcheckpoint.MagicString {
+		return vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServicePublicationIncompatible,
+			"publication is not a strict TRPUB006 envelope",
+			cxlcheckpoint.ErrWrongFormat)
+	}
+	publication, err := cxlcheckpoint.Decode(request.PublicationEnvelope)
+	if err != nil {
+		if errors.Is(err, cxlcheckpoint.ErrWrongFormat) {
+			return vnextOwnerServiceFailure(
+				operation,
+				vnextOwnerServicePublicationIncompatible,
+				"publication is not a strict TRPUB006 envelope",
+				err)
+		}
+		return vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServicePublicationInvalid,
+			"TRPUB006 envelope failed integrity or semantic validation",
+			err)
+	}
+	if publication.CheckpointID != request.Operation.CheckpointID ||
+		publication.Root.CheckpointID != request.Operation.CheckpointID ||
+		publication.Allocation.OwnerID != request.Operation.OwnerID ||
+		publication.Allocation.OwnerEpoch != request.Operation.OwnerEpoch ||
+		publication.Allocation.AllocationRecordID != request.Operation.AllocationRecordID {
+		return vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceIdentityMismatch,
+			"publication does not name the reserved checkpoint allocation",
+			errVNextAuthority)
+	}
+	if err := vnextOwnerServiceRequireSidecars(publication, request.CRCPageSidecars); err != nil {
+		return err
+	}
+	if err := service.group.sealExternalCRIUOutput(
+		grant, publication, service.directory, request.CRCPageSidecars); err != nil {
+		return vnextOwnerServiceWrap(operation, err)
+	}
+	return nil
+}
+
+func vnextOwnerServiceRequireSidecars(
+	publication cxlcheckpoint.Publication,
+	sidecars map[uint32][]byte,
+) error {
+	const operation = "seal"
+	expected := make(map[uint32]struct{})
+	for _, run := range publication.PageMap.Runs {
+		expected[run.PagesImageID] = struct{}{}
+	}
+	for pagesImageID := range expected {
+		data, exists := sidecars[pagesImageID]
+		if !exists || len(data) == 0 {
+			return vnextOwnerServiceFailure(
+				operation,
+				vnextOwnerServiceSidecarMissing,
+				fmt.Sprintf("TRCRC006 sidecar for pages image %d is missing", pagesImageID),
+				errVNextCRCSidecar)
+		}
+	}
+	if len(sidecars) != len(expected) {
+		return vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceSidecarInvalid,
+			"TRCRC006 sidecar set contains an unexpected pages image",
+			errVNextCRCSidecar)
+	}
+	return nil
+}
+
+func (service *vnextOwnerService) commit(identity vnextOwnerOperationIdentity) error {
+	const operation = "commit"
+	service.mu.Lock()
+	defer service.mu.Unlock()
+
+	grant, _, err := service.resolveOperation(
+		operation, identity, vnextOwnerGranted, true, vnextOwnerCommitted)
+	if err != nil {
+		return err
+	}
+	if err := service.group.commit(grant); err != nil {
+		return vnextOwnerServiceWrap(operation, err)
+	}
+	return nil
+}
+
+func (service *vnextOwnerService) abort(identity vnextOwnerOperationIdentity) error {
+	const operation = "abort"
+	service.mu.Lock()
+	defer service.mu.Unlock()
+
+	grant, _, err := service.resolveOperation(
+		operation, identity, vnextOwnerGranted, true, vnextOwnerAborted)
+	if err != nil {
+		return err
+	}
+	if err := service.group.abort(grant); err != nil {
+		return vnextOwnerServiceWrap(operation, err)
+	}
+	return nil
+}
+
+func (service *vnextOwnerService) resolveOperation(
+	operation string,
+	identity vnextOwnerOperationIdentity,
+	requiredState vnextOwnerTransactionState,
+	reconstructFragmentAuthority bool,
+	alsoAllowed ...vnextOwnerTransactionState,
+) (vnextOwnerWriteGrant, vnextOwnerTransactionState, error) {
+	if identity.RequestID == "" || len(identity.RequestID) > vnextMaxIdentityBytes ||
+		identity.CheckpointID == "" || len(identity.CheckpointID) > vnextMaxIdentityBytes ||
+		identity.ProducerID == "" || len(identity.ProducerID) > vnextMaxIdentityBytes ||
+		identity.OwnerID == "" || len(identity.OwnerID) > vnextMaxIdentityBytes ||
+		identity.OwnerEpoch == 0 || identity.OwnerEpoch > uint64(math.MaxInt64) ||
+		identity.AllocationRecordID == 0 || identity.AllocationRecordID > uint64(math.MaxInt64) {
+		return vnextOwnerWriteGrant{}, 0, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceInvalidRequest,
+			"operation identity is incomplete",
+			nil)
+	}
+
+	group := service.group
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	if err := group.checkUsableLocked(); err != nil {
+		return vnextOwnerWriteGrant{}, 0, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable, "Owner group is not usable", err)
+	}
+	transaction := group.journal.Transactions[identity.AllocationRecordID]
+	if transaction == nil {
+		return vnextOwnerWriteGrant{}, 0, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceTransactionNotFound,
+			"allocation record does not exist",
+			nil)
+	}
+	if identity.RequestID != transaction.RequestID ||
+		identity.CheckpointID != transaction.CheckpointID ||
+		identity.ProducerID != transaction.ProducerID ||
+		identity.OwnerID != group.ownerID ||
+		identity.OwnerEpoch != group.ownerEpoch {
+		return vnextOwnerWriteGrant{}, 0, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceIdentityMismatch,
+			"operation identity does not match the durable Owner transaction",
+			errVNextAuthority)
+	}
+	allowed := transaction.State == requiredState
+	for _, state := range alsoAllowed {
+		allowed = allowed || transaction.State == state
+	}
+	if !allowed {
+		return vnextOwnerWriteGrant{}, transaction.State, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceTransactionState,
+			fmt.Sprintf("durable transaction is in state %d", transaction.State),
+			errVNextInvalidState)
+	}
+	grant := vnextOwnerWriteGrant{
+		AllocationRecordID: transaction.AllocationRecordID,
+		RequestID:          transaction.RequestID,
+		CheckpointID:       transaction.CheckpointID,
+		ProducerID:         transaction.ProducerID,
+		OwnerID:            group.ownerID,
+		OwnerEpoch:         group.ownerEpoch,
+	}
+	// A live GRANTED transaction always reconstructs its private per-device
+	// writer grants from durable allocator records, even for commit and abort.
+	// Terminal idempotent retries cannot and need not reconstruct cleared write
+	// tokens; group.commit/group.abort authenticate their full identity before
+	// returning success for COMMITTED/ABORTED.
+	if reconstructFragmentAuthority && transaction.State == requiredState {
+		var err error
+		grant, err = group.buildGrantLocked(transaction)
+		if err != nil {
+			return vnextOwnerWriteGrant{}, transaction.State, vnextOwnerServiceFailure(
+				operation,
+				vnextOwnerServiceUnavailable,
+				"durable device authority cannot be reconstructed",
+				err)
+		}
+	}
+	return grant, transaction.State, nil
+}
+
+func vnextOwnerServiceWrap(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var typed *vnextOwnerServiceError
+	if errors.As(err, &typed) {
+		return err
+	}
+	switch {
+	case errors.Is(err, errVNextAuthority):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceIdentityMismatch, "Owner authority does not match", err)
+	case errors.Is(err, errVNextInvalidState):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceTransactionState, "transaction is not ready for this operation", err)
+	case errors.Is(err, errVNextAlreadyExists):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceConflict, "request or checkpoint identity already exists", err)
+	case errors.Is(err, errVNextNoSpace), errors.Is(err, errVNextMetadataFull):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceNoSpace, "Owner cannot satisfy the checkpoint allocation", err)
+	case errors.Is(err, errVNextCRCSidecar):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceSidecarInvalid, "TRCRC006 validation failed", err)
+	case errors.Is(err, cxlcheckpoint.ErrWrongFormat):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServicePublicationIncompatible, "publication is not TRPUB006", err)
+	case errors.Is(err, cxlcheckpoint.ErrCorrupt), errors.Is(err, cxlcheckpoint.ErrInvalid):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServicePublicationInvalid, "TRPUB006 validation failed", err)
+	case errors.Is(err, errVNextCorrupt):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServicePayloadMismatch, "payload does not match its CRC-32C record", err)
+	default:
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable, "Owner operation failed closed", err)
+	}
+}
