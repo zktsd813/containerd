@@ -33,12 +33,12 @@ func newVNextExternalSealTestFixture(
 	engine vnextCRCCopyEngine,
 ) *vnextExternalSealTestFixture {
 	t.Helper()
-	// These capacities are deliberately three and four content pages. The
-	// seven-page checkpoint must therefore span both devices, and its fourth
+	// These capacities are deliberately three and five content pages. The
+	// eight-page checkpoint must therefore span both devices, and its fourth
 	// memory page crosses the device boundary.
 	owner := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
 		{UUID: "external-seal-device-a", Size: 56 << 10},
-		{UUID: "external-seal-device-b", Size: 60 << 10},
+		{UUID: "external-seal-device-b", Size: 64 << 10},
 	})
 	device := owner.devices[0]
 
@@ -144,10 +144,21 @@ func newVNextExternalSealTestFixture(
 		OwnerID:      device.superblock.OwnerID,
 		OwnerEpoch:   device.superblock.OwnerEpoch,
 		Contents: []vnextContentRequest{
-			{Kind: vnextContentMemory, ObjectID: 1, ByteLength: 4 * vnextContentPageSize},
-			{Kind: vnextContentMMTemplate, ObjectID: 2, ByteLength: mmSize},
-			{Kind: vnextContentPageMap, ObjectID: 3, ByteLength: pageMapSize},
-			{Kind: vnextContentPageMap, ObjectID: 4, ByteLength: pageMapSize},
+			{
+				Kind:       vnextContentMemory,
+				ObjectID:   1,
+				ByteLength: 4 * vnextContentPageSize,
+				PageCount:  4,
+			},
+			{Kind: vnextContentMMTemplate, ObjectID: 2, ByteLength: mmSize, PageCount: 1},
+			{Kind: vnextContentPageMap, ObjectID: 3, ByteLength: pageMapSize, PageCount: 1},
+			{Kind: vnextContentPageMap, ObjectID: 4, ByteLength: pageMapSize, PageCount: 1},
+			{
+				Kind:       vnextContentPublication,
+				ObjectID:   5,
+				ByteLength: vnextContentPageSize,
+				PageCount:  1,
+			},
 		},
 		MaxExtents: 4,
 	}
@@ -226,6 +237,13 @@ func newVNextExternalSealTestFixture(
 				Kind:             cxlcheckpoint.ContentPageMap,
 				ByteLength:       pageMapSize,
 				LogicalPageStart: 6,
+				PageCount:        1,
+			},
+			{
+				ObjectID:         5,
+				Kind:             cxlcheckpoint.ContentPublication,
+				ByteLength:       cxlcheckpoint.PageSize,
+				LogicalPageStart: 7,
 				PageCount:        1,
 			},
 		},
@@ -355,7 +373,12 @@ func newVNextExternalSealTestFixture(
 		directory:   directory,
 		pages:       pages,
 		sidecars:    sidecars,
-		controlSize: []int{int(mmSize), int(pageMapSize), int(pageMapSize)},
+		controlSize: []int{
+			int(mmSize),
+			int(pageMapSize),
+			int(pageMapSize),
+			int(vnextContentPageSize),
+		},
 	}
 }
 
@@ -441,6 +464,17 @@ func (fixture *vnextExternalSealTestFixture) sealControlPages(t *testing.T) {
 	t.Helper()
 	for index, size := range fixture.controlSize {
 		payload := bytes.Repeat([]byte{byte(0xa0 + index)}, size)
+		if index == len(fixture.controlSize)-1 {
+			envelope, err := cxlcheckpoint.Encode(fixture.publication)
+			if err != nil {
+				t.Fatalf("encode publication control object: %v", err)
+			}
+			if len(envelope) > size {
+				t.Fatalf("publication envelope is %d bytes, slot is %d", len(envelope), size)
+			}
+			payload = make([]byte, size)
+			copy(payload, envelope)
+		}
 		if err := fixture.owner.group.writePage(
 			fixture.grant, uint64(index+4), payload); err != nil {
 			t.Fatalf("seal control logical page %d: %v", index+4, err)

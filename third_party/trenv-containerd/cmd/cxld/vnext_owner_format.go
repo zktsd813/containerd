@@ -55,6 +55,7 @@ type vnextOwnerTransaction struct {
 	State              vnextOwnerTransactionState
 	TotalPages         uint64
 	MaxExtents         uint32
+	Contents           []vnextContentSegment
 	Fragments          []vnextOwnerDeviceFragment
 }
 
@@ -99,6 +100,7 @@ func (journal *vnextOwnerJournal) clone() *vnextOwnerJournal {
 	}
 	for allocationID, transaction := range journal.Transactions {
 		copyTransaction := *transaction
+		copyTransaction.Contents = append([]vnextContentSegment(nil), transaction.Contents...)
 		copyTransaction.Fragments = make([]vnextOwnerDeviceFragment, len(transaction.Fragments))
 		for index, fragment := range transaction.Fragments {
 			copyTransaction.Fragments[index] = fragment
@@ -149,6 +151,15 @@ func (journal *vnextOwnerJournal) marshalAtSequence(
 		vnextWriteString(&payload, transaction.CheckpointID)
 		vnextWriteString(&payload, transaction.ProducerID)
 		payload.Write(transaction.RequestDigest[:])
+		vnextWriteU32(&payload, uint32(len(transaction.Contents)))
+		for _, content := range transaction.Contents {
+			payload.WriteByte(byte(content.Kind))
+			payload.Write(make([]byte, 7))
+			vnextWriteU64(&payload, content.ObjectID)
+			vnextWriteU64(&payload, content.ByteLength)
+			vnextWriteU64(&payload, content.LogicalPageStart)
+			vnextWriteU64(&payload, content.PageCount)
+		}
 		vnextWriteU32(&payload, uint32(len(transaction.Fragments)))
 		for _, fragment := range transaction.Fragments {
 			vnextWriteString(&payload, fragment.DeviceUUID)
@@ -282,6 +293,43 @@ func vnextParseOwnerTransaction(decoder *vnextDecoder) (*vnextOwnerTransaction, 
 		return nil, err
 	}
 	copy(transaction.RequestDigest[:], digest)
+	contentCount, err := decoder.u32()
+	if err != nil {
+		return nil, err
+	}
+	if contentCount == 0 || contentCount > vnextMaxContentsPerRecord {
+		return nil, fmt.Errorf("Owner content count %d is invalid: %w",
+			contentCount, errVNextCorrupt)
+	}
+	transaction.Contents = make([]vnextContentSegment, 0, contentCount)
+	for contentIndex := uint32(0); contentIndex < contentCount; contentIndex++ {
+		kind, err := decoder.u8()
+		if err != nil {
+			return nil, err
+		}
+		reserved, err := decoder.bytes(7)
+		if err != nil {
+			return nil, err
+		}
+		if !vnextAllZero(reserved) {
+			return nil, fmt.Errorf(
+				"Owner content reserved bytes are non-zero: %w", errVNextWrongFormat)
+		}
+		content := vnextContentSegment{Kind: vnextContentKind(kind)}
+		if content.ObjectID, err = decoder.u64(); err != nil {
+			return nil, err
+		}
+		if content.ByteLength, err = decoder.u64(); err != nil {
+			return nil, err
+		}
+		if content.LogicalPageStart, err = decoder.u64(); err != nil {
+			return nil, err
+		}
+		if content.PageCount, err = decoder.u64(); err != nil {
+			return nil, err
+		}
+		transaction.Contents = append(transaction.Contents, content)
+	}
 	fragmentCount, err := decoder.u32()
 	if err != nil {
 		return nil, err
@@ -350,7 +398,8 @@ func (journal *vnextOwnerJournal) validate(attachedDevices map[string]*vnextPers
 		if transaction == nil || allocationID != transaction.AllocationRecordID {
 			return fmt.Errorf("Owner transaction map key mismatch: %w", errVNextCorrupt)
 		}
-		if err := vnextValidateOwnerTransaction(transaction, attachedDevices); err != nil {
+		if err := vnextValidateOwnerTransaction(
+			transaction, attachedDevices, journal.OwnerID, journal.OwnerEpoch); err != nil {
 			return err
 		}
 		if _, exists := requests[transaction.RequestID]; exists {
@@ -388,6 +437,8 @@ func (journal *vnextOwnerJournal) validate(attachedDevices map[string]*vnextPers
 func vnextValidateOwnerTransaction(
 	transaction *vnextOwnerTransaction,
 	attachedDevices map[string]*vnextPersistentDevice,
+	ownerID string,
+	ownerEpoch uint64,
 ) error {
 	if transaction.AllocationRecordID == 0 || transaction.AllocationRecordID >= uint64(math.MaxInt64) ||
 		transaction.RequestID == "" || transaction.CheckpointID == "" || transaction.ProducerID == "" ||
@@ -402,6 +453,40 @@ func vnextValidateOwnerTransaction(
 		len(transaction.ProducerID) > vnextMaxIdentityBytes {
 		return fmt.Errorf("Owner transaction %d has overlong identity: %w",
 			transaction.AllocationRecordID, errVNextCorrupt)
+	}
+	if len(transaction.Contents) == 0 ||
+		len(transaction.Contents) > vnextMaxContentsPerRecord {
+		return fmt.Errorf("Owner transaction %d has invalid content count: %w",
+			transaction.AllocationRecordID, errVNextCorrupt)
+	}
+	seenObjects := make(map[uint64]struct{}, len(transaction.Contents))
+	var contentLogical uint64
+	for _, content := range transaction.Contents {
+		if !content.Kind.valid() || content.ObjectID == 0 || content.PageCount == 0 ||
+			content.LogicalPageStart != contentLogical {
+			return fmt.Errorf("Owner transaction %d has invalid content: %w",
+				transaction.AllocationRecordID, errVNextCorrupt)
+		}
+		if _, exists := seenObjects[content.ObjectID]; exists {
+			return fmt.Errorf("Owner transaction %d repeats content object %d: %w",
+				transaction.AllocationRecordID, content.ObjectID, errVNextCorrupt)
+		}
+		seenObjects[content.ObjectID] = struct{}{}
+		capacity, ok := vnextMul(content.PageCount, vnextContentPageSize)
+		if !ok || content.ByteLength > capacity ||
+			(content.Kind == vnextContentMemory && content.ByteLength != capacity) ||
+			(content.Kind == vnextContentPublication && content.ByteLength != capacity) {
+			return fmt.Errorf("Owner transaction %d has invalid content capacity: %w",
+				transaction.AllocationRecordID, errVNextCorrupt)
+		}
+		contentLogical, ok = vnextAdd(contentLogical, content.PageCount)
+		if !ok {
+			return fmt.Errorf("Owner transaction content coverage overflows: %w", errVNextCorrupt)
+		}
+	}
+	if contentLogical != transaction.TotalPages {
+		return fmt.Errorf("Owner transaction content covers %d of %d pages: %w",
+			contentLogical, transaction.TotalPages, errVNextCorrupt)
 	}
 	seenDevices := make(map[string]struct{}, len(transaction.Fragments))
 	var globalLogical uint64
@@ -454,6 +539,28 @@ func vnextValidateOwnerTransaction(
 	}
 	if globalLogical != transaction.TotalPages || extentCount > uint64(transaction.MaxExtents) {
 		return fmt.Errorf("Owner transaction total/extent budget mismatch: %w", errVNextCorrupt)
+	}
+	requestContents := make([]vnextContentRequest, len(transaction.Contents))
+	for index, content := range transaction.Contents {
+		requestContents[index] = vnextContentRequest{
+			Kind:       content.Kind,
+			ObjectID:   content.ObjectID,
+			ByteLength: content.ByteLength,
+			PageCount:  content.PageCount,
+		}
+	}
+	expectedDigest := vnextOwnerRequestDigest(vnextCheckpointAllocationRequest{
+		RequestID:    transaction.RequestID,
+		CheckpointID: transaction.CheckpointID,
+		ProducerID:   transaction.ProducerID,
+		OwnerID:      ownerID,
+		OwnerEpoch:   ownerEpoch,
+		Contents:     requestContents,
+		MaxExtents:   transaction.MaxExtents,
+	})
+	if transaction.RequestDigest != expectedDigest {
+		return fmt.Errorf("Owner transaction %d request digest mismatch: %w",
+			transaction.AllocationRecordID, errVNextCorrupt)
 	}
 	return nil
 }

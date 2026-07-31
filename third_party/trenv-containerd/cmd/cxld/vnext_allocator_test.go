@@ -39,6 +39,7 @@ func testVNextRequest(id string, pages uint64) vnextCheckpointAllocationRequest 
 			Kind:       vnextContentMemory,
 			ObjectID:   uint64(len(id)) + uint64(id[0]) + 1,
 			ByteLength: pages * vnextContentPageSize,
+			PageCount:  pages,
 		}},
 		MaxExtents: 64,
 	}
@@ -83,9 +84,9 @@ func TestVNextAllocatorUsesOnePoolForMemoryAndArtifacts(t *testing.T) {
 		OwnerEpoch:   7,
 		MaxExtents:   8,
 		Contents: []vnextContentRequest{
-			{Kind: vnextContentMemory, ObjectID: 1, ByteLength: 4096},
-			{Kind: vnextContentArtifact, ObjectID: 2, ByteLength: 4097},
-			{Kind: vnextContentMMTemplate, ObjectID: 3, ByteLength: 1},
+			{Kind: vnextContentMemory, ObjectID: 1, ByteLength: 4096, PageCount: 1},
+			{Kind: vnextContentArtifact, ObjectID: 2, ByteLength: 4097, PageCount: 2},
+			{Kind: vnextContentMMTemplate, ObjectID: 3, ByteLength: 1, PageCount: 1},
 		},
 	}
 	before := allocator.freePages()
@@ -128,6 +129,73 @@ func TestVNextAllocatorUsesOnePoolForMemoryAndArtifacts(t *testing.T) {
 	conflicting.Contents[1].ByteLength++
 	if _, err := allocator.reserve(conflicting); !errors.Is(err, errVNextAlreadyExists) {
 		t.Fatalf("conflicting request reuse returned %v", err)
+	}
+}
+
+func TestVNextAllocatorSeparatesMeaningfulBytesFromReservedCapacity(t *testing.T) {
+	allocator := newTestVNextAllocator(t, 8<<20, 128<<10)
+	request := vnextCheckpointAllocationRequest{
+		RequestID:    "request-capacity",
+		CheckpointID: "checkpoint-capacity",
+		ProducerID:   "producer-capacity",
+		OwnerID:      "owner-0",
+		OwnerEpoch:   7,
+		MaxExtents:   8,
+		Contents: []vnextContentRequest{
+			{
+				Kind:       vnextContentPageMap,
+				ObjectID:   1,
+				ByteLength: 17,
+				PageCount:  3,
+			},
+			{
+				Kind:       vnextContentPageMap,
+				ObjectID:   2,
+				ByteLength: 0,
+				PageCount:  2,
+			},
+			{
+				Kind:       vnextContentPublication,
+				ObjectID:   3,
+				ByteLength: 2 * vnextContentPageSize,
+				PageCount:  2,
+			},
+		},
+	}
+	grant, err := allocator.reserve(request)
+	if err != nil {
+		t.Fatalf("reserve capacity-aware content: %v", err)
+	}
+	if len(grant.Contents) != 3 || grant.Contents[0].PageCount != 3 ||
+		grant.Contents[1].ByteLength != 0 || grant.Contents[1].PageCount != 2 ||
+		grant.Contents[2].Kind != vnextContentPublication {
+		t.Fatalf("capacity-aware grant changed content segmentation: %#v", grant.Contents)
+	}
+	wantLengths := []uint32{17, 4096, 4096, 4096, 4096, 4096, 4096}
+	wantPadding := []bool{false, true, true, true, true, false, false}
+	for logicalPage := uint64(0); logicalPage < uint64(len(wantLengths)); logicalPage++ {
+		authorization, err := allocator.authorizePageWrite(grant, logicalPage)
+		if err != nil {
+			t.Fatalf("authorize capacity page %d: %v", logicalPage, err)
+		}
+		if authorization.ExpectedPayloadLength != wantLengths[logicalPage] ||
+			authorization.ExpectedZeroPadding != wantPadding[logicalPage] {
+			t.Fatalf("capacity page %d authorization: %#v", logicalPage, authorization)
+		}
+	}
+
+	invalidMemory := testVNextRequest("capacity-memory", 1)
+	invalidMemory.Contents[0].PageCount = 2
+	if _, err := allocator.reserve(invalidMemory); err == nil {
+		t.Fatal("partial memory capacity reservation was accepted")
+	}
+	invalidPublication := request
+	invalidPublication.RequestID = "request-capacity-publication-invalid"
+	invalidPublication.CheckpointID = "checkpoint-capacity-publication-invalid"
+	invalidPublication.Contents = append([]vnextContentRequest(nil), request.Contents...)
+	invalidPublication.Contents[2].ByteLength--
+	if _, err := allocator.reserve(invalidPublication); err == nil {
+		t.Fatal("non-page-aligned publication slot was accepted")
 	}
 }
 

@@ -2,6 +2,7 @@ package cxlcheckpoint
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -31,7 +32,49 @@ func Encode(publication Publication) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return marshalEnvelope(payload)
+	encoded, err := marshalEnvelope(payload)
+	if err != nil {
+		return nil, err
+	}
+	if err := validatePublicationEnvelopeCapacity(publication, uint64(len(encoded))); err != nil {
+		return nil, err
+	}
+	return encoded, nil
+}
+
+// EncodeForStorage returns both the exact Scheduler-addressed TRPUB006 bytes
+// and the zero-padded bytes that the producer writes to the complete reserved
+// publication slot. The PageID runs cover only the exact envelope pages, so a
+// larger capacity reservation never broadens the discoverable root.
+func EncodeForStorage(publication Publication) (PublicationStorage, error) {
+	encoded, err := Encode(publication)
+	if err != nil {
+		return PublicationStorage{}, err
+	}
+	slot, err := publication.publicationContentSlot()
+	if err != nil {
+		return PublicationStorage{}, err
+	}
+	capacity, ok := mulLong(slot.PageCount, PageSize)
+	if !ok || capacity > uint64(math.MaxInt) {
+		return PublicationStorage{}, invalidf("publication slot exceeds host address space")
+	}
+	requiredPages := (uint64(len(encoded)) + PageSize - 1) / PageSize
+	runs, err := publication.publicationPageRuns(slot, requiredPages)
+	if err != nil {
+		return PublicationStorage{}, err
+	}
+	padded := make([]byte, int(capacity))
+	copy(padded, encoded)
+	return PublicationStorage{
+		ContentObjectID:  slot.ObjectID,
+		LogicalPageStart: slot.LogicalPageStart,
+		CapacityPages:    slot.PageCount,
+		ExactBytes:       append([]byte(nil), encoded...),
+		PaddedBytes:      padded,
+		SHA256:           sha256.Sum256(encoded),
+		PageRuns:         runs,
+	}, nil
 }
 
 // Decode accepts only a complete, checksummed TRPUB006 envelope. Legacy
@@ -49,7 +92,24 @@ func Decode(data []byte) (Publication, error) {
 	if err := publication.Validate(); err != nil {
 		return Publication{}, err
 	}
+	if err := validatePublicationEnvelopeCapacity(publication, uint64(len(data))); err != nil {
+		return Publication{}, err
+	}
 	return publication, nil
+}
+
+func validatePublicationEnvelopeCapacity(publication Publication, encodedBytes uint64) error {
+	slot, err := publication.publicationContentSlot()
+	if err != nil {
+		return err
+	}
+	capacity, ok := mulLong(slot.PageCount, PageSize)
+	if !ok || encodedBytes == 0 || encodedBytes > capacity {
+		return invalidf(
+			"encoded publication is %d bytes, publication slot capacity is %d",
+			encodedBytes, capacity)
+	}
+	return nil
 }
 
 func marshalEnvelope(payload []byte) ([]byte, error) {

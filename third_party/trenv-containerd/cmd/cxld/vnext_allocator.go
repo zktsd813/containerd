@@ -51,6 +51,7 @@ type vnextContentRequest struct {
 	Kind       vnextContentKind
 	ObjectID   uint64
 	ByteLength uint64
+	PageCount  uint64
 }
 
 type vnextCheckpointAllocationRequest struct {
@@ -137,6 +138,7 @@ type vnextPageWriteAuthorization struct {
 	ContentObjectID       uint64
 	ContentKind           vnextContentKind
 	ExpectedPayloadLength uint32
+	ExpectedZeroPadding   bool
 	OwnerTransaction      uint64
 }
 
@@ -548,13 +550,16 @@ func (a *vnextCheckpointAllocator) authorizePageWrite(
 	}
 	pageWithinObject := logicalPage - segment.LogicalPageStart
 	consumed, ok := vnextMul(pageWithinObject, vnextContentPageSize)
-	if !ok || consumed >= segment.ByteLength {
+	if !ok {
 		return vnextPageWriteAuthorization{}, fmt.Errorf("logical content offset overflow: %w", errVNextCorrupt)
 	}
-	remaining := segment.ByteLength - consumed
 	payloadLength := vnextContentPageSize
-	if remaining < payloadLength {
-		payloadLength = remaining
+	padding := consumed >= segment.ByteLength
+	if !padding {
+		remaining := segment.ByteLength - consumed
+		if remaining < payloadLength {
+			payloadLength = remaining
+		}
 	}
 	descriptorOffset, err := a.superblock.Geometry.descriptorOffset(dataPage)
 	if err != nil {
@@ -573,6 +578,7 @@ func (a *vnextCheckpointAllocator) authorizePageWrite(
 		ContentObjectID:       segment.ObjectID,
 		ContentKind:           segment.Kind,
 		ExpectedPayloadLength: uint32(payloadLength),
+		ExpectedZeroPadding:   padding,
 		OwnerTransaction:      record.OwnerTransaction,
 	}, nil
 }
@@ -674,20 +680,23 @@ func (a *vnextCheckpointAllocator) validateRequestLocked(
 			return nil, 0, fmt.Errorf("content object ID %d is duplicated", content.ObjectID)
 		}
 		seenObjects[content.ObjectID] = struct{}{}
-		if content.ByteLength == 0 {
-			return nil, 0, fmt.Errorf("content object %d has zero bytes", content.ObjectID)
+		if content.PageCount == 0 {
+			return nil, 0, fmt.Errorf("content object %d has zero reserved pages", content.ObjectID)
 		}
-		if content.Kind == vnextContentMemory && content.ByteLength%vnextContentPageSize != 0 {
-			return nil, 0, fmt.Errorf(
-				"memory object %d length %d is not a whole 4 KiB page",
-				content.ObjectID, content.ByteLength)
-		}
-		rounded, ok := vnextAdd(content.ByteLength, vnextContentPageSize-1)
-		if !ok {
+		capacity, ok := vnextMul(content.PageCount, vnextContentPageSize)
+		if !ok || content.ByteLength > capacity {
 			return nil, 0, fmt.Errorf("content object %d byte length overflows", content.ObjectID)
 		}
-		pageCount := rounded / vnextContentPageSize
-		nextTotal, ok := vnextAdd(totalPages, pageCount)
+		if content.Kind == vnextContentMemory && content.ByteLength != capacity {
+			return nil, 0, fmt.Errorf(
+				"memory object %d length %d does not fill its %d reserved pages",
+				content.ObjectID, content.ByteLength, content.PageCount)
+		}
+		if content.Kind == vnextContentPublication && content.ByteLength != capacity {
+			return nil, 0, fmt.Errorf(
+				"publication object %d must reserve a page-aligned slot", content.ObjectID)
+		}
+		nextTotal, ok := vnextAdd(totalPages, content.PageCount)
 		if !ok {
 			return nil, 0, errors.New("allocation page count overflows")
 		}
@@ -696,7 +705,7 @@ func (a *vnextCheckpointAllocator) validateRequestLocked(
 			ObjectID:         content.ObjectID,
 			ByteLength:       content.ByteLength,
 			LogicalPageStart: totalPages,
-			PageCount:        pageCount,
+			PageCount:        content.PageCount,
 		})
 		totalPages = nextTotal
 	}
@@ -930,13 +939,14 @@ func (a *vnextCheckpointAllocator) validateRecordLocked(record *vnextAllocationR
 	for _, segment := range record.Contents {
 		if !segment.Kind.valid() ||
 			segment.ObjectID == 0 ||
-			segment.ByteLength == 0 ||
 			segment.PageCount == 0 ||
 			segment.LogicalPageStart != logical {
 			return fmt.Errorf("allocation %d has invalid content segment: %w", record.AllocationRecordID, errVNextCorrupt)
 		}
-		rounded, ok := vnextAdd(segment.ByteLength, vnextContentPageSize-1)
-		if !ok || rounded/vnextContentPageSize != segment.PageCount {
+		capacity, ok := vnextMul(segment.PageCount, vnextContentPageSize)
+		if !ok || segment.ByteLength > capacity ||
+			(segment.Kind == vnextContentMemory && segment.ByteLength != capacity) ||
+			(segment.Kind == vnextContentPublication && segment.ByteLength != capacity) {
 			return fmt.Errorf("allocation %d content page count mismatch: %w", record.AllocationRecordID, errVNextCorrupt)
 		}
 		logical, ok = vnextAdd(logical, segment.PageCount)

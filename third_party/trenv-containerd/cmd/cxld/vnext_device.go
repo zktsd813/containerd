@@ -17,15 +17,15 @@ type vnextPersistentDevice struct {
 	mu sync.Mutex
 
 	file       *os.File
+	storage    vnextDeviceStorage
 	superblock vnextDeviceSuperblock
 	allocator  *vnextCheckpointAllocator
 	poisoned   error
 }
 
 // formatVNextFileDevice destructively creates a fresh VNext layout in a
-// pre-sized file. Production devdax formatting can use the same offset/write
-// protocol through a file descriptor; this wave deliberately tests regular
-// files so fault cases are deterministic.
+// pre-sized regular file. Real devdax must use formatVNextDevDAXDevice because
+// Linux devdax character devices do not implement read(2)/write(2).
 func formatVNextFileDevice(
 	file *os.File,
 	deviceUUID string,
@@ -33,17 +33,26 @@ func formatVNextFileDevice(
 	ownerEpoch uint64,
 	allocatorSlotBytes uint64,
 ) (*vnextPersistentDevice, error) {
-	if file == nil {
-		return nil, errors.New("VNext device file is nil")
-	}
-	stat, err := file.Stat()
+	storage, err := newVNextRegularFileStorage(file)
 	if err != nil {
-		return nil, fmt.Errorf("stat VNext device: %w", err)
+		return nil, err
 	}
-	if stat.Size() <= 0 {
-		return nil, errors.New("VNext device file has no capacity")
+	return formatVNextStorageDevice(
+		file, storage, deviceUUID, ownerID, ownerEpoch, allocatorSlotBytes)
+}
+
+func formatVNextStorageDevice(
+	file *os.File,
+	storage vnextDeviceStorage,
+	deviceUUID string,
+	ownerID string,
+	ownerEpoch uint64,
+	allocatorSlotBytes uint64,
+) (*vnextPersistentDevice, error) {
+	if storage == nil {
+		return nil, errors.New("VNext device storage is nil")
 	}
-	geometry, err := calculateVNextDeviceGeometry(uint64(stat.Size()), allocatorSlotBytes)
+	geometry, err := calculateVNextDeviceGeometry(storage.Size(), allocatorSlotBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -61,10 +70,10 @@ func formatVNextFileDevice(
 	// Offline format clears all authoritative control and descriptor bytes.
 	// Payload bytes are not required to be zero because a page is invisible
 	// until its bitmap bit and sealed descriptor are committed.
-	if err := vnextZeroRange(file, 0, geometry.ContentRegionBase); err != nil {
+	if err := vnextZeroRange(storage, 0, geometry.ContentRegionBase); err != nil {
 		return nil, fmt.Errorf("clear VNext metadata regions: %w", err)
 	}
-	if err := file.Sync(); err != nil {
+	if err := storage.Sync(); err != nil {
 		return nil, fmt.Errorf("sync cleared VNext metadata: %w", err)
 	}
 	dataA, err := superblock.marshalBinary()
@@ -72,7 +81,7 @@ func formatVNextFileDevice(
 		return nil, err
 	}
 	if err := vnextWriteCommittedEnvelopeSlot(
-		file, geometry.SuperblockAOffset, vnextSuperblockSlotBytes, dataA); err != nil {
+		storage, geometry.SuperblockAOffset, vnextSuperblockSlotBytes, dataA); err != nil {
 		return nil, fmt.Errorf("write superblock A: %w", err)
 	}
 	superblock.Sequence = 2
@@ -81,7 +90,7 @@ func formatVNextFileDevice(
 		return nil, err
 	}
 	if err := vnextWriteCommittedEnvelopeSlot(
-		file, geometry.SuperblockBOffset, vnextSuperblockSlotBytes, dataB); err != nil {
+		storage, geometry.SuperblockBOffset, vnextSuperblockSlotBytes, dataB); err != nil {
 		return nil, fmt.Errorf("write superblock B: %w", err)
 	}
 
@@ -91,6 +100,7 @@ func formatVNextFileDevice(
 	}
 	device := &vnextPersistentDevice{
 		file:       file,
+		storage:    storage,
 		superblock: superblock,
 		allocator:  allocator,
 	}
@@ -104,32 +114,39 @@ func formatVNextFileDevice(
 }
 
 func openVNextFileDevice(file *os.File) (*vnextPersistentDevice, error) {
-	if file == nil {
-		return nil, errors.New("VNext device file is nil")
-	}
-	stat, err := file.Stat()
+	storage, err := newVNextRegularFileStorage(file)
 	if err != nil {
-		return nil, fmt.Errorf("stat VNext device: %w", err)
+		return nil, err
 	}
-	superblockA, errA := vnextReadSuperblockSlot(file, 0)
-	superblockB, errB := vnextReadSuperblockSlot(file, vnextSuperblockSlotBytes)
+	return openVNextStorageDevice(file, storage)
+}
+
+func openVNextStorageDevice(
+	file *os.File,
+	storage vnextDeviceStorage,
+) (*vnextPersistentDevice, error) {
+	if storage == nil {
+		return nil, errors.New("VNext device storage is nil")
+	}
+	superblockA, errA := vnextReadSuperblockSlot(storage, 0)
+	superblockB, errB := vnextReadSuperblockSlot(storage, vnextSuperblockSlotBytes)
 	superblock, err := vnextSelectSuperblock(superblockA, errA, superblockB, errB)
 	if err != nil {
 		return nil, err
 	}
-	if stat.Size() < 0 || uint64(stat.Size()) != superblock.Geometry.DeviceBytes {
+	if storage.Size() != superblock.Geometry.DeviceBytes {
 		return nil, fmt.Errorf(
 			"device size is %d, superblock records %d: %w",
-			stat.Size(), superblock.Geometry.DeviceBytes, errVNextWrongFormat)
+			storage.Size(), superblock.Geometry.DeviceBytes, errVNextWrongFormat)
 	}
 
 	allocatorA, allocatorErrA := vnextReadAllocatorSlot(
-		file,
+		storage,
 		superblock.Geometry.AllocatorSlotAOffset,
 		superblock.Geometry.AllocatorSlotBytes,
 		superblock)
 	allocatorB, allocatorErrB := vnextReadAllocatorSlot(
-		file,
+		storage,
 		superblock.Geometry.AllocatorSlotBOffset,
 		superblock.Geometry.AllocatorSlotBytes,
 		superblock)
@@ -139,6 +156,7 @@ func openVNextFileDevice(file *os.File) (*vnextPersistentDevice, error) {
 	}
 	device := &vnextPersistentDevice{
 		file:       file,
+		storage:    storage,
 		superblock: superblock,
 		allocator:  allocator,
 	}
@@ -197,6 +215,11 @@ func (d *vnextPersistentDevice) writePage(
 			"logical page %d has %d bytes, expected %d",
 			logicalPage, len(content), authorization.ExpectedPayloadLength)
 	}
+	if authorization.ExpectedZeroPadding && !vnextAllZero(content) {
+		return fmt.Errorf(
+			"logical page %d is reserved capacity padding and must be all zero: %w",
+			logicalPage, errVNextAuthority)
+	}
 	page, sealed, err := buildVNextContentPage(
 		authorization.ContentKind,
 		content,
@@ -237,20 +260,20 @@ func (d *vnextPersistentDevice) writePage(
 			authorization.DataPageIndex, errVNextAuthority)
 	}
 
-	if err := vnextWriteAtFull(d.file, page[:], authorization.ContentOffset); err != nil {
+	if err := vnextWriteAtFull(d.storage, page[:], authorization.ContentOffset); err != nil {
 		return d.poisonLocked(fmt.Errorf("write content page: %w", err))
 	}
-	if err := d.file.Sync(); err != nil {
+	if err := d.storage.Sync(); err != nil {
 		return d.poisonLocked(fmt.Errorf("sync content page: %w", err))
 	}
 	descriptorData, err := sealed.marshalBinary()
 	if err != nil {
 		return err
 	}
-	if err := vnextWriteAtFull(d.file, descriptorData, authorization.DescriptorOffset); err != nil {
+	if err := vnextWriteAtFull(d.storage, descriptorData, authorization.DescriptorOffset); err != nil {
 		return d.poisonLocked(fmt.Errorf("seal page descriptor: %w", err))
 	}
-	if err := d.file.Sync(); err != nil {
+	if err := d.storage.Sync(); err != nil {
 		return d.poisonLocked(fmt.Errorf("sync page descriptor: %w", err))
 	}
 	return nil
@@ -350,7 +373,7 @@ func (d *vnextPersistentDevice) persistAllocatorLocked() error {
 		offset = d.superblock.Geometry.AllocatorSlotBOffset
 	}
 	if err := vnextWriteCommittedEnvelopeSlot(
-		d.file,
+		d.storage,
 		offset,
 		d.superblock.Geometry.AllocatorSlotBytes,
 		data); err != nil {
@@ -377,13 +400,15 @@ func (d *vnextPersistentDevice) initializeReservedDescriptorsLocked(
 		}
 		pageWithinObject := logicalPage - segment.LogicalPageStart
 		consumed, ok := vnextMul(pageWithinObject, vnextContentPageSize)
-		if !ok || consumed >= segment.ByteLength {
+		if !ok {
 			return fmt.Errorf("content length overflow: %w", errVNextCorrupt)
 		}
-		remaining := segment.ByteLength - consumed
 		payloadLength := vnextContentPageSize
-		if remaining < payloadLength {
-			payloadLength = remaining
+		if consumed < segment.ByteLength {
+			remaining := segment.ByteLength - consumed
+			if remaining < payloadLength {
+				payloadLength = remaining
+			}
 		}
 		descriptor := vnextPageDescriptor{
 			AllocationRecordID:      record.AllocationRecordID,
@@ -417,11 +442,11 @@ func (d *vnextPersistentDevice) initializeReservedDescriptorsLocked(
 		if err != nil {
 			return err
 		}
-		if err := vnextWriteAtFull(d.file, raw, offset); err != nil {
+		if err := vnextWriteAtFull(d.storage, raw, offset); err != nil {
 			return err
 		}
 	}
-	return d.file.Sync()
+	return d.storage.Sync()
 }
 
 func (d *vnextPersistentDevice) validateSealedRecordLocked(
@@ -503,11 +528,11 @@ func (d *vnextPersistentDevice) clearRecordDescriptorsLocked(
 		if err != nil {
 			return err
 		}
-		if err := vnextWriteAtFull(d.file, zero, offset); err != nil {
+		if err := vnextWriteAtFull(d.storage, zero, offset); err != nil {
 			return err
 		}
 	}
-	return d.file.Sync()
+	return d.storage.Sync()
 }
 
 func (d *vnextPersistentDevice) recoverPendingLocked() error {
@@ -630,7 +655,7 @@ func (d *vnextPersistentDevice) readDescriptorLocked(
 		return vnextPageDescriptor{}, err
 	}
 	raw := make([]byte, vnextPageDescriptorSize)
-	if err := vnextReadAtFull(d.file, raw, offset); err != nil {
+	if err := vnextReadAtFull(d.storage, raw, offset); err != nil {
 		return vnextPageDescriptor{}, err
 	}
 	return parseVNextPageDescriptor(raw)
@@ -642,7 +667,7 @@ func (d *vnextPersistentDevice) readContentPageLocked(dataPageIndex uint64) ([]b
 		return nil, err
 	}
 	raw := make([]byte, vnextContentPageSize)
-	if err := vnextReadAtFull(d.file, raw, offset); err != nil {
+	if err := vnextReadAtFull(d.storage, raw, offset); err != nil {
 		return nil, err
 	}
 	return raw, nil
@@ -663,7 +688,7 @@ func (d *vnextPersistentDevice) poisonLocked(err error) error {
 	return err
 }
 
-func vnextReadSuperblockSlot(file *os.File, offset uint64) (vnextDeviceSuperblock, error) {
+func vnextReadSuperblockSlot(file io.ReaderAt, offset uint64) (vnextDeviceSuperblock, error) {
 	data, err := vnextReadEnvelopeSlot(file, offset, vnextSuperblockSlotBytes, vnextDeviceMagic)
 	if err != nil {
 		return vnextDeviceSuperblock{}, err
@@ -699,7 +724,7 @@ func vnextSelectSuperblock(
 }
 
 func vnextReadAllocatorSlot(
-	file *os.File,
+	file io.ReaderAt,
 	offset uint64,
 	slotBytes uint64,
 	superblock vnextDeviceSuperblock,
@@ -748,7 +773,7 @@ func vnextSelectAllocator(
 }
 
 func vnextWriteCommittedEnvelopeSlot(
-	file *os.File,
+	file vnextSynchronizedWriterAt,
 	offset uint64,
 	slotBytes uint64,
 	data []byte,
@@ -785,7 +810,7 @@ func vnextWriteCommittedEnvelopeSlot(
 }
 
 func vnextReadEnvelopeSlot(
-	file *os.File,
+	file io.ReaderAt,
 	offset uint64,
 	slotBytes uint64,
 	expectedMagic [8]byte,
@@ -823,7 +848,7 @@ func vnextReadEnvelopeSlot(
 	return data, nil
 }
 
-func vnextZeroRange(file *os.File, offset, length uint64) error {
+func vnextZeroRange(file io.WriterAt, offset, length uint64) error {
 	if length == 0 {
 		return nil
 	}
@@ -846,9 +871,10 @@ func vnextZeroRange(file *os.File, offset, length uint64) error {
 	return nil
 }
 
-func vnextWriteAtFull(file *os.File, data []byte, offset uint64) error {
-	if offset > uint64(math.MaxInt64) {
-		return errors.New("file write offset exceeds signed 64-bit range")
+func vnextWriteAtFull(file io.WriterAt, data []byte, offset uint64) error {
+	if err := vnextValidateUnsignedStorageRange(
+		uint64(math.MaxInt64), offset, len(data), "write"); err != nil {
+		return err
 	}
 	for len(data) > 0 {
 		count, err := file.WriteAt(data, int64(offset))
@@ -866,9 +892,10 @@ func vnextWriteAtFull(file *os.File, data []byte, offset uint64) error {
 	return nil
 }
 
-func vnextReadAtFull(file *os.File, data []byte, offset uint64) error {
-	if offset > uint64(math.MaxInt64) {
-		return errors.New("file read offset exceeds signed 64-bit range")
+func vnextReadAtFull(file io.ReaderAt, data []byte, offset uint64) error {
+	if err := vnextValidateUnsignedStorageRange(
+		uint64(math.MaxInt64), offset, len(data), "read"); err != nil {
+		return err
 	}
 	for len(data) > 0 {
 		count, err := file.ReadAt(data, int64(offset))

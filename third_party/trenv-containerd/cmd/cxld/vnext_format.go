@@ -442,10 +442,11 @@ const (
 	vnextContentMMTemplate
 	vnextContentPageMap
 	vnextContentRestoreBlob
+	vnextContentPublication
 )
 
 func (k vnextContentKind) valid() bool {
-	return k >= vnextContentMemory && k <= vnextContentRestoreBlob
+	return k >= vnextContentMemory && k <= vnextContentPublication
 }
 
 type vnextPageDescriptorState uint8

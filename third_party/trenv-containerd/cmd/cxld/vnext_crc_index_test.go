@@ -42,6 +42,7 @@ func commitVNextCRCCheckpoint(
 			Kind:       kind,
 			ObjectID:   objectID,
 			ByteLength: byteLength,
+			PageCount:  uint64(len(pages)),
 		}},
 		MaxExtents: 32,
 	}
@@ -78,6 +79,7 @@ func reserveVNextCRCCheckpoint(
 			Kind:       vnextContentMemory,
 			ObjectID:   objectID,
 			ByteLength: vnextContentPageSize,
+			PageCount:  1,
 		}},
 		MaxExtents: 1,
 	}

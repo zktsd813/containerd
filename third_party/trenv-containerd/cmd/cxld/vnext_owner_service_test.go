@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"hash/crc32"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/cxlcheckpoint"
@@ -82,9 +84,16 @@ func TestVNextOwnerServiceMultiDAXReserveResponseIsPortable(t *testing.T) {
 		OwnerEpoch:   7,
 		Contents: []vnextOwnerReserveContent{
 			{
-				Kind:       vnextOwnerServiceContentMemory,
-				ObjectID:   11,
-				ByteLength: pages * vnextContentPageSize,
+				Kind:          vnextOwnerServiceContentMemory,
+				ObjectID:      11,
+				ByteLength:    pages * vnextContentPageSize,
+				CapacityPages: pages,
+			},
+			{
+				Kind:          vnextOwnerServiceContentPublication,
+				ObjectID:      12,
+				ByteLength:    vnextContentPageSize,
+				CapacityPages: 1,
 			},
 		},
 		MaxExtents: 2,
@@ -103,7 +112,7 @@ func TestVNextOwnerServiceMultiDAXReserveResponseIsPortable(t *testing.T) {
 	}) {
 		t.Fatalf("unexpected portable operation identity: %#v", response.Operation)
 	}
-	if response.TotalPages != pages || len(response.Contents) != 1 {
+	if response.TotalPages != pages+1 || len(response.Contents) != 2 {
 		t.Fatalf("unexpected content segmentation: total=%d contents=%#v",
 			response.TotalPages, response.Contents)
 	}
@@ -126,7 +135,7 @@ func TestVNextOwnerServiceMultiDAXReserveResponseIsPortable(t *testing.T) {
 		logical += extent.PageCount
 		used[extent.DeviceUUID] = struct{}{}
 	}
-	if logical != pages || len(used) != 2 {
+	if logical != pages+1 || len(used) != 2 {
 		t.Fatalf("multi-DAX extents cover %d pages on %d devices", logical, len(used))
 	}
 	if !sort.SliceIsSorted(response.Devices, func(i, j int) bool {
@@ -194,7 +203,18 @@ func TestVNextOwnerServiceRestartResolvesSameIdentityForAbort(t *testing.T) {
 		OwnerID:      "owner-0",
 		OwnerEpoch:   7,
 		Contents: []vnextOwnerReserveContent{
-			{Kind: vnextOwnerServiceContentMemory, ObjectID: 12, ByteLength: 2 * vnextContentPageSize},
+			{
+				Kind:          vnextOwnerServiceContentMemory,
+				ObjectID:      12,
+				ByteLength:    2 * vnextContentPageSize,
+				CapacityPages: 2,
+			},
+			{
+				Kind:          vnextOwnerServiceContentPublication,
+				ObjectID:      13,
+				ByteLength:    vnextContentPageSize,
+				CapacityPages: 1,
+			},
 		},
 		MaxExtents: 1,
 	})
@@ -230,6 +250,374 @@ func TestVNextOwnerServiceRestartResolvesSameIdentityForAbort(t *testing.T) {
 	}
 }
 
+func TestVNextOwnerServiceReserveRequiresOneBoundedPublicationSlot(t *testing.T) {
+	base := vnextOwnerReserveRequest{
+		RequestID:    "owner-service-publication-request",
+		CheckpointID: "owner-service-publication-checkpoint",
+		ProducerID:   "owner-service-publication-producer",
+		OwnerID:      "owner-0",
+		OwnerEpoch:   7,
+		Contents: []vnextOwnerReserveContent{{
+			Kind:          vnextOwnerServiceContentMemory,
+			ObjectID:      1,
+			ByteLength:    vnextContentPageSize,
+			CapacityPages: 1,
+		}},
+		MaxExtents: 2,
+	}
+	t.Run("missing", func(t *testing.T) {
+		if _, err := base.internal(); err == nil {
+			t.Fatal("reserve without a publication slot was accepted")
+		}
+	})
+	t.Run("duplicate", func(t *testing.T) {
+		request := base
+		request.Contents = append(append([]vnextOwnerReserveContent(nil), base.Contents...),
+			vnextOwnerReserveContent{
+				Kind:          vnextOwnerServiceContentPublication,
+				ObjectID:      2,
+				ByteLength:    vnextContentPageSize,
+				CapacityPages: 1,
+			},
+			vnextOwnerReserveContent{
+				Kind:          vnextOwnerServiceContentPublication,
+				ObjectID:      3,
+				ByteLength:    vnextContentPageSize,
+				CapacityPages: 1,
+			})
+		if _, err := request.internal(); err == nil {
+			t.Fatal("reserve with duplicate publication slots was accepted")
+		}
+	})
+	t.Run("over maximum", func(t *testing.T) {
+		request := base
+		pages := cxlcheckpoint.MaxPublicationSlotPages + 1
+		request.Contents = append(append([]vnextOwnerReserveContent(nil), base.Contents...),
+			vnextOwnerReserveContent{
+				Kind:          vnextOwnerServiceContentPublication,
+				ObjectID:      2,
+				ByteLength:    pages * vnextContentPageSize,
+				CapacityPages: pages,
+			})
+		if _, err := request.internal(); err == nil {
+			t.Fatal("oversized publication slot was accepted")
+		}
+	})
+}
+
+func TestVNextOwnerServiceMultiPagePublicationCrossesDevicesAndRetriesAfterRestart(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
+		// With the test control-slot size these devices contain exactly one
+		// and five content pages. The two-page publication slot is first in
+		// logical order, so it necessarily crosses the device boundary.
+		{UUID: "publication-device-a", Size: 48 << 10},
+		{UUID: "publication-device-b", Size: 64 << 10},
+	})
+	if fixture.devices[0].superblock.Geometry.DataPageCount != 1 ||
+		fixture.devices[1].superblock.Geometry.DataPageCount != 5 {
+		t.Fatalf("unexpected test capacities: %d/%d",
+			fixture.devices[0].superblock.Geometry.DataPageCount,
+			fixture.devices[1].superblock.Geometry.DataPageCount)
+	}
+	service := newVNextOwnerServiceForFixture(t, fixture)
+
+	// CheckpointID appears in both the publication and its committed root.
+	// A long but valid identity makes the canonical envelope require two
+	// pages without adding unrelated payload content.
+	checkpointID := "multi-page-publication-" + strings.Repeat("x", 3000)
+	mmTemplate := cxlcheckpoint.MMTemplate{
+		TemplateID:             "multi-page-mm-template",
+		ContentObjectID:        3,
+		RuntimeCompatibilityID: "trenv-v6-multi-page-publication-test",
+		PageSize:               cxlcheckpoint.PageSize,
+		VMAs: []cxlcheckpoint.VMA{{
+			PagesImageID:    7,
+			StartVAddr:      0x1000,
+			EndVAddr:        0x2000,
+			ProtectionFlags: cxlcheckpoint.ProtectionRead | cxlcheckpoint.ProtectionWrite,
+			MappingFlags:    cxlcheckpoint.MappingPrivate | cxlcheckpoint.MappingAnonymous,
+			BackingKind:     cxlcheckpoint.BackingAnonymous,
+			PageMapRunStart: 0,
+			PageMapRunCount: 1,
+		}},
+	}
+	pageMap := cxlcheckpoint.PageMap{
+		PageMapID:       "multi-page-page-map",
+		Version:         1,
+		ContentObjectID: 4,
+		PageSize:        cxlcheckpoint.PageSize,
+		Runs: []cxlcheckpoint.PageMapRun{{
+			PagesImageID: 7,
+			StartVAddr:   0x1000,
+			PageCount:    1,
+			FirstPage: cxlcheckpoint.PageID{
+				OwnerID:            "owner-0",
+				DeviceUUID:         "publication-device-a",
+				AllocationRecordID: 1,
+				DataPageIndex:      0,
+			},
+		}},
+	}
+	mmSize, err := cxlcheckpoint.CanonicalMMTemplateSize(mmTemplate)
+	if err != nil {
+		t.Fatalf("measure MMTemplate: %v", err)
+	}
+	pageMapSize, err := cxlcheckpoint.CanonicalPageMapSize(pageMap)
+	if err != nil {
+		t.Fatalf("measure PageMap: %v", err)
+	}
+	reserved, err := service.reserve(vnextOwnerReserveRequest{
+		RequestID:    "multi-page-publication-request",
+		CheckpointID: checkpointID,
+		ProducerID:   "multi-page-publication-producer",
+		OwnerID:      "owner-0",
+		OwnerEpoch:   7,
+		Contents: []vnextOwnerReserveContent{
+			{
+				Kind:          vnextOwnerServiceContentPublication,
+				ObjectID:      1,
+				ByteLength:    2 * vnextContentPageSize,
+				CapacityPages: 2,
+			},
+			{
+				Kind:          vnextOwnerServiceContentMemory,
+				ObjectID:      2,
+				ByteLength:    vnextContentPageSize,
+				CapacityPages: 1,
+			},
+			{
+				Kind:          vnextOwnerServiceContentMMTemplate,
+				ObjectID:      3,
+				ByteLength:    mmSize,
+				CapacityPages: 1,
+			},
+			{
+				Kind:          vnextOwnerServiceContentPageMap,
+				ObjectID:      4,
+				ByteLength:    pageMapSize,
+				CapacityPages: 1,
+			},
+			{
+				Kind:          vnextOwnerServiceContentPageMap,
+				ObjectID:      5,
+				ByteLength:    pageMapSize,
+				CapacityPages: 1,
+			},
+		},
+		MaxExtents: 2,
+	})
+	if err != nil {
+		t.Fatalf("reserve cross-device publication: %v", err)
+	}
+	if len(reserved.Extents) != 2 ||
+		reserved.Extents[0].LogicalPageStart != 0 ||
+		reserved.Extents[0].PageCount != 1 ||
+		reserved.Extents[1].LogicalPageStart != 1 {
+		t.Fatalf("publication slot does not cross the expected boundary: %#v", reserved.Extents)
+	}
+	memoryPage := cxlcheckpoint.PageID{}
+	for _, extent := range reserved.Extents {
+		end := extent.LogicalPageStart + extent.PageCount
+		if 2 < extent.LogicalPageStart || 2 >= end {
+			continue
+		}
+		memoryPage = cxlcheckpoint.PageID{
+			OwnerID:            reserved.Operation.OwnerID,
+			DeviceUUID:         extent.DeviceUUID,
+			AllocationRecordID: reserved.Operation.AllocationRecordID,
+			DataPageIndex:      extent.StartDataPageIndex + (2 - extent.LogicalPageStart),
+		}
+	}
+	if memoryPage.DeviceUUID == "" {
+		t.Fatal("memory page is outside the portable reserve response")
+	}
+	pageMap.Runs[0].FirstPage = memoryPage
+	finalPageMapSize, err := cxlcheckpoint.CanonicalPageMapSize(pageMap)
+	if err != nil {
+		t.Fatalf("measure located PageMap: %v", err)
+	}
+	if finalPageMapSize != pageMapSize {
+		t.Fatalf("located PageMap size changed from %d to %d", pageMapSize, finalPageMapSize)
+	}
+
+	extents := make([]cxlcheckpoint.AllocationExtent, len(reserved.Extents))
+	for index, extent := range reserved.Extents {
+		extents[index] = cxlcheckpoint.AllocationExtent{
+			DeviceUUID:         extent.DeviceUUID,
+			StartDataPageIndex: extent.StartDataPageIndex,
+			PageCount:          extent.PageCount,
+			LogicalPageStart:   extent.LogicalPageStart,
+		}
+	}
+	devices := make([]cxlcheckpoint.Device, len(fixture.devices))
+	for index, device := range fixture.devices {
+		devices[index] = cxlcheckpoint.Device{
+			DeviceUUID:    device.superblock.DeviceUUID,
+			OwnerID:       device.superblock.OwnerID,
+			OwnerEpoch:    device.superblock.OwnerEpoch,
+			DataPageCount: device.superblock.Geometry.DataPageCount,
+		}
+	}
+	publication := cxlcheckpoint.Publication{
+		CheckpointID: checkpointID,
+		Devices:      devices,
+		ContentObjects: []cxlcheckpoint.ContentObject{
+			{
+				ObjectID:         1,
+				Kind:             cxlcheckpoint.ContentPublication,
+				ByteLength:       2 * cxlcheckpoint.PageSize,
+				LogicalPageStart: 0,
+				PageCount:        2,
+			},
+			{
+				ObjectID:         2,
+				Kind:             cxlcheckpoint.ContentMemory,
+				ByteLength:       cxlcheckpoint.PageSize,
+				LogicalPageStart: 2,
+				PageCount:        1,
+			},
+			{
+				ObjectID:         3,
+				Kind:             cxlcheckpoint.ContentMMTemplate,
+				ByteLength:       mmSize,
+				LogicalPageStart: 3,
+				PageCount:        1,
+			},
+			{
+				ObjectID:         4,
+				Kind:             cxlcheckpoint.ContentPageMap,
+				ByteLength:       pageMapSize,
+				LogicalPageStart: 4,
+				PageCount:        1,
+			},
+			{
+				ObjectID:         5,
+				Kind:             cxlcheckpoint.ContentPageMap,
+				ByteLength:       pageMapSize,
+				LogicalPageStart: 5,
+				PageCount:        1,
+			},
+		},
+		Allocation: cxlcheckpoint.InitialAllocation{
+			OwnerID:            reserved.Operation.OwnerID,
+			OwnerEpoch:         reserved.Operation.OwnerEpoch,
+			AllocationRecordID: reserved.Operation.AllocationRecordID,
+			TotalPages:         reserved.TotalPages,
+			Extents:            extents,
+		},
+		MMTemplate: mmTemplate,
+		PageMap:    pageMap,
+		Artifacts: cxlcheckpoint.ArtifactManifest{
+			ManifestID: "multi-page-artifacts",
+		},
+		MappingSlots: cxlcheckpoint.MappingSlots{
+			A: cxlcheckpoint.MappingSlot{
+				Name:            cxlcheckpoint.MappingSlotA,
+				ContentObjectID: 4,
+				CapacityPages:   1,
+			},
+			B: cxlcheckpoint.MappingSlot{
+				Name:            cxlcheckpoint.MappingSlotB,
+				ContentObjectID: 5,
+				CapacityPages:   1,
+			},
+		},
+		Root: cxlcheckpoint.CommittedRoot{
+			State:               cxlcheckpoint.RootCommitted,
+			RootID:              "multi-page-publication-root",
+			CheckpointID:        checkpointID,
+			OwnerID:             reserved.Operation.OwnerID,
+			AllocationRecordID:  reserved.Operation.AllocationRecordID,
+			MMTemplateID:        mmTemplate.TemplateID,
+			PageMapID:           pageMap.PageMapID,
+			PageMapVersion:      pageMap.Version,
+			ArtifactManifestID:  "multi-page-artifacts",
+			ActiveMappingSlot:   cxlcheckpoint.MappingSlotA,
+			PublicationSequence: 1,
+		},
+	}
+	digest, err := cxlcheckpoint.DeviceTableDigest(publication.Devices)
+	if err != nil {
+		t.Fatalf("digest device table: %v", err)
+	}
+	publication.Root.DeviceTableDigest = digest
+	storage, err := cxlcheckpoint.EncodeForStorage(publication)
+	if err != nil {
+		t.Fatalf("encode multi-page publication: %v", err)
+	}
+	if len(storage.ExactBytes) <= int(cxlcheckpoint.PageSize) ||
+		len(storage.ExactBytes) > 2*int(cxlcheckpoint.PageSize) ||
+		len(storage.PageRuns) != 2 ||
+		storage.PageRuns[0].FirstPage.DeviceUUID == storage.PageRuns[1].FirstPage.DeviceUUID {
+		t.Fatalf("publication did not produce two cross-device exact runs: bytes=%d runs=%#v",
+			len(storage.ExactBytes), storage.PageRuns)
+	}
+	memoryPayload := bytes.Repeat([]byte{0x5a}, int(vnextContentPageSize))
+	memoryDevice := fixture.group.devices[memoryPage.DeviceUUID]
+	memoryOffset, err := memoryDevice.superblock.Geometry.contentOffset(memoryPage.DataPageIndex)
+	if err != nil {
+		t.Fatalf("resolve memory payload offset: %v", err)
+	}
+	if err := vnextWriteAtFull(memoryDevice.file, memoryPayload, memoryOffset); err != nil {
+		t.Fatalf("write memory payload: %v", err)
+	}
+	if err := memoryDevice.file.Sync(); err != nil {
+		t.Fatalf("sync memory payload: %v", err)
+	}
+	sidecars := vnextTestCRCPageSidecars(t, publication, service.directory)
+	binary.LittleEndian.PutUint32(sidecars[7][28:32], uint32(vnextCRCCopyEngineCPU))
+	binary.LittleEndian.PutUint32(
+		sidecars[7][vnextCRCPageSidecarHeaderSize+28:vnextCRCPageSidecarHeaderSize+32],
+		crc32.Checksum(memoryPayload, vnextCRCTable))
+
+	sealed, err := service.seal(vnextOwnerSealRequest{
+		Operation:           reserved.Operation,
+		PublicationEnvelope: storage.ExactBytes,
+		CRCPageSidecars:     sidecars,
+	})
+	if err != nil {
+		t.Fatalf("seal multi-page publication: %v", err)
+	}
+	if sealed.PublicationByteLength != uint64(len(storage.ExactBytes)) ||
+		sealed.PublicationSHA256 != storage.SHA256 ||
+		len(sealed.PageRuns) != len(storage.PageRuns) {
+		t.Fatalf("seal returned a different root locator: %#v", sealed)
+	}
+	for index, run := range sealed.PageRuns {
+		if run.FirstPage != storage.PageRuns[index].FirstPage ||
+			run.PageCount != storage.PageRuns[index].PageCount {
+			t.Fatalf("seal run %d = %#v, want %#v", index, run, storage.PageRuns[index])
+		}
+		device := fixture.group.devices[run.FirstPage.DeviceUUID]
+		device.mu.Lock()
+		page, readErr := device.readContentPageLocked(run.FirstPage.DataPageIndex)
+		device.mu.Unlock()
+		if readErr != nil {
+			t.Fatalf("read stored publication run %d: %v", index, readErr)
+		}
+		start := index * int(cxlcheckpoint.PageSize)
+		end := start + int(cxlcheckpoint.PageSize)
+		if !bytes.Equal(page, storage.PaddedBytes[start:end]) {
+			t.Fatalf("stored publication page %d differs from canonical padding", index)
+		}
+	}
+
+	fixture.reopen(t)
+	restarted := newVNextOwnerServiceForFixture(t, fixture)
+	retried, err := restarted.seal(vnextOwnerSealRequest{
+		Operation:           reserved.Operation,
+		PublicationEnvelope: storage.ExactBytes,
+		CRCPageSidecars:     sidecars,
+	})
+	if err != nil {
+		t.Fatalf("retry multi-page publication seal after restart: %v", err)
+	}
+	if !bytes.Equal(mustMarshalJSON(t, sealed), mustMarshalJSON(t, retried)) {
+		t.Fatalf("restart retry changed publication locator:\nfirst=%#v\nretry=%#v",
+			sealed, retried)
+	}
+}
+
 func TestVNextOwnerServiceRestartResolvesSameIdentityForCommit(t *testing.T) {
 	fixture := newVNextExternalSealTestFixture(t, vnextCRCCopyEngineCPU)
 	service, err := newVNextOwnerService(fixture.owner.group, fixture.directory)
@@ -241,12 +629,42 @@ func TestVNextOwnerServiceRestartResolvesSameIdentityForCommit(t *testing.T) {
 		t.Fatalf("encode strict external publication: %v", err)
 	}
 	identity := vnextOwnerServiceIdentity(fixture.grant)
-	if err := service.seal(vnextOwnerSealRequest{
+	sealed, err := service.seal(vnextOwnerSealRequest{
 		Operation:           identity,
 		PublicationEnvelope: envelope,
 		CRCPageSidecars:     fixture.cloneSidecars(),
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("seal external pages through Owner service: %v", err)
+	}
+	if sealed.PublicationByteLength != uint64(len(envelope)) ||
+		sealed.PublicationSHA256 != sha256.Sum256(envelope) ||
+		len(sealed.PageRuns) != 1 ||
+		sealed.PageRuns[0].PageCount != 1 {
+		t.Fatalf("unexpected portable publication root locator: %#v", sealed)
+	}
+	publicationStorage, err := cxlcheckpoint.EncodeForStorage(fixture.publication)
+	if err != nil {
+		t.Fatalf("prepare expected publication storage: %v", err)
+	}
+	if sealed.PageRuns[0].FirstPage != publicationStorage.PageRuns[0].FirstPage {
+		t.Fatalf("seal response PageID = %#v, want %#v",
+			sealed.PageRuns[0].FirstPage, publicationStorage.PageRuns[0].FirstPage)
+	}
+	publicationDevice := fixture.owner.group.devices[sealed.PageRuns[0].FirstPage.DeviceUUID]
+	publicationDevice.mu.Lock()
+	storedPublicationPage, readErr := publicationDevice.readContentPageLocked(
+		sealed.PageRuns[0].FirstPage.DataPageIndex)
+	publicationDescriptor, descriptorErr := publicationDevice.readDescriptorLocked(
+		sealed.PageRuns[0].FirstPage.DataPageIndex)
+	publicationDevice.mu.Unlock()
+	if readErr != nil || descriptorErr != nil {
+		t.Fatalf("read Owner-written publication page/descriptor: %v / %v",
+			readErr, descriptorErr)
+	}
+	if publicationDescriptor.State != vnextDescriptorSealed ||
+		!bytes.Equal(storedPublicationPage, publicationStorage.PaddedBytes[:vnextContentPageSize]) {
+		t.Fatalf("Owner did not atomically store the zero-padded publication slot")
 	}
 	fixture.sealControlPages(t)
 
@@ -271,7 +689,7 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("build Owner service: %v", err)
 		}
-		err = service.seal(vnextOwnerSealRequest{
+		_, err = service.seal(vnextOwnerSealRequest{
 			Operation:           vnextOwnerServiceIdentity(fixture.grant),
 			PublicationEnvelope: []byte("TRPUB005"),
 			CRCPageSidecars:     fixture.cloneSidecars(),
@@ -292,7 +710,7 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 		}
 		sidecars := fixture.cloneSidecars()
 		delete(sidecars, 8)
-		err = service.seal(vnextOwnerSealRequest{
+		_, err = service.seal(vnextOwnerSealRequest{
 			Operation:           vnextOwnerServiceIdentity(fixture.grant),
 			PublicationEnvelope: envelope,
 			CRCPageSidecars:     sidecars,
@@ -315,7 +733,7 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 		offset := vnextCRCPageSidecarHeaderSize + vnextCRCPageSidecarRecordSize
 		crc := binary.LittleEndian.Uint32(sidecars[8][offset+28 : offset+32])
 		binary.LittleEndian.PutUint32(sidecars[8][offset+28:offset+32], crc^1)
-		err = service.seal(vnextOwnerSealRequest{
+		_, err = service.seal(vnextOwnerSealRequest{
 			Operation:           vnextOwnerServiceIdentity(fixture.grant),
 			PublicationEnvelope: envelope,
 			CRCPageSidecars:     sidecars,
@@ -332,7 +750,7 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 		}
 		identity := vnextOwnerServiceIdentity(fixture.grant)
 		identity.ProducerID = "different-producer"
-		err = service.seal(vnextOwnerSealRequest{Operation: identity})
+		_, err = service.seal(vnextOwnerSealRequest{Operation: identity})
 		requireVNextOwnerServiceCode(t, err, vnextOwnerServiceIdentityMismatch)
 		fixture.assertAllocationDescriptorState(t, vnextDescriptorReserved)
 	})
@@ -348,7 +766,7 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 			t.Fatalf("encode publication: %v", err)
 		}
 		identity := vnextOwnerServiceIdentity(fixture.grant)
-		if err := service.seal(vnextOwnerSealRequest{
+		if _, err := service.seal(vnextOwnerSealRequest{
 			Operation:           identity,
 			PublicationEnvelope: envelope,
 			CRCPageSidecars:     fixture.cloneSidecars(),
@@ -378,7 +796,7 @@ func TestVNextOwnerServiceUsesExactTRCRC006Bytes(t *testing.T) {
 	// Append one byte. The sidecar parser must reject it instead of accepting
 	// a prefix or silently choosing an older contiguous format.
 	sidecars[7] = append(sidecars[7], 0)
-	err = service.seal(vnextOwnerSealRequest{
+	_, err = service.seal(vnextOwnerSealRequest{
 		Operation:           vnextOwnerServiceIdentity(fixture.grant),
 		PublicationEnvelope: envelope,
 		CRCPageSidecars:     sidecars,

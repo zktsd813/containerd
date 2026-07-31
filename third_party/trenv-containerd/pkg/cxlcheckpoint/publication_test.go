@@ -2,6 +2,7 @@ package cxlcheckpoint
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -26,15 +27,22 @@ func validPublication(t testing.TB) Publication {
 			{ObjectID: 4, Kind: ContentPageMap, ByteLength: 256, LogicalPageStart: 4, PageCount: 1},
 			{ObjectID: 5, Kind: ContentPageMap, ByteLength: 0, LogicalPageStart: 5, PageCount: 1},
 			{ObjectID: 6, Kind: ContentRestoreBlob, ByteLength: 50, LogicalPageStart: 6, PageCount: 1},
+			{
+				ObjectID:         7,
+				Kind:             ContentPublication,
+				ByteLength:       PageSize,
+				LogicalPageStart: 7,
+				PageCount:        1,
+			},
 		},
 		Allocation: InitialAllocation{
 			OwnerID:            "owner-a",
 			OwnerEpoch:         7,
 			AllocationRecordID: 42,
-			TotalPages:         7,
+			TotalPages:         8,
 			Extents: []AllocationExtent{
 				{DeviceUUID: "device-a", StartDataPageIndex: 100, PageCount: 4, LogicalPageStart: 0},
-				{DeviceUUID: "device-b", StartDataPageIndex: 200, PageCount: 3, LogicalPageStart: 4},
+				{DeviceUUID: "device-b", StartDataPageIndex: 200, PageCount: 4, LogicalPageStart: 4},
 			},
 		},
 		MMTemplate: MMTemplate{
@@ -229,7 +237,7 @@ func TestPublicationRoundTripIsDeterministicAndLittleEndian(t *testing.T) {
 	for _, object := range decoded.ContentObjects {
 		kinds[object.Kind] = true
 	}
-	for kind := ContentMemory; kind <= ContentRestoreBlob; kind++ {
+	for kind := ContentMemory; kind <= ContentPublication; kind++ {
 		if !kinds[kind] {
 			t.Fatalf("content kind %d is absent from round-trip fixture", kind)
 		}
@@ -237,6 +245,183 @@ func TestPublicationRoundTripIsDeterministicAndLittleEndian(t *testing.T) {
 	if decoded.Artifacts.Entries[1].ByteLength != 5 {
 		t.Fatal("artifact exact byte length was not preserved")
 	}
+}
+
+func TestPublicationStorageUsesExactRootBytesAndZeroPaddedCapacity(t *testing.T) {
+	publication := validPublication(t)
+	storage, err := EncodeForStorage(publication)
+	if err != nil {
+		t.Fatalf("EncodeForStorage(): %v", err)
+	}
+	encoded, err := Encode(publication)
+	if err != nil {
+		t.Fatalf("Encode(): %v", err)
+	}
+	if !bytes.Equal(storage.ExactBytes, encoded) {
+		t.Fatal("storage exact bytes differ from canonical TRPUB006 encoding")
+	}
+	if storage.SHA256 != sha256.Sum256(encoded) {
+		t.Fatal("storage SHA-256 does not cover the complete exact envelope")
+	}
+	if storage.ContentObjectID != 7 || storage.LogicalPageStart != 7 ||
+		storage.CapacityPages != 1 {
+		t.Fatalf("storage slot = object %d logical %d pages %d, want object 7 logical 7 pages 1",
+			storage.ContentObjectID, storage.LogicalPageStart, storage.CapacityPages)
+	}
+	if got, want := len(storage.PaddedBytes), int(PageSize); got != want {
+		t.Fatalf("padded storage length = %d, want %d", got, want)
+	}
+	if !bytes.Equal(storage.PaddedBytes[:len(encoded)], encoded) {
+		t.Fatal("padded storage does not begin with the exact envelope")
+	}
+	if !allZero(storage.PaddedBytes[len(encoded):]) {
+		t.Fatal("publication capacity padding is not zero-filled")
+	}
+	if len(storage.PageRuns) != 1 {
+		t.Fatalf("root has %d PageID runs, want 1", len(storage.PageRuns))
+	}
+	run := storage.PageRuns[0]
+	if run.PageCount != 1 ||
+		run.FirstPage.OwnerID != "owner-a" ||
+		run.FirstPage.DeviceUUID != "device-b" ||
+		run.FirstPage.AllocationRecordID != 42 ||
+		run.FirstPage.DataPageIndex != 203 {
+		t.Fatalf("unexpected publication root run: %#v", run)
+	}
+	if _, err := Decode(storage.ExactBytes); err != nil {
+		t.Fatalf("decode exact stored bytes: %v", err)
+	}
+	if _, err := Decode(storage.PaddedBytes); len(storage.PaddedBytes) != len(encoded) &&
+		!errors.Is(err, ErrCorrupt) {
+		t.Fatalf("decode padded capacity error = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestPublicationStorageRootUsesExactPagesNotSlotCapacity(t *testing.T) {
+	publication := validPublication(t)
+	slot := &publication.ContentObjects[len(publication.ContentObjects)-1]
+	slot.ByteLength = 2 * PageSize
+	slot.PageCount = 2
+	publication.Allocation.TotalPages++
+	publication.Allocation.Extents[len(publication.Allocation.Extents)-1].PageCount++
+	if err := publication.Validate(); err != nil {
+		t.Fatalf("two-page publication capacity is invalid: %v", err)
+	}
+	storage, err := EncodeForStorage(publication)
+	if err != nil {
+		t.Fatalf("EncodeForStorage(): %v", err)
+	}
+	if len(storage.ExactBytes) >= int(PageSize) {
+		t.Fatalf("fixture exact publication is %d bytes; expected one root page", len(storage.ExactBytes))
+	}
+	if storage.CapacityPages != 2 || len(storage.PaddedBytes) != 2*int(PageSize) {
+		t.Fatalf("slot capacity = %d pages/%d bytes, want 2 pages/%d bytes",
+			storage.CapacityPages, len(storage.PaddedBytes), 2*PageSize)
+	}
+	if len(storage.PageRuns) != 1 || storage.PageRuns[0].PageCount != 1 {
+		t.Fatalf("root locator covers capacity instead of exact bytes: %#v", storage.PageRuns)
+	}
+}
+
+func TestPublicationStorageRootFollowsSlotAcrossDevices(t *testing.T) {
+	publication := validPublication(t)
+	slot := &publication.ContentObjects[len(publication.ContentObjects)-1]
+	slot.ByteLength = 4 * PageSize
+	slot.PageCount = 4
+	publication.Allocation.TotalPages = 11
+	publication.Allocation.Extents = []AllocationExtent{
+		{DeviceUUID: "device-a", StartDataPageIndex: 100, PageCount: 4, LogicalPageStart: 0},
+		{DeviceUUID: "device-b", StartDataPageIndex: 200, PageCount: 4, LogicalPageStart: 4},
+		{DeviceUUID: "device-a", StartDataPageIndex: 500, PageCount: 3, LogicalPageStart: 8},
+	}
+	var rawEnvelope []byte
+	for index := 0; len(rawEnvelope) <= int(PageSize); index++ {
+		publication.Artifacts.Entries = append(publication.Artifacts.Entries, ArtifactEntry{
+			Path: fmt.Sprintf("zz-root-span-%04d", index),
+			Type: ArtifactDirectory,
+			Mode: 0755,
+		})
+		payload, err := marshalPayload(publication)
+		if err != nil {
+			t.Fatalf("marshal root-span payload: %v", err)
+		}
+		rawEnvelope, err = marshalEnvelope(payload)
+		if err != nil {
+			t.Fatalf("marshal root-span envelope: %v", err)
+		}
+	}
+	if len(rawEnvelope) > 2*int(PageSize) {
+		t.Fatalf("fixture skipped the two-page envelope range: %d bytes", len(rawEnvelope))
+	}
+	storage, err := EncodeForStorage(publication)
+	if err != nil {
+		t.Fatalf("EncodeForStorage(): %v", err)
+	}
+	if len(storage.PageRuns) != 2 {
+		t.Fatalf("cross-device root has %d runs, want 2: %#v",
+			len(storage.PageRuns), storage.PageRuns)
+	}
+	first, second := storage.PageRuns[0], storage.PageRuns[1]
+	if first.PageCount != 1 ||
+		first.FirstPage.DeviceUUID != "device-b" ||
+		first.FirstPage.DataPageIndex != 203 {
+		t.Fatalf("first publication root run = %#v", first)
+	}
+	if second.PageCount != 1 ||
+		second.FirstPage.DeviceUUID != "device-a" ||
+		second.FirstPage.DataPageIndex != 500 {
+		t.Fatalf("second publication root run = %#v", second)
+	}
+}
+
+func TestPublicationEnvelopeMustFitReservedPublicationSlot(t *testing.T) {
+	publication := validPublication(t)
+	for index := 0; index < 256; index++ {
+		publication.Artifacts.Entries = append(publication.Artifacts.Entries, ArtifactEntry{
+			Path: fmt.Sprintf("zz-extra-%04d", index),
+			Type: ArtifactDirectory,
+			Mode: 0755,
+		})
+	}
+	if err := publication.Validate(); err != nil {
+		t.Fatalf("large publication graph is semantically invalid: %v", err)
+	}
+	payload, err := marshalPayload(publication)
+	if err != nil {
+		t.Fatalf("marshal large payload: %v", err)
+	}
+	oversized, err := marshalEnvelope(payload)
+	if err != nil {
+		t.Fatalf("marshal large envelope: %v", err)
+	}
+	if len(oversized) <= int(PageSize) {
+		t.Fatalf("large envelope is only %d bytes", len(oversized))
+	}
+	if _, err := Encode(publication); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Encode() error = %v, want ErrInvalid", err)
+	}
+	if _, err := Decode(oversized); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Decode() error = %v, want ErrInvalid", err)
+	}
+}
+
+func TestPublicationRequiresExactlyOnePageAlignedPublicationSlot(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		publication := validPublication(t)
+		publication.ContentObjects[len(publication.ContentObjects)-1].Kind = ContentRestoreBlob
+		requireInvalid(t, publication)
+	})
+	t.Run("duplicate", func(t *testing.T) {
+		publication := validPublication(t)
+		publication.ContentObjects[5].Kind = ContentPublication
+		publication.ContentObjects[5].ByteLength = PageSize
+		requireInvalid(t, publication)
+	})
+	t.Run("not full capacity", func(t *testing.T) {
+		publication := validPublication(t)
+		publication.ContentObjects[len(publication.ContentObjects)-1].ByteLength--
+		requireInvalid(t, publication)
+	})
 }
 
 func TestDeviceTableDigestIsCanonicalAndHasNoLocalPathContract(t *testing.T) {
@@ -657,6 +842,10 @@ func TestTextualIdentityUTF8AndLengthLimits(t *testing.T) {
 	publication := validPublication(t)
 	publication.CheckpointID = exact
 	publication.Root.CheckpointID = exact
+	publication.ContentObjects[len(publication.ContentObjects)-1].ByteLength = 3 * PageSize
+	publication.ContentObjects[len(publication.ContentObjects)-1].PageCount = 3
+	publication.Allocation.TotalPages += 2
+	publication.Allocation.Extents[len(publication.Allocation.Extents)-1].PageCount += 2
 	if _, err := Encode(publication); err != nil {
 		t.Fatalf("exactly %d UTF-8 bytes rejected: %v", MaxIdentityBytes, err)
 	}

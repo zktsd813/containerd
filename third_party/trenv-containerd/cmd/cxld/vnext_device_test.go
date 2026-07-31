@@ -68,8 +68,8 @@ func TestVNextPersistentDeviceUnifiedLifecycleAndRestart(t *testing.T) {
 		OwnerEpoch:   7,
 		MaxExtents:   8,
 		Contents: []vnextContentRequest{
-			{Kind: vnextContentMemory, ObjectID: 101, ByteLength: 4096},
-			{Kind: vnextContentArtifact, ObjectID: 102, ByteLength: 4100},
+			{Kind: vnextContentMemory, ObjectID: 101, ByteLength: 4096, PageCount: 1},
+			{Kind: vnextContentArtifact, ObjectID: 102, ByteLength: 4100, PageCount: 2},
 		},
 	}
 	initialFree := device.allocator.freePages()
@@ -178,6 +178,41 @@ func TestVNextPersistentDeviceUnifiedLifecycleAndRestart(t *testing.T) {
 	}
 	if nextGrant.Extents[0].StartDataPageIndex != firstPhysical {
 		t.Fatal("allocator did not reuse the reclaimed physical hole")
+	}
+}
+
+func TestVNextPersistentDeviceRequiresZeroFilledCapacityPadding(t *testing.T) {
+	_, device := newTestVNextPersistentDevice(t, 8<<20, 128<<10)
+	request := vnextCheckpointAllocationRequest{
+		RequestID:    "request-zero-capacity-padding",
+		CheckpointID: "checkpoint-zero-capacity-padding",
+		ProducerID:   "producer-zero-capacity-padding",
+		OwnerID:      "owner-0",
+		OwnerEpoch:   7,
+		MaxExtents:   1,
+		Contents: []vnextContentRequest{{
+			Kind:       vnextContentPageMap,
+			ObjectID:   501,
+			ByteLength: 3,
+			PageCount:  2,
+		}},
+	}
+	grant, err := device.reserve(request)
+	if err != nil {
+		t.Fatalf("reserve padded PageMap slot: %v", err)
+	}
+	if err := device.writePage(grant, 0, []byte{1, 2, 3}); err != nil {
+		t.Fatalf("write meaningful PageMap bytes: %v", err)
+	}
+	nonZero := bytes.Repeat([]byte{1}, int(vnextContentPageSize))
+	if err := device.writePage(grant, 1, nonZero); !errors.Is(err, errVNextAuthority) {
+		t.Fatalf("non-zero capacity padding returned %v", err)
+	}
+	if err := device.writePage(grant, 1, make([]byte, vnextContentPageSize)); err != nil {
+		t.Fatalf("seal zero capacity padding: %v", err)
+	}
+	if err := device.commit(grant); err != nil {
+		t.Fatalf("commit capacity-aware PageMap slot: %v", err)
 	}
 }
 

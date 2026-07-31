@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"math"
+	"os"
 	"sort"
 
 	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/cxlcheckpoint"
@@ -181,7 +181,7 @@ func (group *vnextOwnerGroup) sealExternalCRIUOutput(
 		if _, touched := touchedDevices[device]; !touched {
 			continue
 		}
-		if err := device.file.Sync(); err != nil {
+		if err := device.storage.Sync(); err != nil {
 			return device.poisonLocked(fmt.Errorf(
 				"sync externally written page descriptors: %w", err))
 		}
@@ -225,6 +225,23 @@ func validateVNextPublicationAllocationGrant(
 		return fmt.Errorf(
 			"publication has %d initial extents, writer grant has %d: %w",
 			len(allocation.Extents), len(grant.Extents), errVNextAuthority)
+	}
+	if len(publication.ContentObjects) != len(grant.Contents) {
+		return fmt.Errorf(
+			"publication has %d content objects, writer grant has %d: %w",
+			len(publication.ContentObjects), len(grant.Contents), errVNextAuthority)
+	}
+	for index, object := range publication.ContentObjects {
+		granted := grant.Contents[index]
+		if uint8(object.Kind) != uint8(granted.Kind) ||
+			object.ObjectID != granted.ObjectID ||
+			object.ByteLength != granted.ByteLength ||
+			object.LogicalPageStart != granted.LogicalPageStart ||
+			object.PageCount != granted.PageCount {
+			return fmt.Errorf(
+				"publication content object %d differs from writer grant: %w",
+				index, errVNextAuthority)
+		}
 	}
 	var totalPages uint64
 	for index, extent := range allocation.Extents {
@@ -413,7 +430,7 @@ func (device *vnextPersistentDevice) applyPreparedExternalSealLocked(
 			len(prepared.descriptorData), errVNextCorrupt)
 	}
 	if err := vnextWriteAtFull(
-		device.file, prepared.descriptorData, prepared.descriptorOffset); err != nil {
+		device.storage, prepared.descriptorData, prepared.descriptorOffset); err != nil {
 		return device.poisonLocked(fmt.Errorf("seal external page descriptor: %w", err))
 	}
 	return nil
@@ -424,22 +441,45 @@ func (device *vnextPersistentDevice) readVisibleExternalContentLocked(
 	copyEngine vnextCRCCopyEngine,
 	needsVisibilityBarrier bool,
 ) ([]byte, error) {
-	if contentOffset > uint64(math.MaxInt64) {
-		return nil, errors.New("external content offset exceeds signed mmap ABI")
+	if err := vnextValidateUnsignedStorageRange(
+		device.storage.Size(), contentOffset, int(vnextContentPageSize), "external mmap"); err != nil {
+		return nil, err
+	}
+	if contentOffset%uint64(os.Getpagesize()) != 0 {
+		return nil, errors.New("external content offset is not host-page aligned")
+	}
+	if device.storage.FD() > uintptr(maxInt()) {
+		return nil, errors.New("external content file descriptor exceeds int ABI")
+	}
+	mappingAlignment := device.storage.MappingAlignment()
+	if mappingAlignment < uint64(os.Getpagesize()) ||
+		mappingAlignment%uint64(os.Getpagesize()) != 0 {
+		return nil, errors.New("external content mapping alignment is invalid")
+	}
+	mappingOffset := vnextAlignDown(contentOffset, mappingAlignment)
+	contentEnd := contentOffset + vnextContentPageSize
+	mappingEnd := vnextAlignUpBounded(
+		contentEnd, mappingAlignment, device.storage.Size())
+	mappingLength := mappingEnd - mappingOffset
+	if mappingLength == 0 || mappingLength > uint64(maxInt()) {
+		return nil, errors.New("external content mapping length exceeds int ABI")
 	}
 	mapped, err := unix.Mmap(
-		int(device.file.Fd()),
-		int64(contentOffset),
-		int(vnextContentPageSize),
+		int(device.storage.FD()),
+		int64(mappingOffset),
+		int(mappingLength),
 		unix.PROT_READ|unix.PROT_WRITE,
 		unix.MAP_SHARED)
 	if err != nil {
 		return nil, fmt.Errorf("map externally written content page: %w", err)
 	}
 	defer unix.Munmap(mapped) //nolint:errcheck
+	pageOffset := contentOffset - mappingOffset
+	pageEnd := pageOffset + vnextContentPageSize
+	page := mapped[int(pageOffset):int(pageEnd)]
 	if needsVisibilityBarrier {
 		err := vnextExternalPayloadVisibilityHook(
-			mapped,
+			page,
 			func(data []byte) error {
 				return directDaxFlushHook(device.file, data)
 			},
@@ -451,5 +491,5 @@ func (device *vnextPersistentDevice) readVisibleExternalContentLocked(
 			return nil, fmt.Errorf("make external payload visible: %w", err)
 		}
 	}
-	return append([]byte(nil), mapped...), nil
+	return append([]byte(nil), page...), nil
 }

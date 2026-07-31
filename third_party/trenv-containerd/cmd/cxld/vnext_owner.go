@@ -39,6 +39,7 @@ type vnextOwnerWriteGrant struct {
 	ProducerID         string
 	OwnerID            string
 	OwnerEpoch         uint64
+	Contents           []vnextContentSegment
 	Extents            []vnextOwnerPageExtentGrant
 
 	// Device-local tokens are deliberately not part of the portable grant
@@ -217,6 +218,7 @@ func (group *vnextOwnerGroup) reserve(
 		State:              vnextOwnerPreparing,
 		TotalPages:         totalPages,
 		MaxExtents:         request.MaxExtents,
+		Contents:           append([]vnextContentSegment(nil), segments...),
 		Fragments:          plan.Fragments,
 	}
 	candidate := group.journal.clone()
@@ -441,22 +443,26 @@ func (group *vnextOwnerGroup) validateOwnerRequestLocked(
 	seenObjects := make(map[uint64]struct{}, len(request.Contents))
 	var totalPages uint64
 	for _, content := range request.Contents {
-		if !content.Kind.valid() || content.ObjectID == 0 || content.ByteLength == 0 {
+		if !content.Kind.valid() || content.ObjectID == 0 || content.PageCount == 0 {
 			return nil, 0, zeroDigest, errors.New("Owner content object is invalid")
 		}
 		if _, exists := seenObjects[content.ObjectID]; exists {
 			return nil, 0, zeroDigest, fmt.Errorf("Owner content object %d is duplicated", content.ObjectID)
 		}
 		seenObjects[content.ObjectID] = struct{}{}
-		if content.Kind == vnextContentMemory && content.ByteLength%vnextContentPageSize != 0 {
-			return nil, 0, zeroDigest, fmt.Errorf("memory object %d is not page-aligned", content.ObjectID)
+		capacity, ok := vnextMul(content.PageCount, vnextContentPageSize)
+		if !ok || content.ByteLength > capacity {
+			return nil, 0, zeroDigest, errors.New("Owner content length exceeds reserved capacity")
 		}
-		rounded, ok := vnextAdd(content.ByteLength, vnextContentPageSize-1)
-		if !ok {
-			return nil, 0, zeroDigest, errors.New("Owner content length overflows")
+		if content.Kind == vnextContentMemory && content.ByteLength != capacity {
+			return nil, 0, zeroDigest, fmt.Errorf(
+				"memory object %d does not fill its reserved pages", content.ObjectID)
 		}
-		pages := rounded / vnextContentPageSize
-		nextTotal, ok := vnextAdd(totalPages, pages)
+		if content.Kind == vnextContentPublication && content.ByteLength != capacity {
+			return nil, 0, zeroDigest, fmt.Errorf(
+				"publication object %d is not a page-aligned slot", content.ObjectID)
+		}
+		nextTotal, ok := vnextAdd(totalPages, content.PageCount)
 		if !ok || nextTotal > uint64(math.MaxInt64) {
 			return nil, 0, zeroDigest, errors.New("Owner logical page count exceeds signed ABI")
 		}
@@ -465,7 +471,7 @@ func (group *vnextOwnerGroup) validateOwnerRequestLocked(
 			ObjectID:         content.ObjectID,
 			ByteLength:       content.ByteLength,
 			LogicalPageStart: totalPages,
-			PageCount:        pages,
+			PageCount:        content.PageCount,
 		})
 		totalPages = nextTotal
 	}
@@ -696,24 +702,32 @@ func vnextSliceOwnerContents(
 			continue
 		}
 		chunkPages := end - start
-		chunkBytes, ok := vnextMul(chunkPages, vnextContentPageSize)
+		pageOffset := start - segment.LogicalPageStart
+		chunkStartByte, ok := vnextMul(pageOffset, vnextContentPageSize)
 		if !ok {
 			return nil, errors.New("fragment content byte length overflows")
 		}
-		if end == segmentEnd {
-			lastPayload := segment.ByteLength - (segment.PageCount-1)*vnextContentPageSize
-			chunkBytes = (chunkPages-1)*vnextContentPageSize + lastPayload
+		chunkCapacity, ok := vnextMul(chunkPages, vnextContentPageSize)
+		if !ok {
+			return nil, errors.New("fragment content capacity overflows")
+		}
+		var chunkBytes uint64
+		if chunkStartByte < segment.ByteLength {
+			chunkBytes = segment.ByteLength - chunkStartByte
+			if chunkBytes > chunkCapacity {
+				chunkBytes = chunkCapacity
+			}
 		}
 		contents = append(contents, vnextContentRequest{
 			Kind:       segment.Kind,
 			ObjectID:   segment.ObjectID,
 			ByteLength: chunkBytes,
+			PageCount:  chunkPages,
 		})
 	}
 	var covered uint64
 	for _, content := range contents {
-		rounded, _ := vnextAdd(content.ByteLength, vnextContentPageSize-1)
-		covered += rounded / vnextContentPageSize
+		covered += content.PageCount
 	}
 	if covered != pageCount {
 		return nil, fmt.Errorf("fragment content covers %d of %d pages: %w",
@@ -736,6 +750,7 @@ func vnextOwnerRequestDigest(request vnextCheckpointAllocationRequest) [32]byte 
 		buffer.Write(make([]byte, 7))
 		vnextWriteU64(&buffer, content.ObjectID)
 		vnextWriteU64(&buffer, content.ByteLength)
+		vnextWriteU64(&buffer, content.PageCount)
 	}
 	return sha256.Sum256(buffer.Bytes())
 }
@@ -750,6 +765,7 @@ func (group *vnextOwnerGroup) buildGrantLocked(
 		ProducerID:         transaction.ProducerID,
 		OwnerID:            group.ownerID,
 		OwnerEpoch:         group.ownerEpoch,
+		Contents:           append([]vnextContentSegment(nil), transaction.Contents...),
 		fragmentGrants:     make(map[string]vnextWriteGrant, len(transaction.Fragments)),
 	}
 	for _, fragment := range transaction.Fragments {
@@ -933,6 +949,28 @@ func (group *vnextOwnerGroup) reconcileDeviceFragmentsLocked() error {
 				return fmt.Errorf("Owner recovery left transaction %d in state %d: %w",
 					allocationID, transaction.State, errVNextCorrupt)
 			}
+			if record != nil {
+				var fragment *vnextOwnerDeviceFragment
+				for index := range transaction.Fragments {
+					if transaction.Fragments[index].DeviceUUID == deviceUUID {
+						fragment = &transaction.Fragments[index]
+						break
+					}
+				}
+				if fragment == nil {
+					device.allocator.mu.Unlock()
+					return fmt.Errorf(
+						"Owner transaction %d has no fragment for device %q: %w",
+						allocationID, deviceUUID, errVNextCorrupt)
+				}
+				if err := validateVNextOwnerDeviceRecord(
+					group.ownerID, group.ownerEpoch, transaction, *fragment, record); err != nil {
+					device.allocator.mu.Unlock()
+					return fmt.Errorf(
+						"device %q allocation %d disagrees with Owner journal: %w",
+						deviceUUID, allocationID, err)
+				}
+			}
 		}
 		device.allocator.mu.Unlock()
 	}
@@ -958,6 +996,86 @@ func (group *vnextOwnerGroup) reconcileDeviceFragmentsLocked() error {
 		device.allocator.mu.Unlock()
 	}
 	return nil
+}
+
+func validateVNextOwnerDeviceRecord(
+	ownerID string,
+	ownerEpoch uint64,
+	transaction *vnextOwnerTransaction,
+	fragment vnextOwnerDeviceFragment,
+	record *vnextAllocationRecord,
+) error {
+	requestContents := make([]vnextContentRequest, len(transaction.Contents))
+	for index, content := range transaction.Contents {
+		requestContents[index] = vnextContentRequest{
+			Kind:       content.Kind,
+			ObjectID:   content.ObjectID,
+			ByteLength: content.ByteLength,
+			PageCount:  content.PageCount,
+		}
+	}
+	fragmentRequest, err := vnextOwnerFragmentRequest(
+		vnextCheckpointAllocationRequest{
+			RequestID:    transaction.RequestID,
+			CheckpointID: transaction.CheckpointID,
+			ProducerID:   transaction.ProducerID,
+			OwnerID:      ownerID,
+			OwnerEpoch:   ownerEpoch,
+			Contents:     requestContents,
+			MaxExtents:   transaction.MaxExtents,
+		},
+		transaction.Contents,
+		fragment)
+	if err != nil {
+		return err
+	}
+	expectedContents := make([]vnextContentSegment, len(fragmentRequest.Contents))
+	var localLogical uint64
+	for index, content := range fragmentRequest.Contents {
+		expectedContents[index] = vnextContentSegment{
+			Kind:             content.Kind,
+			ObjectID:         content.ObjectID,
+			ByteLength:       content.ByteLength,
+			LogicalPageStart: localLogical,
+			PageCount:        content.PageCount,
+		}
+		localLogical += content.PageCount
+	}
+	expectedExtents := make([]vnextPageExtent, len(fragment.Extents))
+	localLogical = 0
+	for index, extent := range fragment.Extents {
+		expectedExtents[index] = vnextPageExtent{
+			StartDataPageIndex: extent.StartDataPageIndex,
+			PageCount:          extent.PageCount,
+			LogicalPageStart:   localLogical,
+		}
+		localLogical += extent.PageCount
+	}
+	if record.AllocationRecordID != transaction.AllocationRecordID ||
+		record.RequestID != fragmentRequest.RequestID ||
+		record.CheckpointID != transaction.CheckpointID ||
+		record.ProducerID != transaction.ProducerID ||
+		record.OwnerID != ownerID ||
+		record.OwnerEpoch != ownerEpoch ||
+		record.TotalPages != fragment.PageCount ||
+		record.MaxExtents != uint32(len(fragment.Extents)) ||
+		!vnextContentSegmentsEqual(record.Contents, expectedContents) ||
+		!vnextPageExtentsEqual(record.Extents, expectedExtents) {
+		return errVNextCorrupt
+	}
+	return nil
+}
+
+func vnextContentSegmentsEqual(left, right []vnextContentSegment) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (group *vnextOwnerGroup) persistJournalLocked(candidate *vnextOwnerJournal) error {

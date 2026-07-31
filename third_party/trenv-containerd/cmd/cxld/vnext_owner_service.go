@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math"
@@ -106,6 +107,7 @@ const (
 	vnextOwnerServiceContentMMTemplate
 	vnextOwnerServiceContentPageMap
 	vnextOwnerServiceContentRestoreBlob
+	vnextOwnerServiceContentPublication
 )
 
 func (kind vnextOwnerServiceContentKind) internal() (vnextContentKind, bool) {
@@ -120,6 +122,8 @@ func (kind vnextOwnerServiceContentKind) internal() (vnextContentKind, bool) {
 		return vnextContentPageMap, true
 	case vnextOwnerServiceContentRestoreBlob:
 		return vnextContentRestoreBlob, true
+	case vnextOwnerServiceContentPublication:
+		return vnextContentPublication, true
 	default:
 		return 0, false
 	}
@@ -137,15 +141,18 @@ func vnextOwnerServiceKindFromInternal(kind vnextContentKind) (vnextOwnerService
 		return vnextOwnerServiceContentPageMap, true
 	case vnextContentRestoreBlob:
 		return vnextOwnerServiceContentRestoreBlob, true
+	case vnextContentPublication:
+		return vnextOwnerServiceContentPublication, true
 	default:
 		return 0, false
 	}
 }
 
 type vnextOwnerReserveContent struct {
-	Kind       vnextOwnerServiceContentKind
-	ObjectID   uint64
-	ByteLength uint64
+	Kind          vnextOwnerServiceContentKind
+	ObjectID      uint64
+	ByteLength    uint64
+	CapacityPages uint64
 }
 
 type vnextOwnerReserveRequest struct {
@@ -195,6 +202,21 @@ type vnextOwnerSealRequest struct {
 	Operation           vnextOwnerOperationIdentity
 	PublicationEnvelope []byte
 	CRCPageSidecars     map[uint32][]byte
+}
+
+type vnextOwnerPublicationPageRun struct {
+	FirstPage cxlcheckpoint.PageID
+	PageCount uint64
+}
+
+// vnextOwnerSealResponse is sufficient for the Scheduler to construct a
+// CxlCheckpointRootLocator. PublicationByteLength and PublicationSHA256 cover
+// only the exact canonical TRPUB006 bytes. PageRuns cover ceil(exact/4096)
+// pages, never the complete pre-reserved publication-slot capacity.
+type vnextOwnerSealResponse struct {
+	PublicationByteLength uint64
+	PublicationSHA256     [32]byte
+	PageRuns              []vnextOwnerPublicationPageRun
 }
 
 func newVNextOwnerService(
@@ -284,32 +306,46 @@ func (request vnextOwnerReserveRequest) internal() (vnextCheckpointAllocationReq
 	contents := make([]vnextContentRequest, len(request.Contents))
 	objects := make(map[uint64]struct{}, len(request.Contents))
 	var totalPages uint64
+	publicationSlots := 0
 	for index, portable := range request.Contents {
 		kind, ok := portable.Kind.internal()
 		if !ok {
 			return vnextCheckpointAllocationRequest{}, fmt.Errorf(
 				"content %d has unknown kind %d", index, portable.Kind)
 		}
-		if portable.ObjectID == 0 || portable.ByteLength == 0 {
+		if portable.ObjectID == 0 || portable.CapacityPages == 0 {
 			return vnextCheckpointAllocationRequest{}, fmt.Errorf(
-				"content %d has a zero object ID or byte length", index)
+				"content %d has a zero object ID or capacity", index)
 		}
 		if _, duplicate := objects[portable.ObjectID]; duplicate {
 			return vnextCheckpointAllocationRequest{}, fmt.Errorf(
 				"content object ID %d is duplicated", portable.ObjectID)
 		}
 		objects[portable.ObjectID] = struct{}{}
-		if kind == vnextContentMemory && portable.ByteLength%vnextContentPageSize != 0 {
+		capacity, ok := vnextMul(portable.CapacityPages, vnextContentPageSize)
+		if !ok || portable.ByteLength > capacity {
 			return vnextCheckpointAllocationRequest{}, fmt.Errorf(
-				"memory content %d is not page aligned", portable.ObjectID)
+				"content %d byte length exceeds reserved capacity", portable.ObjectID)
 		}
-		rounded, ok := vnextAdd(portable.ByteLength, vnextContentPageSize-1)
-		if !ok {
+		if kind == vnextContentMemory && portable.ByteLength != capacity {
 			return vnextCheckpointAllocationRequest{}, fmt.Errorf(
-				"content %d byte length overflows", index)
+				"memory content %d does not fill its reserved pages", portable.ObjectID)
 		}
-		pages := rounded / vnextContentPageSize
-		totalPages, ok = vnextAdd(totalPages, pages)
+		if kind == vnextContentPublication && portable.ByteLength != capacity {
+			return vnextCheckpointAllocationRequest{}, fmt.Errorf(
+				"publication content %d is not a page-aligned slot", portable.ObjectID)
+		}
+		if kind == vnextContentPublication {
+			publicationSlots++
+			if portable.CapacityPages > cxlcheckpoint.MaxPublicationSlotPages {
+				return vnextCheckpointAllocationRequest{}, fmt.Errorf(
+					"publication content %d reserves %d pages, maximum is %d",
+					portable.ObjectID,
+					portable.CapacityPages,
+					cxlcheckpoint.MaxPublicationSlotPages)
+			}
+		}
+		totalPages, ok = vnextAdd(totalPages, portable.CapacityPages)
 		if !ok || totalPages > uint64(math.MaxInt64) {
 			return vnextCheckpointAllocationRequest{}, errors.New(
 				"checkpoint page count exceeds the signed ABI")
@@ -318,7 +354,13 @@ func (request vnextOwnerReserveRequest) internal() (vnextCheckpointAllocationReq
 			Kind:       kind,
 			ObjectID:   portable.ObjectID,
 			ByteLength: portable.ByteLength,
+			PageCount:  portable.CapacityPages,
 		}
+	}
+	if publicationSlots != 1 {
+		return vnextCheckpointAllocationRequest{}, fmt.Errorf(
+			"reserve request must contain exactly one publication slot, found %d",
+			publicationSlots)
 	}
 	return vnextCheckpointAllocationRequest{
 		RequestID:    request.RequestID,
@@ -353,19 +395,14 @@ func (service *vnextOwnerService) reserveResponse(
 		if !ok {
 			return vnextOwnerReserveResponse{}, fmt.Errorf("unknown internal content kind %d", content.Kind)
 		}
-		rounded, ok := vnextAdd(content.ByteLength, vnextContentPageSize-1)
-		if !ok {
-			return vnextOwnerReserveResponse{}, errors.New("content size overflows")
-		}
-		pages := rounded / vnextContentPageSize
 		response.Contents[index] = vnextOwnerPortableContentSegment{
 			Kind:             kind,
 			ObjectID:         content.ObjectID,
 			ByteLength:       content.ByteLength,
 			LogicalPageStart: logicalPage,
-			PageCount:        pages,
+			PageCount:        content.PageCount,
 		}
-		logicalPage, ok = vnextAdd(logicalPage, pages)
+		logicalPage, ok = vnextAdd(logicalPage, content.PageCount)
 		if !ok {
 			return vnextOwnerReserveResponse{}, errors.New("logical content coverage overflows")
 		}
@@ -419,7 +456,9 @@ func (service *vnextOwnerService) reserveResponse(
 	return response, nil
 }
 
-func (service *vnextOwnerService) seal(request vnextOwnerSealRequest) error {
+func (service *vnextOwnerService) seal(
+	request vnextOwnerSealRequest,
+) (vnextOwnerSealResponse, error) {
 	const operation = "seal"
 	service.mu.Lock()
 	defer service.mu.Unlock()
@@ -427,11 +466,11 @@ func (service *vnextOwnerService) seal(request vnextOwnerSealRequest) error {
 	grant, _, err := service.resolveOperation(
 		operation, request.Operation, vnextOwnerGranted, true)
 	if err != nil {
-		return err
+		return vnextOwnerSealResponse{}, err
 	}
 	if len(request.PublicationEnvelope) >= len(cxlcheckpoint.MagicString) &&
 		string(request.PublicationEnvelope[:len(cxlcheckpoint.MagicString)]) != cxlcheckpoint.MagicString {
-		return vnextOwnerServiceFailure(
+		return vnextOwnerSealResponse{}, vnextOwnerServiceFailure(
 			operation,
 			vnextOwnerServicePublicationIncompatible,
 			"publication is not a strict TRPUB006 envelope",
@@ -440,37 +479,69 @@ func (service *vnextOwnerService) seal(request vnextOwnerSealRequest) error {
 	publication, err := cxlcheckpoint.Decode(request.PublicationEnvelope)
 	if err != nil {
 		if errors.Is(err, cxlcheckpoint.ErrWrongFormat) {
-			return vnextOwnerServiceFailure(
+			return vnextOwnerSealResponse{}, vnextOwnerServiceFailure(
 				operation,
 				vnextOwnerServicePublicationIncompatible,
 				"publication is not a strict TRPUB006 envelope",
 				err)
 		}
-		return vnextOwnerServiceFailure(
+		return vnextOwnerSealResponse{}, vnextOwnerServiceFailure(
 			operation,
 			vnextOwnerServicePublicationInvalid,
 			"TRPUB006 envelope failed integrity or semantic validation",
 			err)
+	}
+	storage, err := cxlcheckpoint.EncodeForStorage(publication)
+	if err != nil {
+		return vnextOwnerSealResponse{}, vnextOwnerServiceWrap(operation, err)
+	}
+	if !bytes.Equal(storage.ExactBytes, request.PublicationEnvelope) {
+		return vnextOwnerSealResponse{}, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServicePublicationInvalid,
+			"TRPUB006 envelope is not the canonical deterministic encoding",
+			cxlcheckpoint.ErrInvalid)
 	}
 	if publication.CheckpointID != request.Operation.CheckpointID ||
 		publication.Root.CheckpointID != request.Operation.CheckpointID ||
 		publication.Allocation.OwnerID != request.Operation.OwnerID ||
 		publication.Allocation.OwnerEpoch != request.Operation.OwnerEpoch ||
 		publication.Allocation.AllocationRecordID != request.Operation.AllocationRecordID {
-		return vnextOwnerServiceFailure(
+		return vnextOwnerSealResponse{}, vnextOwnerServiceFailure(
 			operation,
 			vnextOwnerServiceIdentityMismatch,
 			"publication does not name the reserved checkpoint allocation",
 			errVNextAuthority)
 	}
 	if err := vnextOwnerServiceRequireSidecars(publication, request.CRCPageSidecars); err != nil {
-		return err
+		return vnextOwnerSealResponse{}, err
 	}
 	if err := service.group.sealExternalCRIUOutput(
 		grant, publication, service.directory, request.CRCPageSidecars); err != nil {
-		return vnextOwnerServiceWrap(operation, err)
+		return vnextOwnerSealResponse{}, vnextOwnerServiceWrap(operation, err)
 	}
-	return nil
+	for page := uint64(0); page < storage.CapacityPages; page++ {
+		byteStart := page * cxlcheckpoint.PageSize
+		byteEnd := byteStart + cxlcheckpoint.PageSize
+		if err := service.group.writePage(
+			grant,
+			storage.LogicalPageStart+page,
+			storage.PaddedBytes[int(byteStart):int(byteEnd)]); err != nil {
+			return vnextOwnerSealResponse{}, vnextOwnerServiceWrap(operation, err)
+		}
+	}
+	response := vnextOwnerSealResponse{
+		PublicationByteLength: uint64(len(storage.ExactBytes)),
+		PublicationSHA256:     storage.SHA256,
+		PageRuns:              make([]vnextOwnerPublicationPageRun, len(storage.PageRuns)),
+	}
+	for index, run := range storage.PageRuns {
+		response.PageRuns[index] = vnextOwnerPublicationPageRun{
+			FirstPage: run.FirstPage,
+			PageCount: run.PageCount,
+		}
+	}
+	return response, nil
 }
 
 func vnextOwnerServiceRequireSidecars(

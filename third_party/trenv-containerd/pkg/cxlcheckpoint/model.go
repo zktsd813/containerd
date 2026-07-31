@@ -33,6 +33,9 @@ const (
 	// MaxPayloadBytes is the strict upper bound on a TRPUB006 payload. Producers
 	// must budget worst-case one-page PageMap runs within this envelope.
 	MaxPayloadBytes = 64 << 20
+	// MaxPublicationSlotPages is the largest page-aligned ContentPublication
+	// reservation capable of holding the maximum envelope header and payload.
+	MaxPublicationSlotPages = (uint64(envelopeHeaderSize) + MaxPayloadBytes + PageSize - 1) / PageSize
 
 	maxCollectionElements = 1 << 20
 )
@@ -58,10 +61,15 @@ const (
 	ContentMMTemplate
 	ContentPageMap
 	ContentRestoreBlob
+	// ContentPublication is the page-aligned slot that stores this complete
+	// encoded TRPUB006 envelope followed by zero padding. Its ByteLength is
+	// the reserved slot capacity; the Scheduler root locator carries the
+	// exact encoded byte length and SHA-256.
+	ContentPublication
 )
 
 func (k ContentKind) valid() bool {
-	return k >= ContentMemory && k <= ContentRestoreBlob
+	return k >= ContentMemory && k <= ContentPublication
 }
 
 // BackingKind is the portable source category of a VMA. Kernel objects and
@@ -138,6 +146,29 @@ type PageID struct {
 	DataPageIndex      uint64
 }
 
+// PublicationPageRun identifies consecutive pages that contain the complete
+// encoded TRPUB006 envelope. It deliberately contains no host-local path.
+// PageCount covers only ceil(exact encoded bytes / PageSize), not the complete
+// capacity of the pre-reserved publication slot.
+type PublicationPageRun struct {
+	FirstPage PageID
+	PageCount uint64
+}
+
+// PublicationStorage is the result of preparing one validated TRPUB006
+// publication for its pre-reserved CXL slot. ExactBytes and SHA256 are the
+// Scheduler-visible root identity. PaddedBytes is the complete slot write:
+// ExactBytes followed only by zero bytes.
+type PublicationStorage struct {
+	ContentObjectID  uint64
+	LogicalPageStart uint64
+	CapacityPages    uint64
+	ExactBytes       []byte
+	PaddedBytes      []byte
+	SHA256           [sha256.Size]byte
+	PageRuns         []PublicationPageRun
+}
+
 // Device describes a stable DAX identity. There is intentionally no local
 // /dev path or shard index in the portable contract.
 type Device struct {
@@ -148,7 +179,11 @@ type Device struct {
 }
 
 // ContentObject describes pages reserved from the unified content allocator.
-// ByteLength is the exact meaningful length; PageCount is reserved capacity.
+// ByteLength is the exact meaningful length and PageCount is reserved capacity
+// for every ordinary content kind. ContentPublication is the deliberate
+// exception: its exact encoded length is self-referential, so ByteLength names
+// the page-aligned slot capacity and the Scheduler root locator carries the
+// exact encoded envelope length.
 type ContentObject struct {
 	ObjectID         uint64
 	Kind             ContentKind
@@ -355,6 +390,7 @@ func validateDevices(devices []Device) (map[string]Device, error) {
 func validateContentObjects(objects []ContentObject, totalPages uint64) (map[uint64]ContentObject, error) {
 	byID := make(map[uint64]ContentObject, len(objects))
 	expectedLogical := uint64(0)
+	publicationObjects := 0
 	for i, object := range objects {
 		if err := positiveLong("content object ID", object.ObjectID); err != nil {
 			return nil, fmt.Errorf("content object %d: %w", i, err)
@@ -378,6 +414,15 @@ func validateContentObjects(objects []ContentObject, totalPages uint64) (map[uin
 		if object.Kind == ContentMemory && object.ByteLength != capacity {
 			return nil, invalidf("memory content object %d must fill every reserved page", i)
 		}
+		if object.Kind == ContentPublication {
+			publicationObjects++
+			if object.ByteLength != capacity || object.ByteLength == 0 ||
+				object.PageCount > MaxPublicationSlotPages {
+				return nil, invalidf(
+					"publication content object %d must be a non-empty page-aligned slot of at most %d pages",
+					i, MaxPublicationSlotPages)
+			}
+		}
 		if object.LogicalPageStart != expectedLogical {
 			return nil, invalidf("content objects have a gap or overlap at logical page %d", expectedLogical)
 		}
@@ -393,7 +438,103 @@ func validateContentObjects(objects []ContentObject, totalPages uint64) (map[uin
 	if expectedLogical != totalPages {
 		return nil, invalidf("content objects cover %d pages, allocation declares %d", expectedLogical, totalPages)
 	}
+	if publicationObjects != 1 {
+		return nil, invalidf(
+			"publication must contain exactly one publication content slot, found %d",
+			publicationObjects)
+	}
 	return byID, nil
+}
+
+func (p Publication) publicationContentSlot() (ContentObject, error) {
+	var slot ContentObject
+	found := false
+	for _, object := range p.ContentObjects {
+		if object.Kind != ContentPublication {
+			continue
+		}
+		if found {
+			return ContentObject{}, invalidf("publication contains more than one publication content slot")
+		}
+		slot = object
+		found = true
+	}
+	if !found {
+		return ContentObject{}, invalidf("publication contains no publication content slot")
+	}
+	return slot, nil
+}
+
+func (p Publication) publicationPageRuns(slot ContentObject, pageCount uint64) ([]PublicationPageRun, error) {
+	if pageCount == 0 || pageCount > slot.PageCount {
+		return nil, invalidf(
+			"encoded publication requires %d pages outside slot capacity %d",
+			pageCount, slot.PageCount)
+	}
+	rangeEnd, ok := addLong(slot.LogicalPageStart, pageCount)
+	if !ok {
+		return nil, invalidf("publication page range overflows signed-Long ABI")
+	}
+	runs := make([]PublicationPageRun, 0, len(p.Allocation.Extents))
+	covered := uint64(0)
+	for _, extent := range p.Allocation.Extents {
+		extentEnd, extentOK := addLong(extent.LogicalPageStart, extent.PageCount)
+		if !extentOK {
+			return nil, invalidf("allocation extent logical range overflows signed-Long ABI")
+		}
+		overlapStart := slot.LogicalPageStart
+		if extent.LogicalPageStart > overlapStart {
+			overlapStart = extent.LogicalPageStart
+		}
+		overlapEnd := rangeEnd
+		if extentEnd < overlapEnd {
+			overlapEnd = extentEnd
+		}
+		if overlapStart >= overlapEnd {
+			continue
+		}
+		runPages := overlapEnd - overlapStart
+		physicalStart, physicalOK := addLong(
+			extent.StartDataPageIndex, overlapStart-extent.LogicalPageStart)
+		if !physicalOK {
+			return nil, invalidf("publication physical page range overflows signed-Long ABI")
+		}
+		run := PublicationPageRun{
+			FirstPage: PageID{
+				OwnerID:            p.Allocation.OwnerID,
+				DeviceUUID:         extent.DeviceUUID,
+				AllocationRecordID: p.Allocation.AllocationRecordID,
+				DataPageIndex:      physicalStart,
+			},
+			PageCount: runPages,
+		}
+		if len(runs) > 0 {
+			previous := &runs[len(runs)-1]
+			previousEnd, previousOK := addLong(
+				previous.FirstPage.DataPageIndex, previous.PageCount)
+			if previousOK &&
+				previous.FirstPage.OwnerID == run.FirstPage.OwnerID &&
+				previous.FirstPage.DeviceUUID == run.FirstPage.DeviceUUID &&
+				previous.FirstPage.AllocationRecordID == run.FirstPage.AllocationRecordID &&
+				previousEnd == run.FirstPage.DataPageIndex {
+				coalesced, coalescedOK := addLong(previous.PageCount, run.PageCount)
+				if !coalescedOK {
+					return nil, invalidf("publication PageID run length overflows signed-Long ABI")
+				}
+				previous.PageCount = coalesced
+				covered += runPages
+				continue
+			}
+		}
+		runs = append(runs, run)
+		covered += runPages
+	}
+	if covered != pageCount {
+		return nil, invalidf(
+			"publication slot allocation covers %d encoded pages, expected %d",
+			covered, pageCount)
+	}
+	return runs, nil
 }
 
 func validateAllocation(allocation InitialAllocation, devices map[string]Device, objects []ContentObject) error {

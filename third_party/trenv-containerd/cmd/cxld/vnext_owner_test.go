@@ -101,6 +101,7 @@ func vnextOwnerMemoryRequest(id string, pages uint64, maxExtents uint32) vnextCh
 			Kind:       vnextContentMemory,
 			ObjectID:   uint64(id[0]) + uint64(len(id))*1000,
 			ByteLength: pages * vnextContentPageSize,
+			PageCount:  pages,
 		}},
 		MaxExtents: maxExtents,
 	}
@@ -156,6 +157,26 @@ func TestVNextOwnerFragmentRetryRejectsDifferentIdentityOrPlan(t *testing.T) {
 	differentPlan := []vnextPageExtent{{StartDataPageIndex: 1, PageCount: 1, LogicalPageStart: 0}}
 	if _, err := fixture.devices[0].allocator.reserveAtIDWithExtents(request, 9, differentPlan); !errors.Is(err, errVNextAlreadyExists) {
 		t.Fatalf("retry with a different physical plan returned %v", err)
+	}
+}
+
+func TestVNextOwnerTransactionValidationRejectsRequestDigestMismatch(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{UUID: "device-digest", Size: 256 << 10}})
+	request := vnextOwnerMemoryRequest("digest", 1, 1)
+	grant, err := fixture.group.reserve(request)
+	if err != nil {
+		t.Fatalf("reserve Owner transaction: %v", err)
+	}
+	transaction := fixture.group.journal.Transactions[grant.AllocationRecordID]
+	if transaction == nil {
+		t.Fatal("reserved Owner transaction is missing")
+	}
+	tampered := *transaction
+	tampered.RequestDigest[0] ^= 0xff
+	if err := vnextValidateOwnerTransaction(
+		&tampered, fixture.group.devices, fixture.group.ownerID, fixture.group.ownerEpoch,
+	); !errors.Is(err, errVNextCorrupt) {
+		t.Fatalf("tampered request digest returned %v", err)
 	}
 }
 
@@ -542,6 +563,38 @@ func TestVNextOwnerJournalABFallbackAndMissingCommittedFragment(t *testing.T) {
 			t.Fatalf("missing committed fragment returned %v", err)
 		}
 	})
+
+	t.Run("journal rejects valid device snapshot with different producer identity", func(t *testing.T) {
+		fixture := newVNextOwnerTestFixture(
+			t, []vnextOwnerTestDeviceSpec{{UUID: "device-only", Size: 256 << 10}})
+		request := vnextOwnerMemoryRequest("device-journal-mismatch", 2, 1)
+		grant, err := fixture.group.reserve(request)
+		if err != nil {
+			t.Fatalf("reserve mismatch fixture: %v", err)
+		}
+		target := fixture.group.devices[grant.Extents[0].DeviceUUID]
+		target.mu.Lock()
+		target.allocator.mu.Lock()
+		record := target.allocator.records[grant.AllocationRecordID]
+		record.ProducerID = "different-but-valid-producer"
+		target.allocator.mu.Unlock()
+		if err := target.persistAllocatorLocked(); err != nil {
+			target.mu.Unlock()
+			t.Fatalf("persist independently valid mismatched device snapshot: %v", err)
+		}
+		target.mu.Unlock()
+
+		reopenedDevice, err := openVNextFileDevice(fixture.deviceFiles[0])
+		if err != nil {
+			t.Fatalf("reopen independently valid device snapshot: %v", err)
+		}
+		if _, err := openVNextOwnerGroup(
+			fixture.controlFile,
+			testVNextOwnerControlSlotBytes,
+			[]*vnextPersistentDevice{reopenedDevice}); !errors.Is(err, errVNextCorrupt) {
+			t.Fatalf("journal/device producer mismatch returned %v", err)
+		}
+	})
 }
 
 func TestVNextOwnerGrantOrderingIsStable(t *testing.T) {
@@ -617,8 +670,13 @@ func TestVNextOwnerMixedMemoryArtifactSplitPreservesTailSemantics(t *testing.T) 
 		OwnerEpoch:   7,
 		MaxExtents:   2,
 		Contents: []vnextContentRequest{
-			{Kind: vnextContentMemory, ObjectID: 101, ByteLength: (capacity - 1) * vnextContentPageSize},
-			{Kind: vnextContentArtifact, ObjectID: 102, ByteLength: 4096 + 904},
+			{
+				Kind:       vnextContentMemory,
+				ObjectID:   101,
+				ByteLength: (capacity - 1) * vnextContentPageSize,
+				PageCount:  capacity - 1,
+			},
+			{Kind: vnextContentArtifact, ObjectID: 102, ByteLength: 4096 + 904, PageCount: 2},
 		},
 	}
 	grant, err := fixture.group.reserve(request)
