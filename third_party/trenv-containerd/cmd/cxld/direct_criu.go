@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -51,7 +52,12 @@ func runDirectCRIURequest(operation string, req switchRequest, timeoutMillis int
 	startedAt := time.Now()
 	result, err := directRestoreIntoCandidate(ctx, operation, req, config)
 	if err != nil {
-		return execResponse{Ok: false, Error: err.Error(), TimingsMicros: result.timingsMicros}
+		return execResponse{
+			Ok:            false,
+			Error:         err.Error(),
+			ErrorCode:     dedupRestoreErrorCode(err),
+			TimingsMicros: result.timingsMicros,
+		}
 	}
 	resp := containerResponse{
 		ContainerID: req.ContainerID,
@@ -113,11 +119,26 @@ func directRestoreIntoCandidate(ctx context.Context, operation string, req switc
 	}
 
 	started = time.Now()
+	readerPlan, hasReaderPlan, err := resolveDirectPseudoMMImportPlan(req, config)
+	record("validate_reader_pseudomm", started)
+	if err != nil {
+		return directCriuResult{timingsMicros: timings}, fmt.Errorf("resolve reader pseudo_mm import: %w", err)
+	}
+
+	started = time.Now()
 	rebindMode, err := prepareDirectSwitchTarget(req, state, config)
 	record("prepare_target", started)
 	if err != nil {
 		return directCriuResult{timingsMicros: timings}, err
 	}
+
+	started = time.Now()
+	if hasReaderPlan {
+		if err := prepareDirectReaderPseudoMM(ctx, readerPlan, state, config); err != nil {
+			return directCriuResult{timingsMicros: timings}, err
+		}
+	}
+	record("import_reader_pseudomm", started)
 
 	workDir := filepath.Join(config.WorkingDirectory, "restore-work", sanitizePathPart(req.ContainerID), sanitizePathPart(checkpointID(req.CheckpointPath)))
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
@@ -138,6 +159,9 @@ func directRestoreIntoCandidate(ctx context.Context, operation string, req switc
 	if restoredPID <= 0 {
 		return directCriuResult{timingsMicros: timings}, errors.New("CRIU restore did not report a restored pid")
 	}
+	if err := moveDirectProcessTreeToStoredCgroup(state, restoredPID); err != nil {
+		return directCriuResult{timingsMicros: timings}, err
+	}
 
 	state.PID = restoredPID
 	state.State = "running"
@@ -156,6 +180,72 @@ func directRestoreIntoCandidate(ctx context.Context, operation string, req switc
 	stdout := fmt.Sprintf("direct_restore operation=%s container=%s pid=%d checkpoint=%s rebind=%s\n",
 		operation, state.ContainerID, restoredPID, req.CheckpointPath, rebindMode)
 	return directCriuResult{pid: restoredPID, stdout: stdout, timingsMicros: timings}, nil
+}
+
+func moveDirectProcessTreeToStoredCgroup(state trenvContainerState, rootPID int) error {
+	cgroupPath, err := directStoredCgroupPath(state)
+	if err != nil {
+		return err
+	}
+	processes, err := collectDirectProcessTree(rootPID, readDirectProcessChildren)
+	if err != nil {
+		return fmt.Errorf("collect restored process tree: %w", err)
+	}
+	cgroupProcs := filepath.Join("/sys/fs/cgroup", cgroupPath, "cgroup.procs")
+	for index := len(processes) - 1; index >= 0; index-- {
+		pid := processes[index]
+		if err := os.WriteFile(cgroupProcs, []byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil {
+			if errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("move restored pid %d to cgroup %s: %w", pid, cgroupPath, err)
+		}
+	}
+	return nil
+}
+
+func collectDirectProcessTree(rootPID int, readChildren func(int) ([]int, error)) ([]int, error) {
+	if rootPID <= 0 {
+		return nil, fmt.Errorf("invalid process tree root pid %d", rootPID)
+	}
+	processes := make([]int, 0, 4)
+	queue := []int{rootPID}
+	seen := make(map[int]bool)
+	for len(queue) > 0 {
+		pid := queue[0]
+		queue = queue[1:]
+		if seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		processes = append(processes, pid)
+		children, err := readChildren(pid)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, err
+		}
+		queue = append(queue, children...)
+	}
+	return processes, nil
+}
+
+func readDirectProcessChildren(pid int) ([]int, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid))
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Fields(string(data))
+	children := make([]int, 0, len(fields))
+	for _, field := range fields {
+		child, err := strconv.Atoi(field)
+		if err != nil || child <= 0 {
+			return nil, fmt.Errorf("invalid child pid %q for %d", field, pid)
+		}
+		children = append(children, child)
+	}
+	return children, nil
 }
 
 func runDirectCriuSwitch(ctx context.Context, state trenvContainerState, opts directCriuOptions, timings map[string]int64) (int, error) {
@@ -182,6 +272,9 @@ func runDirectCriuSwitch(ctx context.Context, state trenvContainerState, opts di
 		NotifyScripts:   proto.Bool(true),
 		OrphanPtsMaster: proto.Bool(true),
 		Switch:          proto.Bool(true),
+	}
+	if directCheckpointHasTCPStreams(opts.imagesDirectory) {
+		rpcOpts.TcpClose = proto.Bool(true)
 	}
 	var extraFiles []*os.File
 	defer closeFiles(extraFiles)
@@ -227,6 +320,11 @@ func runDirectCriuSwitch(ctx context.Context, state trenvContainerState, opts di
 	}
 	timings["criu_swrk"] = elapsedMicros(started)
 	return session.restoredPID, nil
+}
+
+func directCheckpointHasTCPStreams(imageDir string) bool {
+	matches, err := filepath.Glob(filepath.Join(imageDir, "tcp-stream-*.img"))
+	return err == nil && len(matches) > 0
 }
 
 func inheritDirectSwitchNamespaces(rpcOpts *criurpc.CriuOpts, pid int, extraFiles *[]*os.File) error {

@@ -8,3 +8,6 @@ releases/*.tar.gz
 releases/*.tar.gz.sha256sum
 _output/
 .vagrant/
+
+# Generated TrEnv helper binaries.
+/third_party/trenv-containerd/cmd/trenv-dedup-pub/trenv-dedup-pub

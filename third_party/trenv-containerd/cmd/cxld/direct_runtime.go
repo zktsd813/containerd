@@ -161,23 +161,34 @@ func runDirectCheckpointRequest(req checkpointRequest, timeoutMillis int64, conf
 	if err != nil {
 		return commandExecResponse("runc checkpoint", stdout, stderr, err, ctx)
 	}
-	if err := finalizeDirectCheckpoint(ctx, req, state, config); err != nil {
+	placement, err := prepareDirectCheckpointPublication(ctx, req, state, config)
+	if err != nil {
 		return execResponse{Ok: false, Error: err.Error()}
+	}
+	if err := finalizeDirectCheckpoint(ctx, req, state, config, placement); err != nil {
+		response := execResponse{Ok: false, Error: err.Error()}
+		if config.DedupCheckpointMode == "sync-required" {
+			response.ErrorCode = "dedup_checkpoint_rejected"
+		}
+		return response
 	}
 	state.CheckpointPath = req.ImagePath
 	state.UpdatedAt = time.Now().UTC()
 	_ = saveContainerState(config, state)
-	if config.DedupOnCheckpoint {
-		triggerDedupCycle(config, "checkpoint")
-	}
 	return execResponse{Ok: true, Stdout: req.ImagePath + "\n"}
 }
 
 func runDirectRestoreRequest(req switchRequest, timeoutMillis int64, config daemonConfig) execResponse {
+	if err := validateSwitchPublicationIdentity(req); err != nil {
+		return execResponse{Ok: false, Error: err.Error()}
+	}
 	return runDirectCRIURequest("restoreIntoContainer", req, timeoutMillis, config)
 }
 
 func runDirectSwitchRequest(req switchRequest, timeoutMillis int64, config daemonConfig) execResponse {
+	if err := validateSwitchPublicationIdentity(req); err != nil {
+		return execResponse{Ok: false, Error: err.Error()}
+	}
 	return runDirectCRIURequest("switchIntoCandidate", req, timeoutMillis, config)
 }
 
@@ -226,6 +237,9 @@ func runCleanupContainersRequest(req cleanupContainersRequest, timeoutMillis int
 		if err := removeDirectContainer(ctx, id, config); err != nil {
 			warnings = append(warnings, fmt.Sprintf("%s: %v", id, err))
 		}
+	}
+	if err := removeDirectProjectedContainersByPrefix(prefix, config); err != nil {
+		warnings = append(warnings, fmt.Sprintf("restore projections: %v", err))
 	}
 	stdout := fmt.Sprintf("cleanupContainers prefix=%s\n", prefix)
 	if len(warnings) > 0 {
@@ -303,7 +317,7 @@ func createDirectContainer(ctx context.Context, req createContainerRequest, conf
 		return trenvContainerState{}, err
 	}
 	args := []string{"--root", runcRoot, "create", "--bundle", bundle, "--pid-file", pidPath, containerID}
-	stdout, stderr, err := runCommandCapture(ctx, runcBinary, args...)
+	stdout, stderr, err := runCommandDiscardStdio(ctx, runcBinary, args...)
 	if err != nil {
 		return trenvContainerState{}, fmt.Errorf("runc create failed: %s", commandErrorString(err, stderr+"\n"+stdout))
 	}
@@ -323,7 +337,7 @@ func createDirectContainer(ctx context.Context, req createContainerRequest, conf
 			host = cniHost
 		}
 	}
-	stdout, stderr, err = runCommandCapture(ctx, runcBinary, "--root", runcRoot, "start", containerID)
+	stdout, stderr, err = runCommandDiscardStdio(ctx, runcBinary, "--root", runcRoot, "start", containerID)
 	if err != nil {
 		return trenvContainerState{}, fmt.Errorf("runc start failed: %s", commandErrorString(err, stderr+"\n"+stdout))
 	}
@@ -532,8 +546,20 @@ func resolveRootfsCache(root, image string) (rootfsCacheEntry, error) {
 }
 
 func mountOverlay(lower, upper, work, merged string) error {
+	if err := prepareOverlayDirectories(upper, work, merged); err != nil {
+		return err
+	}
 	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", lower, upper, work)
 	return syscall.Mount("overlay", merged, "overlay", 0, opts)
+}
+
+func prepareOverlayDirectories(upper, work, merged string) error {
+	for _, directory := range []string{upper, work, merged} {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			return fmt.Errorf("create overlay directory %s: %w", directory, err)
+		}
+	}
+	return nil
 }
 
 func addCNI(ctx context.Context, containerID string, pid int, cfg createContainerCNI) (string, error) {
@@ -649,14 +675,19 @@ func freezeDirectContainer(config daemonConfig, containerID string, freeze bool)
 	if err != nil {
 		return err
 	}
+	cgroupPath, err := directContainerCgroupPath(state)
+	if err != nil {
+		return err
+	}
 	value := "0"
 	if freeze {
 		value = "1"
 	}
-	path := filepath.Join("/sys/fs/cgroup", strings.TrimPrefix(state.CgroupPath, "/"), "cgroup.freeze")
+	path := filepath.Join("/sys/fs/cgroup", cgroupPath, "cgroup.freeze")
 	if err := os.WriteFile(path, []byte(value+"\n"), 0o644); err != nil {
 		return err
 	}
+	state.CgroupPath = cgroupPath
 	if freeze {
 		state.State = "paused"
 	} else {
@@ -670,20 +701,61 @@ func removeDirectContainer(ctx context.Context, containerID string, config daemo
 	state, err := loadContainerState(config, containerID)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return removeDirectProjectedTreesForContainer(containerID, config)
 		}
 		return err
 	}
+	cgroupPath, err := directContainerCgroupPath(state)
+	if err != nil {
+		cgroupPath = expectedDirectContainerCgroupPath(state.ContainerID)
+	}
 	_ = delCNI(ctx, state)
 	_, _, _ = runCommandCapture(ctx, state.RuncBinary, "--root", state.RuncRoot, "kill", state.ContainerID, "KILL")
-	killCgroupProcs(state.CgroupPath)
+	killCgroupProcs(cgroupPath)
 	_, _, _ = runCommandCapture(ctx, state.RuncBinary, "--root", state.RuncRoot, "delete", "--force", state.ContainerID)
 	cleanupDirectActionOverlays(config, state.ContainerID)
 	_ = syscall.Unmount(state.Rootfs, syscall.MNT_DETACH)
+	projectionErr := removeDirectProjectedTreesForContainer(containerID, config)
 	if err := os.RemoveAll(filepath.Dir(state.Bundle)); err != nil {
 		return err
 	}
-	return os.Remove(statePath(config, containerID))
+	stateErr := os.Remove(statePath(config, containerID))
+	if projectionErr != nil {
+		return projectionErr
+	}
+	return stateErr
+}
+
+func directContainerCgroupPath(state trenvContainerState) (string, error) {
+	return directStoredCgroupPath(state)
+}
+
+func directStoredCgroupPath(state trenvContainerState) (string, error) {
+	path := strings.TrimSpace(state.CgroupPath)
+	if path == "" {
+		return "", fmt.Errorf("empty cgroup path for %s", state.ContainerID)
+	}
+	normalized, err := normalizeDirectCgroupPath(path)
+	if err != nil {
+		return "", err
+	}
+	expected := expectedDirectContainerCgroupPath(state.ContainerID)
+	if normalized != expected {
+		return "", fmt.Errorf("unsafe cgroup path %q for %s; expected %q", normalized, state.ContainerID, expected)
+	}
+	return normalized, nil
+}
+
+func expectedDirectContainerCgroupPath(containerID string) string {
+	return filepath.Join("openwhisk-trenv", sanitizePathPart(containerID))
+}
+
+func normalizeDirectCgroupPath(path string) (string, error) {
+	normalized := strings.TrimPrefix(strings.TrimSpace(path), "/")
+	if normalized == "" {
+		return "", fmt.Errorf("empty cgroup path")
+	}
+	return normalized, nil
 }
 
 func killCgroupProcs(cgroupPath string) {
@@ -739,7 +811,7 @@ func listContainerStateIDs(config daemonConfig) ([]string, error) {
 }
 
 func stateRoot(config daemonConfig) string {
-	return filepath.Join(config.WorkingDirectory, "trenvd-state", "containers")
+	return filepath.Join(config.WorkingDirectory, daemonStateDirectory, "containers")
 }
 
 func runtimeContainersRoot(config daemonConfig) string {
@@ -775,12 +847,12 @@ func requestTimeout(timeoutMillis int64, fallback time.Duration) time.Duration {
 
 func runCommandCapture(ctx context.Context, binary string, args ...string) (string, string, error) {
 	cmd := exec.CommandContext(ctx, binary, args...)
-	stdoutFile, err := os.CreateTemp("", "trenvd-command-stdout-*")
+	stdoutFile, err := os.CreateTemp("", daemonName+"-command-stdout-*")
 	if err != nil {
 		return "", "", err
 	}
 	defer os.Remove(stdoutFile.Name())
-	stderrFile, err := os.CreateTemp("", "trenvd-command-stderr-*")
+	stderrFile, err := os.CreateTemp("", daemonName+"-command-stderr-*")
 	if err != nil {
 		_ = stdoutFile.Close()
 		return "", "", err
@@ -802,6 +874,30 @@ func runCommandCapture(ctx context.Context, binary string, args ...string) (stri
 		}
 	}
 	return string(stdout), string(stderr), err
+}
+
+func runCommandDiscardStdio(ctx context.Context, binary string, args ...string) (string, string, error) {
+	stdinFile, err := os.Open(os.DevNull)
+	if err != nil {
+		return "", "", err
+	}
+	defer stdinFile.Close()
+	stdoutFile, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return "", "", err
+	}
+	defer stdoutFile.Close()
+	stderrFile, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return "", "", err
+	}
+	defer stderrFile.Close()
+
+	cmd := exec.CommandContext(ctx, binary, args...)
+	cmd.Stdin = stdinFile
+	cmd.Stdout = stdoutFile
+	cmd.Stderr = stderrFile
+	return "", "", cmd.Run()
 }
 
 func commandExecResponse(label, stdout, stderr string, err error, ctx context.Context) execResponse {
