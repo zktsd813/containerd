@@ -1,0 +1,686 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"hash/crc32"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/cxlcheckpoint"
+)
+
+type vnextOwnerClientRoundTripFunc func(
+	context.Context,
+	daemonRequest,
+) (execResponse, error)
+
+func (roundTrip vnextOwnerClientRoundTripFunc) RoundTrip(
+	ctx context.Context,
+	request daemonRequest,
+) (execResponse, error) {
+	return roundTrip(ctx, request)
+}
+
+type vnextOwnerClientRecordingTransport struct {
+	rpc      *vnextOwnerRPC
+	requests []daemonRequest
+}
+
+func (transport *vnextOwnerClientRecordingTransport) RoundTrip(
+	ctx context.Context,
+	request daemonRequest,
+) (execResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return execResponse{}, err
+	}
+	transport.requests = append(transport.requests, request)
+	return runCommandWithVNextOwnerRPC(request, transport.rpc), nil
+}
+
+func TestVNextOwnerClientReserveSealCommitThroughDaemonRoundTrip(t *testing.T) {
+	environment := newVNextProducerTestEnvironment(t)
+	// The shared producer fixture creates allocation 1 while deriving its
+	// publication. Abort it, then prove that this client's reserve is the
+	// operation that creates the allocation used below.
+	if err := environment.producer.Abort(
+		context.Background(), environment.reserve.Operation); err != nil {
+		t.Fatalf("abort seed producer allocation: %v", err)
+	}
+
+	transport := &vnextOwnerClientRecordingTransport{
+		rpc: newVNextOwnerRPC(environment.service),
+	}
+	client, err := newVNextOwnerClient(transport)
+	if err != nil {
+		t.Fatalf("create strict Owner client: %v", err)
+	}
+	reserveRequest := vnextOwnerReserveRequest{
+		RequestID:    "owner-client-reserve-request",
+		CheckpointID: "owner-client-checkpoint",
+		ProducerID:   "owner-client-producer",
+		OwnerID:      environment.reserve.Operation.OwnerID,
+		OwnerEpoch:   environment.reserve.Operation.OwnerEpoch,
+		MaxExtents:   2,
+		Contents:     make([]vnextOwnerReserveContent, len(environment.reserve.Contents)),
+	}
+	for index, content := range environment.reserve.Contents {
+		reserveRequest.Contents[index] = vnextOwnerReserveContent{
+			Kind:          content.Kind,
+			ObjectID:      content.ObjectID,
+			ByteLength:    content.ByteLength,
+			CapacityPages: content.PageCount,
+		}
+	}
+	reserved, err := client.Reserve(context.Background(), reserveRequest)
+	if err != nil {
+		t.Fatalf("reserve through strict Owner client: %v", err)
+	}
+	if reserved.Operation.AllocationRecordID == environment.reserve.Operation.AllocationRecordID ||
+		reserved.Operation.CheckpointID != reserveRequest.CheckpointID ||
+		len(reserved.Extents) != 2 {
+		t.Fatalf("unexpected client reserve response: %#v", reserved)
+	}
+
+	publication, sidecars := vnextOwnerClientPublicationForReserve(
+		t, environment, reserved)
+	producer, err := newVNextFileBackedProducer(environment.service.directory, client)
+	if err != nil {
+		t.Fatalf("create producer with strict Owner client: %v", err)
+	}
+	sealed, err := producer.Seal(context.Background(), vnextProducerSealRequest{
+		Reserve:            reserved,
+		Publication:        publication,
+		CRCPageSidecars:    sidecars,
+		ExternalCopyEngine: vnextCRCCopyEngineCPU,
+		Sources: []vnextProducerContentSource{
+			{ObjectID: 101, Reader: bytes.NewReader(environment.payloads[101])},
+			{ObjectID: 102, Reader: bytes.NewReader(environment.payloads[102])},
+			{ObjectID: 105, Reader: bytes.NewReader(environment.payloads[105])},
+			{ObjectID: 106, Reader: bytes.NewReader(environment.payloads[106])},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seal producer through strict Owner client: %v", err)
+	}
+	transaction := environment.ownerFixture.group.journal.Transactions[reserved.Operation.AllocationRecordID]
+	if transaction == nil || transaction.State != vnextOwnerGranted {
+		t.Fatalf("client seal changed transaction before commit: %#v", transaction)
+	}
+	if sealed.Root.RootID != publication.Root.RootID ||
+		sealed.Root.ContractID != cxlcheckpoint.V6CompatibilityID {
+		t.Fatalf("client returned wrong candidate root: %#v", sealed.Root)
+	}
+	if err := producer.Commit(context.Background(), sealed); err != nil {
+		t.Fatalf("commit through strict Owner client: %v", err)
+	}
+	transaction = environment.ownerFixture.group.journal.Transactions[reserved.Operation.AllocationRecordID]
+	if transaction == nil || transaction.State != vnextOwnerCommitted {
+		t.Fatalf("client commit did not reach COMMITTED: %#v", transaction)
+	}
+
+	wantOperations := []string{
+		vnextOwnerRPCOperationReserve,
+		vnextOwnerRPCOperationSeal,
+		vnextOwnerRPCOperationCommit,
+	}
+	if len(transport.requests) != len(wantOperations) {
+		t.Fatalf("daemon round trips = %d, want %d", len(transport.requests), len(wantOperations))
+	}
+	for index, request := range transport.requests {
+		if request.Operation != wantOperations[index] ||
+			request.CommandLabel != "vnext-owner-client" || request.TimeoutMillis != 0 {
+			t.Fatalf("round trip %d has unexpected envelope: %#v", index, request)
+		}
+	}
+}
+
+func TestVNextOwnerClientRejectsNonCanonicalResponses(t *testing.T) {
+	identity := vnextOwnerOperationIdentity{
+		RequestID:          "client-response-request",
+		CheckpointID:       "client-response-checkpoint",
+		ProducerID:         "client-response-producer",
+		OwnerID:            "owner-0",
+		OwnerEpoch:         7,
+		AllocationRecordID: 19,
+	}
+	valid := vnextOwnerClientValidSealResponse(t, identity)
+	tests := []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{
+			name: "unknown-field",
+			mutate: func(raw []byte) []byte {
+				return append(append([]byte(nil), raw[:len(raw)-1]...), []byte(`,"unknown":0}`)...)
+			},
+		},
+		{
+			name: "missing-field",
+			mutate: func(raw []byte) []byte {
+				object := vnextOwnerClientJSONMap(t, raw)
+				delete(object, "operation")
+				return vnextOwnerClientMarshalJSON(t, object)
+			},
+		},
+		{
+			name: "duplicate-field",
+			mutate: func(raw []byte) []byte {
+				prefix := []byte(`{"protocol":"cxld.vnext-owner.v1",`)
+				return append(prefix, raw[1:]...)
+			},
+		},
+		{
+			name: "null-root",
+			mutate: func(raw []byte) []byte {
+				object := vnextOwnerClientJSONMap(t, raw)
+				object["root"] = nil
+				return vnextOwnerClientMarshalJSON(t, object)
+			},
+		},
+		{
+			name: "null-page-runs",
+			mutate: func(raw []byte) []byte {
+				object := vnextOwnerClientJSONMap(t, raw)
+				root := object["root"].(map[string]interface{})
+				locator := root["locator"].(map[string]interface{})
+				locator["pageRuns"] = nil
+				return vnextOwnerClientMarshalJSON(t, object)
+			},
+		},
+		{
+			name: "trailing-json",
+			mutate: func(raw []byte) []byte {
+				return append(append([]byte(nil), raw...), []byte(`{}`)...)
+			},
+		},
+		{
+			name: "uppercase-digest",
+			mutate: func(raw []byte) []byte {
+				object := vnextOwnerClientJSONMap(t, raw)
+				root := object["root"].(map[string]interface{})
+				root["deviceTableDigest"] = strings.Repeat("A", 64)
+				return vnextOwnerClientMarshalJSON(t, object)
+			},
+		},
+		{
+			name: "wrong-locator-coverage",
+			mutate: func(raw []byte) []byte {
+				object := vnextOwnerClientJSONMap(t, raw)
+				root := object["root"].(map[string]interface{})
+				locator := root["locator"].(map[string]interface{})
+				locator["publicationByteLength"] = float64(cxlcheckpoint.PageSize + 1)
+				return vnextOwnerClientMarshalJSON(t, object)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload := test.mutate(append([]byte(nil), valid...))
+			client, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+				func(context.Context, daemonRequest) (execResponse, error) {
+					return execResponse{
+						Ok:        true,
+						Operation: vnextOwnerRPCOperationSeal,
+						Stdout:    string(payload),
+					}, nil
+				}))
+			if err != nil {
+				t.Fatalf("create malformed-response client: %v", err)
+			}
+			if _, err := client.SealVNextCheckpoint(
+				context.Background(), vnextOwnerClientTestSealRequest(identity)); err == nil {
+				t.Fatal("malformed strict Owner response was accepted")
+			}
+		})
+	}
+}
+
+func TestVNextOwnerClientPreservesRemoteErrorCodeAndMandatoryRequest(t *testing.T) {
+	identity := vnextOwnerOperationIdentity{
+		RequestID:          "client-error-request",
+		CheckpointID:       "client-error-checkpoint",
+		ProducerID:         "client-error-producer",
+		OwnerID:            "owner-0",
+		OwnerEpoch:         7,
+		AllocationRecordID: 41,
+	}
+	var captured daemonRequest
+	client, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+		func(_ context.Context, request daemonRequest) (execResponse, error) {
+			captured = request
+			return execResponse{
+				Ok:        false,
+				Operation: request.Operation,
+				Error:     "Owner has no free content pages",
+				ErrorCode: string(vnextOwnerServiceNoSpace),
+			}, nil
+		}))
+	if err != nil {
+		t.Fatalf("create remote-error client: %v", err)
+	}
+	err = client.CommitVNextCheckpoint(context.Background(), identity)
+	var remote *vnextOwnerClientRemoteError
+	if !errors.As(err, &remote) || remote.ErrorCode != string(vnextOwnerServiceNoSpace) ||
+		remote.Message != "Owner has no free content pages" {
+		t.Fatalf("remote error did not preserve code/message: %#v / %v", remote, err)
+	}
+	if captured.Operation != vnextOwnerRPCOperationCommit ||
+		len(captured.VNextOwnerCommit) == 0 || len(captured.VNextOwnerAbort) != 0 ||
+		captured.TimeoutMillis != 0 {
+		t.Fatalf("captured lifecycle envelope is invalid: %#v", captured)
+	}
+	var wire vnextOwnerRPCLifecycleRequest
+	if err := decodeStrictVNextOwnerRPC(captured.VNextOwnerCommit, &wire); err != nil {
+		t.Fatalf("client did not encode a mandatory-field lifecycle payload: %v", err)
+	}
+	if wire.Protocol != vnextOwnerRPCProtocol || wire.Identity.internal() != identity {
+		t.Fatalf("encoded lifecycle identity differs: %#v", wire)
+	}
+}
+
+func TestVNextOwnerClientCancellationAndTransportFailure(t *testing.T) {
+	identity := vnextOwnerOperationIdentity{
+		RequestID:          "client-cancel-request",
+		CheckpointID:       "client-cancel-checkpoint",
+		ProducerID:         "client-cancel-producer",
+		OwnerID:            "owner-0",
+		OwnerEpoch:         7,
+		AllocationRecordID: 42,
+	}
+	t.Run("cancelled-before-round-trip", func(t *testing.T) {
+		calls := 0
+		client, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+			func(context.Context, daemonRequest) (execResponse, error) {
+				calls++
+				return execResponse{}, nil
+			}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := client.AbortVNextCheckpoint(ctx, identity); !errors.Is(err, context.Canceled) {
+			t.Fatalf("pre-cancelled client returned %v", err)
+		}
+		if calls != 0 {
+			t.Fatalf("pre-cancelled client made %d transport calls", calls)
+		}
+	})
+
+	t.Run("cancelled-during-round-trip", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		client, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+			func(context.Context, daemonRequest) (execResponse, error) {
+				cancel()
+				wire := vnextOwnerRPCLifecycleResponse{
+					Protocol:  vnextOwnerRPCProtocol,
+					Operation: vnextOwnerRPCOperationAbort,
+					State:     "ABORTED",
+				}
+				payload, _ := json.Marshal(wire)
+				return execResponse{
+					Ok:        true,
+					Operation: vnextOwnerRPCOperationAbort,
+					Stdout:    string(payload),
+				}, nil
+			}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.AbortVNextCheckpoint(ctx, identity); !errors.Is(err, context.Canceled) {
+			t.Fatalf("mid-flight cancellation returned %v", err)
+		}
+	})
+
+	t.Run("transport-error", func(t *testing.T) {
+		transportFailure := errors.New("framed transport unavailable")
+		client, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+			func(context.Context, daemonRequest) (execResponse, error) {
+				return execResponse{}, transportFailure
+			}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.CommitVNextCheckpoint(
+			context.Background(), identity); !errors.Is(err, transportFailure) {
+			t.Fatalf("transport error was not preserved: %v", err)
+		}
+	})
+}
+
+func TestVNextOwnerClientRejectsOutgoingIdentityBeforeTransport(t *testing.T) {
+	validIdentity := vnextOwnerOperationIdentity{
+		RequestID:          "client-identity-request",
+		CheckpointID:       "client-identity-checkpoint",
+		ProducerID:         "client-identity-producer",
+		OwnerID:            "owner-0",
+		OwnerEpoch:         7,
+		AllocationRecordID: 43,
+	}
+	tests := []struct {
+		name string
+		run  func(*vnextOwnerClient) error
+	}{
+		{
+			name: "seal-surrounding-whitespace",
+			run: func(client *vnextOwnerClient) error {
+				identity := validIdentity
+				identity.RequestID = " client-identity-request"
+				_, err := client.SealVNextCheckpoint(
+					context.Background(), vnextOwnerClientTestSealRequest(identity))
+				return err
+			},
+		},
+		{
+			name: "commit-invalid-utf8",
+			run: func(client *vnextOwnerClient) error {
+				identity := validIdentity
+				identity.ProducerID = string([]byte{0xff})
+				return client.CommitVNextCheckpoint(context.Background(), identity)
+			},
+		},
+		{
+			name: "reserve-control-character",
+			run: func(client *vnextOwnerClient) error {
+				_, err := client.Reserve(context.Background(), vnextOwnerReserveRequest{
+					RequestID:    "identity-reserve-request",
+					CheckpointID: "identity\nreserve-checkpoint",
+					ProducerID:   "identity-reserve-producer",
+					OwnerID:      "owner-0",
+					OwnerEpoch:   7,
+					Contents: []vnextOwnerReserveContent{
+						{
+							Kind:          vnextOwnerServiceContentMemory,
+							ObjectID:      1,
+							ByteLength:    cxlcheckpoint.PageSize,
+							CapacityPages: 1,
+						},
+						{
+							Kind:          vnextOwnerServiceContentPublication,
+							ObjectID:      2,
+							ByteLength:    cxlcheckpoint.PageSize,
+							CapacityPages: 1,
+						},
+					},
+					MaxExtents: 1,
+				})
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			client, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+				func(context.Context, daemonRequest) (execResponse, error) {
+					calls++
+					return execResponse{}, nil
+				}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := test.run(client); err == nil {
+				t.Fatal("invalid outgoing identity was accepted")
+			}
+			if calls != 0 {
+				t.Fatalf("invalid outgoing identity made %d transport calls", calls)
+			}
+		})
+	}
+}
+
+func TestVNextOwnerClientReserveRejectsAdjacentSameDeviceExtents(t *testing.T) {
+	request := vnextOwnerReserveRequest{
+		RequestID:    "client-adjacent-request",
+		CheckpointID: "client-adjacent-checkpoint",
+		ProducerID:   "client-adjacent-producer",
+		OwnerID:      "owner-0",
+		OwnerEpoch:   7,
+		Contents: []vnextOwnerReserveContent{
+			{
+				Kind:          vnextOwnerServiceContentMemory,
+				ObjectID:      1,
+				ByteLength:    2 * cxlcheckpoint.PageSize,
+				CapacityPages: 2,
+			},
+			{
+				Kind:          vnextOwnerServiceContentPublication,
+				ObjectID:      2,
+				ByteLength:    cxlcheckpoint.PageSize,
+				CapacityPages: 1,
+			},
+		},
+		MaxExtents: 2,
+	}
+	internal, err := request.internal()
+	if err != nil {
+		t.Fatalf("build adjacent-extent request: %v", err)
+	}
+	wire := vnextOwnerRPCReserveResponse{
+		Protocol:  vnextOwnerRPCProtocol,
+		Operation: vnextOwnerRPCOperationReserve,
+		Identity: vnextOwnerRPCOperationIdentity{
+			RequestID:          request.RequestID,
+			CheckpointID:       request.CheckpointID,
+			ProducerID:         request.ProducerID,
+			OwnerID:            request.OwnerID,
+			OwnerEpoch:         request.OwnerEpoch,
+			AllocationRecordID: 1,
+		},
+		TotalPages: 3,
+		Contents: []vnextOwnerRPCPortableContent{
+			{
+				Kind:             "memory",
+				ObjectID:         1,
+				ByteLength:       2 * cxlcheckpoint.PageSize,
+				LogicalPageStart: 0,
+				PageCount:        2,
+			},
+			{
+				Kind:             "publication",
+				ObjectID:         2,
+				ByteLength:       cxlcheckpoint.PageSize,
+				LogicalPageStart: 2,
+				PageCount:        1,
+			},
+		},
+		Extents: []vnextOwnerRPCPortableExtent{
+			{
+				DeviceUUID:         "client-adjacent-device",
+				StartDataPageIndex: 10,
+				PageCount:          1,
+				LogicalPageStart:   0,
+			},
+			{
+				DeviceUUID:         "client-adjacent-device",
+				StartDataPageIndex: 11,
+				PageCount:          2,
+				LogicalPageStart:   1,
+			},
+		},
+		Devices: []vnextOwnerRPCPortableDevice{{
+			DeviceUUID:        "client-adjacent-device",
+			DataPageCount:     128,
+			ContentRegionBase: 4096,
+		}},
+	}
+	if _, err := convertVNextOwnerClientReserveResponse(
+		request, internal, wire); err == nil ||
+		!strings.Contains(err.Error(), "not coalesced") {
+		t.Fatalf("adjacent same-device extents returned %v", err)
+	}
+}
+
+func vnextOwnerClientPublicationForReserve(
+	t *testing.T,
+	environment *vnextProducerTestEnvironment,
+	reserve vnextOwnerReserveResponse,
+) (cxlcheckpoint.Publication, map[uint32][]byte) {
+	t.Helper()
+	encoded, err := cxlcheckpoint.Encode(environment.publication)
+	if err != nil {
+		t.Fatalf("clone source publication: %v", err)
+	}
+	publication, err := cxlcheckpoint.Decode(encoded)
+	if err != nil {
+		t.Fatalf("decode cloned publication: %v", err)
+	}
+	publication.CheckpointID = reserve.Operation.CheckpointID
+	publication.ContentObjects = publication.ContentObjects[:0]
+	for _, content := range reserve.Contents {
+		kind, ok := vnextProducerTestPortableKind(content.Kind)
+		if !ok {
+			t.Fatalf("unknown client reserve content kind %d", content.Kind)
+		}
+		publication.ContentObjects = append(publication.ContentObjects, cxlcheckpoint.ContentObject{
+			ObjectID:         content.ObjectID,
+			Kind:             kind,
+			ByteLength:       content.ByteLength,
+			LogicalPageStart: content.LogicalPageStart,
+			PageCount:        content.PageCount,
+		})
+	}
+	publication.Devices = publication.Devices[:0]
+	for _, device := range reserve.Devices {
+		publication.Devices = append(publication.Devices, cxlcheckpoint.Device{
+			DeviceUUID:    device.DeviceUUID,
+			OwnerID:       reserve.Operation.OwnerID,
+			OwnerEpoch:    reserve.Operation.OwnerEpoch,
+			DataPageCount: device.DataPageCount,
+		})
+	}
+	publication.Allocation = cxlcheckpoint.InitialAllocation{
+		OwnerID:            reserve.Operation.OwnerID,
+		OwnerEpoch:         reserve.Operation.OwnerEpoch,
+		AllocationRecordID: reserve.Operation.AllocationRecordID,
+		TotalPages:         reserve.TotalPages,
+	}
+	for _, extent := range reserve.Extents {
+		publication.Allocation.Extents = append(
+			publication.Allocation.Extents,
+			cxlcheckpoint.AllocationExtent{
+				DeviceUUID:         extent.DeviceUUID,
+				StartDataPageIndex: extent.StartDataPageIndex,
+				PageCount:          extent.PageCount,
+				LogicalPageStart:   extent.LogicalPageStart,
+			})
+	}
+	memoryPages := reserve.Contents[0].PageCount
+	publication.PageMap.Runs = vnextProducerMemoryRuns(
+		t, reserve, memoryPages, 17, publication.MMTemplate.VMAs[0].StartVAddr)
+	publication.MMTemplate.VMAs[0].PageMapRunCount = uint64(len(publication.PageMap.Runs))
+	publication.Root.RootID = "owner-client-root"
+	publication.Root.CheckpointID = reserve.Operation.CheckpointID
+	publication.Root.OwnerID = reserve.Operation.OwnerID
+	publication.Root.AllocationRecordID = reserve.Operation.AllocationRecordID
+	publication.Root.PublicationSequence = 10
+	digest, err := cxlcheckpoint.DeviceTableDigest(publication.Devices)
+	if err != nil {
+		t.Fatalf("digest client publication devices: %v", err)
+	}
+	publication.Root.DeviceTableDigest = digest
+	if err := publication.Validate(); err != nil {
+		t.Fatalf("validate client publication: %v", err)
+	}
+
+	sidecars := vnextTestCRCPageSidecars(t, publication, environment.service.directory)
+	data := sidecars[17]
+	for page := uint64(0); page < memoryPages; page++ {
+		offset := vnextCRCPageSidecarHeaderSize + int(page)*vnextCRCPageSidecarRecordSize
+		start := page * cxlcheckpoint.PageSize
+		checksum := crc32.Checksum(
+			environment.payloads[101][int(start):int(start+cxlcheckpoint.PageSize)],
+			vnextCRCTable)
+		binary.LittleEndian.PutUint32(data[offset+28:offset+32], checksum)
+	}
+	return publication, sidecars
+}
+
+func vnextOwnerClientValidSealResponse(
+	t *testing.T,
+	identity vnextOwnerOperationIdentity,
+) []byte {
+	t.Helper()
+	digest := strings.Repeat("00", 32)
+	wire := vnextOwnerRPCSealResponse{
+		Protocol:  vnextOwnerRPCProtocol,
+		Operation: vnextOwnerRPCOperationSeal,
+		Root: vnextOwnerRPCCheckpointRoot{
+			RootID:            "client-response-root",
+			RootVersion:       1,
+			MMTemplateID:      "client-response-mm",
+			PageMapID:         "client-response-map",
+			PageMapVersion:    1,
+			DeviceTableDigest: digest,
+			ContractID:        cxlcheckpoint.V6CompatibilityID,
+			Locator: vnextOwnerRPCRootLocator{
+				PublicationByteLength: 123,
+				PublicationSHA256:     digest,
+				PageRuns: []vnextOwnerRPCPublicationPageRun{{
+					FirstPage: vnextOwnerRPCPageID{
+						OwnerID:            identity.OwnerID,
+						DeviceID:           "client-response-device",
+						DataPageIndex:      5,
+						AllocationRecordID: identity.AllocationRecordID,
+					},
+					PageCount: 1,
+				}},
+			},
+		},
+	}
+	return vnextOwnerClientMarshalJSON(t, wire)
+}
+
+func vnextOwnerClientTestSealRequest(
+	identity vnextOwnerOperationIdentity,
+) vnextOwnerExternalSealRequest {
+	return vnextOwnerExternalSealRequest{
+		Operation:           identity,
+		PublicationEnvelope: []byte("test-publication"),
+		CRCPageSidecars: map[uint32][]byte{
+			1: []byte("test-sidecar"),
+		},
+		ExternalContentPageCRCs: []vnextExternalContentPageCRC{},
+	}
+}
+
+func vnextOwnerClientJSONMap(t *testing.T, raw []byte) map[string]interface{} {
+	t.Helper()
+	var object map[string]interface{}
+	if err := json.Unmarshal(raw, &object); err != nil {
+		t.Fatalf("decode JSON mutation object: %v", err)
+	}
+	return object
+}
+
+func vnextOwnerClientMarshalJSON(t *testing.T, value interface{}) []byte {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal Owner client test JSON: %v", err)
+	}
+	return raw
+}
+
+func TestVNextOwnerClientDigestDecoderKnownAnswer(t *testing.T) {
+	known := strings.Repeat("ab", 32)
+	digest, err := decodeCanonicalVNextOwnerClientDigest("known", known)
+	if err != nil {
+		t.Fatalf("decode known digest: %v", err)
+	}
+	want, _ := hex.DecodeString(known)
+	if !reflect.DeepEqual(digest[:], want) {
+		t.Fatalf("decoded digest differs: %x / %x", digest, want)
+	}
+	if _, err := decodeCanonicalVNextOwnerClientDigest(
+		"short", fmt.Sprintf("%062x", 1)); err == nil {
+		t.Fatal("short digest was accepted")
+	}
+}
