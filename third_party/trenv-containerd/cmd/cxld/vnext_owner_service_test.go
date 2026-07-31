@@ -437,6 +437,83 @@ func TestVNextOwnerReservationStatusReplaysExactLostGrantWithoutMutation(t *test
 	requireVNextOwnerServiceCode(t, err, vnextOwnerServiceConflict)
 }
 
+func TestVNextOwnerReservationStatusReportsDurableNoSpaceExactlyAndReadOnly(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "status-no-space", Size: 256 << 10,
+	}})
+	service := newVNextOwnerServiceForFixture(t, fixture)
+	capacity := fixture.devices[0].superblock.Geometry.DataPageCount
+	request := vnextOwnerStatusTestRequest("no-space", capacity)
+	_, err := service.reserve(request)
+	requireVNextOwnerServiceCode(t, err, vnextOwnerServiceNoSpace)
+	allocationID := fixture.group.journal.RequestIndex[request.RequestID]
+	if allocationID == 0 {
+		t.Fatal("service no-space result has no durable allocation ID")
+	}
+	beforeSequence := fixture.group.journal.SnapshotSequence
+	beforeHighWater := fixture.group.journal.NextAllocationRecordID
+	_, err = service.reserve(request)
+	requireVNextOwnerServiceCode(t, err, vnextOwnerServiceNoSpace)
+	if fixture.group.journal.SnapshotSequence != beforeSequence ||
+		fixture.group.journal.NextAllocationRecordID != beforeHighWater ||
+		fixture.group.journal.RequestIndex[request.RequestID] != allocationID {
+		t.Fatal("service duplicate no-space replay mutated or replaced its tombstone")
+	}
+	beforeFree := vnextOwnerStatusTestFreePages(fixture.group)
+	beforeImage := vnextOwnerStatusTestPersistentImage(t, fixture.group)
+	for attempt := 0; attempt < 3; attempt++ {
+		status, err := service.reservationStatus(request)
+		if err != nil {
+			t.Fatalf("read REJECTED_NO_SPACE status: %v", err)
+		}
+		if status.State != vnextOwnerReservationRejectedNoSpace || status.Grant != nil ||
+			status.Identity.RequestID != request.RequestID ||
+			status.Identity.CheckpointID != request.CheckpointID ||
+			status.Identity.ProducerID != request.ProducerID ||
+			status.Identity.OwnerID != request.OwnerID ||
+			status.Identity.OwnerEpoch != request.OwnerEpoch ||
+			status.Identity.AllocationRecordID != allocationID {
+			t.Fatalf("unexpected REJECTED_NO_SPACE status: %#v", status)
+		}
+	}
+	if fixture.group.journal.SnapshotSequence != beforeSequence ||
+		fixture.group.journal.NextAllocationRecordID != beforeHighWater ||
+		vnextOwnerStatusTestFreePages(fixture.group) != beforeFree {
+		t.Fatal("REJECTED_NO_SPACE status mutated Owner state")
+	}
+	if afterImage := vnextOwnerStatusTestPersistentImage(t, fixture.group); !bytes.Equal(afterImage, beforeImage) {
+		t.Fatal("REJECTED_NO_SPACE status changed journal, bitmap, records, or sequence")
+	}
+
+	mismatch := request
+	mismatch.Contents = append([]vnextOwnerReserveContent(nil), request.Contents...)
+	mismatch.Contents[0].ObjectID++
+	_, err = service.reservationStatus(mismatch)
+	requireVNextOwnerServiceCode(t, err, vnextOwnerServiceConflict)
+
+	fixture.reopen(t)
+	restarted := newVNextOwnerServiceForFixture(t, fixture)
+	status, err := restarted.reservationStatus(request)
+	if err != nil || status.State != vnextOwnerReservationRejectedNoSpace ||
+		status.Grant != nil || status.Identity.AllocationRecordID != allocationID {
+		t.Fatalf("REJECTED_NO_SPACE status after restart: %#v / %v", status, err)
+	}
+}
+
+func TestVNextOwnerServiceNoSpaceMetadataFailureIsUnavailable(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "service-no-space-persist-failure", Size: 256 << 10,
+	}})
+	service := newVNextOwnerServiceForFixture(t, fixture)
+	capacity := fixture.devices[0].superblock.Geometry.DataPageCount
+	fixture.group.controlSlotBytes = 1
+	_, err := service.reserve(vnextOwnerStatusTestRequest("metadata-failure", capacity))
+	requireVNextOwnerServiceCode(t, err, vnextOwnerServiceUnavailable)
+	if errors.Is(err, errVNextNoSpace) || !errors.Is(err, errVNextMetadataFull) {
+		t.Fatalf("metadata persistence failure was misclassified: %v", err)
+	}
+}
+
 func TestVNextOwnerReservationStatusConcurrentRepeatedReadsRemainPure(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
 		{UUID: "status-race-b", Size: 256 << 10},

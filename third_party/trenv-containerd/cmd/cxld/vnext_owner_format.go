@@ -27,10 +27,11 @@ const (
 	vnextOwnerReclaiming
 	vnextOwnerReclaimed
 	vnextOwnerQuarantined
+	vnextOwnerRejectedNoSpace
 )
 
 func (state vnextOwnerTransactionState) valid() bool {
-	return state >= vnextOwnerPreparing && state <= vnextOwnerQuarantined
+	return state >= vnextOwnerPreparing && state <= vnextOwnerRejectedNoSpace
 }
 
 type vnextOwnerExtent struct {
@@ -334,7 +335,8 @@ func vnextParseOwnerTransaction(decoder *vnextDecoder) (*vnextOwnerTransaction, 
 	if err != nil {
 		return nil, err
 	}
-	if fragmentCount == 0 || fragmentCount > vnextMaxExtentsPerRecord {
+	negativeTombstone := transaction.State == vnextOwnerRejectedNoSpace
+	if fragmentCount > vnextMaxExtentsPerRecord || (fragmentCount == 0) != negativeTombstone {
 		return nil, fmt.Errorf("Owner fragment count %d is invalid: %w", fragmentCount, errVNextCorrupt)
 	}
 	transaction.Fragments = make([]vnextOwnerDeviceFragment, 0, fragmentCount)
@@ -443,10 +445,14 @@ func vnextValidateOwnerTransaction(
 	if transaction.AllocationRecordID == 0 || transaction.AllocationRecordID >= uint64(math.MaxInt64) ||
 		transaction.RequestID == "" || transaction.CheckpointID == "" || transaction.ProducerID == "" ||
 		!transaction.State.valid() || transaction.TotalPages == 0 ||
-		transaction.TotalPages > uint64(math.MaxInt64) || transaction.MaxExtents == 0 ||
-		len(transaction.Fragments) == 0 {
+		transaction.TotalPages > uint64(math.MaxInt64) || transaction.MaxExtents == 0 {
 		return fmt.Errorf("Owner transaction %d has invalid identity/state: %w",
 			transaction.AllocationRecordID, errVNextCorrupt)
+	}
+	negativeTombstone := transaction.State == vnextOwnerRejectedNoSpace
+	if (len(transaction.Fragments) == 0) != negativeTombstone {
+		return fmt.Errorf("Owner transaction %d has fragments inconsistent with state %d: %w",
+			transaction.AllocationRecordID, transaction.State, errVNextCorrupt)
 	}
 	if len(transaction.RequestID) > vnextMaxIdentityBytes ||
 		len(transaction.CheckpointID) > vnextMaxIdentityBytes ||
@@ -488,57 +494,59 @@ func vnextValidateOwnerTransaction(
 		return fmt.Errorf("Owner transaction content covers %d of %d pages: %w",
 			contentLogical, transaction.TotalPages, errVNextCorrupt)
 	}
-	seenDevices := make(map[string]struct{}, len(transaction.Fragments))
-	var globalLogical uint64
-	var extentCount uint64
-	for _, fragment := range transaction.Fragments {
-		if fragment.DeviceUUID == "" || fragment.PageCount == 0 ||
-			fragment.GlobalLogicalStart != globalLogical || len(fragment.Extents) == 0 {
-			return fmt.Errorf("Owner transaction %d has invalid fragment: %w",
-				transaction.AllocationRecordID, errVNextCorrupt)
-		}
-		if _, exists := seenDevices[fragment.DeviceUUID]; exists {
-			return fmt.Errorf("Owner transaction %d repeats device %q: %w",
-				transaction.AllocationRecordID, fragment.DeviceUUID, errVNextCorrupt)
-		}
-		seenDevices[fragment.DeviceUUID] = struct{}{}
-		device := attachedDevices[fragment.DeviceUUID]
-		if attachedDevices != nil && device == nil {
-			return fmt.Errorf("Owner transaction references unattached device %q: %w",
-				fragment.DeviceUUID, errVNextWrongFormat)
-		}
-		var fragmentLogical uint64
-		var previousEnd uint64
-		for index, extent := range fragment.Extents {
-			expectedLogical, ok := vnextAdd(fragment.GlobalLogicalStart, fragmentLogical)
-			if !ok || extent.PageCount == 0 || extent.GlobalLogicalStart != expectedLogical {
-				return fmt.Errorf("Owner transaction extent has invalid logical coverage: %w", errVNextCorrupt)
+	if !negativeTombstone {
+		seenDevices := make(map[string]struct{}, len(transaction.Fragments))
+		var globalLogical uint64
+		var extentCount uint64
+		for _, fragment := range transaction.Fragments {
+			if fragment.DeviceUUID == "" || fragment.PageCount == 0 ||
+				fragment.GlobalLogicalStart != globalLogical || len(fragment.Extents) == 0 {
+				return fmt.Errorf("Owner transaction %d has invalid fragment: %w",
+					transaction.AllocationRecordID, errVNextCorrupt)
 			}
-			end, ok := vnextAdd(extent.StartDataPageIndex, extent.PageCount)
-			if !ok || (device != nil && end > device.superblock.Geometry.DataPageCount) {
-				return fmt.Errorf("Owner transaction extent exceeds device: %w", errVNextCorrupt)
+			if _, exists := seenDevices[fragment.DeviceUUID]; exists {
+				return fmt.Errorf("Owner transaction %d repeats device %q: %w",
+					transaction.AllocationRecordID, fragment.DeviceUUID, errVNextCorrupt)
 			}
-			if index > 0 && extent.StartDataPageIndex <= previousEnd {
-				return fmt.Errorf("Owner transaction extents are not canonical: %w", errVNextCorrupt)
+			seenDevices[fragment.DeviceUUID] = struct{}{}
+			device := attachedDevices[fragment.DeviceUUID]
+			if attachedDevices != nil && device == nil {
+				return fmt.Errorf("Owner transaction references unattached device %q: %w",
+					fragment.DeviceUUID, errVNextWrongFormat)
 			}
-			previousEnd = end
-			fragmentLogical, ok = vnextAdd(fragmentLogical, extent.PageCount)
+			var fragmentLogical uint64
+			var previousEnd uint64
+			for index, extent := range fragment.Extents {
+				expectedLogical, ok := vnextAdd(fragment.GlobalLogicalStart, fragmentLogical)
+				if !ok || extent.PageCount == 0 || extent.GlobalLogicalStart != expectedLogical {
+					return fmt.Errorf("Owner transaction extent has invalid logical coverage: %w", errVNextCorrupt)
+				}
+				end, ok := vnextAdd(extent.StartDataPageIndex, extent.PageCount)
+				if !ok || (device != nil && end > device.superblock.Geometry.DataPageCount) {
+					return fmt.Errorf("Owner transaction extent exceeds device: %w", errVNextCorrupt)
+				}
+				if index > 0 && extent.StartDataPageIndex <= previousEnd {
+					return fmt.Errorf("Owner transaction extents are not canonical: %w", errVNextCorrupt)
+				}
+				previousEnd = end
+				fragmentLogical, ok = vnextAdd(fragmentLogical, extent.PageCount)
+				if !ok {
+					return fmt.Errorf("Owner fragment page count overflows: %w", errVNextCorrupt)
+				}
+				extentCount++
+			}
+			if fragmentLogical != fragment.PageCount {
+				return fmt.Errorf("Owner fragment page coverage mismatch: %w", errVNextCorrupt)
+			}
+			var ok bool
+			globalLogical, ok = vnextAdd(globalLogical, fragment.PageCount)
 			if !ok {
-				return fmt.Errorf("Owner fragment page count overflows: %w", errVNextCorrupt)
+				return fmt.Errorf("Owner global logical page count overflows: %w", errVNextCorrupt)
 			}
-			extentCount++
 		}
-		if fragmentLogical != fragment.PageCount {
-			return fmt.Errorf("Owner fragment page coverage mismatch: %w", errVNextCorrupt)
+		if globalLogical != transaction.TotalPages || extentCount > uint64(transaction.MaxExtents) {
+			return fmt.Errorf("Owner transaction total/extent budget mismatch: %w", errVNextCorrupt)
 		}
-		var ok bool
-		globalLogical, ok = vnextAdd(globalLogical, fragment.PageCount)
-		if !ok {
-			return fmt.Errorf("Owner global logical page count overflows: %w", errVNextCorrupt)
-		}
-	}
-	if globalLogical != transaction.TotalPages || extentCount > uint64(transaction.MaxExtents) {
-		return fmt.Errorf("Owner transaction total/extent budget mismatch: %w", errVNextCorrupt)
 	}
 	requestContents := make([]vnextContentRequest, len(transaction.Contents))
 	for index, content := range transaction.Contents {

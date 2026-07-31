@@ -238,6 +238,34 @@ func TestVNextOwnerClientReservationStatusRecoversExactLostGrant(t *testing.T) {
 	}
 }
 
+func TestVNextOwnerClientReservationStatusAcceptsDurableNoSpace(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "client-status-no-space", Size: 256 << 10,
+	}})
+	transport := &vnextOwnerClientRecordingTransport{
+		rpc: newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture)),
+	}
+	client, err := newVNextOwnerClient(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capacity := fixture.devices[0].superblock.Geometry.DataPageCount
+	request := vnextOwnerStatusTestRequest("client-no-space", capacity)
+	if _, err := client.Reserve(context.Background(), request); err == nil {
+		t.Fatal("client no-space Reserve unexpectedly succeeded")
+	} else {
+		var remote *vnextOwnerClientRemoteError
+		if !errors.As(err, &remote) || remote.ErrorCode != string(vnextOwnerServiceNoSpace) {
+			t.Fatalf("client no-space Reserve returned %v", err)
+		}
+	}
+	status, err := client.ReservationStatus(context.Background(), request)
+	if err != nil || status.State != vnextOwnerReservationRejectedNoSpace ||
+		status.Identity.AllocationRecordID == 0 || status.Grant != nil {
+		t.Fatalf("client REJECTED_NO_SPACE status: %#v / %v", status, err)
+	}
+}
+
 func TestVNextOwnerClientReservationStatusRejectsMalformedStrictResponse(t *testing.T) {
 	request := vnextOwnerStatusTestRequest("client-malformed", 1)
 	valid := vnextOwnerRPCReservationStatusResponse{

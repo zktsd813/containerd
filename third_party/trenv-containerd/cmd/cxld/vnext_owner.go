@@ -210,12 +210,18 @@ func (group *vnextOwnerGroup) reserve(
 				"Owner request ID %q conflicts with allocation %d: %w",
 				request.RequestID, allocationID, errVNextAlreadyExists)
 		}
-		if transaction.State != vnextOwnerGranted {
+		switch transaction.State {
+		case vnextOwnerGranted:
+			return group.buildGrantLocked(transaction)
+		case vnextOwnerRejectedNoSpace:
+			return vnextOwnerWriteGrant{}, fmt.Errorf(
+				"Owner allocation %d durably rejected the exact request: %w",
+				allocationID, errVNextNoSpace)
+		default:
 			return vnextOwnerWriteGrant{}, fmt.Errorf(
 				"Owner allocation %d is state %d, not writable: %w",
 				allocationID, transaction.State, errVNextInvalidState)
 		}
-		return group.buildGrantLocked(transaction)
 	}
 	if allocationID, exists := group.journal.CheckpointIndex[request.CheckpointID]; exists {
 		return vnextOwnerWriteGrant{}, fmt.Errorf(
@@ -228,7 +234,32 @@ func (group *vnextOwnerGroup) reserve(
 	}
 	plan, err := group.planLocked(totalPages, request.MaxExtents)
 	if err != nil {
-		return vnextOwnerWriteGrant{}, err
+		if !errors.Is(err, errVNextNoSpace) {
+			return vnextOwnerWriteGrant{}, err
+		}
+		transaction := &vnextOwnerTransaction{
+			AllocationRecordID: allocationID,
+			RequestID:          request.RequestID,
+			CheckpointID:       request.CheckpointID,
+			ProducerID:         request.ProducerID,
+			RequestDigest:      digest,
+			State:              vnextOwnerRejectedNoSpace,
+			TotalPages:         totalPages,
+			MaxExtents:         request.MaxExtents,
+			Contents:           append([]vnextContentSegment(nil), segments...),
+		}
+		candidate := group.journal.clone()
+		candidate.Transactions[allocationID] = transaction
+		candidate.RequestIndex[request.RequestID] = allocationID
+		candidate.CheckpointIndex[request.CheckpointID] = allocationID
+		candidate.NextAllocationRecordID = allocationID + 1
+		if persistErr := group.persistJournalLocked(candidate); persistErr != nil {
+			return vnextOwnerWriteGrant{}, group.poisonLocked(fmt.Errorf(
+				"persist Owner REJECTED_NO_SPACE: %w", persistErr))
+		}
+		return vnextOwnerWriteGrant{}, fmt.Errorf(
+			"Owner allocation %d durably rejected the exact request: %w",
+			allocationID, errVNextNoSpace)
 	}
 	transaction := &vnextOwnerTransaction{
 		AllocationRecordID: allocationID,
@@ -1030,6 +1061,9 @@ func (group *vnextOwnerGroup) recoverTransactionsLocked() error {
 			}
 		case vnextOwnerQuarantined:
 			return fmt.Errorf("Owner allocation %d is quarantined: %w", allocationID, errVNextOwnerPoisoned)
+		case vnextOwnerRejectedNoSpace:
+			// The negative result is already terminal and owns no device pages.
+			continue
 		}
 	}
 	return nil
@@ -1037,7 +1071,20 @@ func (group *vnextOwnerGroup) recoverTransactionsLocked() error {
 
 func (group *vnextOwnerGroup) reconcileDeviceFragmentsLocked() error {
 	expected := make(map[string]map[uint64]*vnextOwnerTransaction)
+	negativeTombstones := make(map[uint64]struct{})
 	for _, transaction := range group.journal.Transactions {
+		if transaction.State == vnextOwnerRejectedNoSpace {
+			if len(transaction.Fragments) != 0 {
+				return fmt.Errorf("REJECTED_NO_SPACE Owner allocation %d has device fragments: %w",
+					transaction.AllocationRecordID, errVNextCorrupt)
+			}
+			negativeTombstones[transaction.AllocationRecordID] = struct{}{}
+			continue
+		}
+		if len(transaction.Fragments) == 0 {
+			return fmt.Errorf("Owner allocation %d has no device fragments: %w",
+				transaction.AllocationRecordID, errVNextCorrupt)
+		}
 		for _, fragment := range transaction.Fragments {
 			if expected[fragment.DeviceUUID] == nil {
 				expected[fragment.DeviceUUID] = make(map[uint64]*vnextOwnerTransaction)
@@ -1111,6 +1158,11 @@ func (group *vnextOwnerGroup) reconcileDeviceFragmentsLocked() error {
 	for deviceUUID, device := range group.devices {
 		device.allocator.mu.Lock()
 		for allocationID, record := range device.allocator.records {
+			if _, rejected := negativeTombstones[allocationID]; rejected {
+				device.allocator.mu.Unlock()
+				return fmt.Errorf("device %q has allocator record for REJECTED_NO_SPACE allocation %d: %w",
+					deviceUUID, allocationID, errVNextCorrupt)
+			}
 			transaction := expected[deviceUUID][allocationID]
 			if transaction == nil {
 				if record.State == vnextAllocationAborted || record.State == vnextAllocationReclaimed {

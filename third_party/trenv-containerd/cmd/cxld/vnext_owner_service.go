@@ -218,12 +218,13 @@ type vnextOwnerInventoryResponse struct {
 type vnextOwnerReservationState string
 
 const (
-	vnextOwnerReservationNotFound  vnextOwnerReservationState = "NOT_FOUND"
-	vnextOwnerReservationPreparing vnextOwnerReservationState = "PREPARING"
-	vnextOwnerReservationGranted   vnextOwnerReservationState = "GRANTED"
-	vnextOwnerReservationSealed    vnextOwnerReservationState = "SEALED"
-	vnextOwnerReservationCommitted vnextOwnerReservationState = "COMMITTED"
-	vnextOwnerReservationAborted   vnextOwnerReservationState = "ABORTED"
+	vnextOwnerReservationNotFound        vnextOwnerReservationState = "NOT_FOUND"
+	vnextOwnerReservationPreparing       vnextOwnerReservationState = "PREPARING"
+	vnextOwnerReservationGranted         vnextOwnerReservationState = "GRANTED"
+	vnextOwnerReservationSealed          vnextOwnerReservationState = "SEALED"
+	vnextOwnerReservationCommitted       vnextOwnerReservationState = "COMMITTED"
+	vnextOwnerReservationAborted         vnextOwnerReservationState = "ABORTED"
+	vnextOwnerReservationRejectedNoSpace vnextOwnerReservationState = "REJECTED_NO_SPACE"
 )
 
 func (state vnextOwnerReservationState) valid() bool {
@@ -233,7 +234,8 @@ func (state vnextOwnerReservationState) valid() bool {
 		vnextOwnerReservationGranted,
 		vnextOwnerReservationSealed,
 		vnextOwnerReservationCommitted,
-		vnextOwnerReservationAborted:
+		vnextOwnerReservationAborted,
+		vnextOwnerReservationRejectedNoSpace:
 		return true
 	default:
 		return false
@@ -461,6 +463,9 @@ func (service *vnextOwnerService) reservationStatus(
 		// descriptors, freed its bitmap pages, and persisted the allocator.
 		// Startup recovery replays ABORTING before this state is observable.
 		response.State = vnextOwnerReservationAborted
+		return response, nil
+	case vnextOwnerRejectedNoSpace:
+		response.State = vnextOwnerReservationRejectedNoSpace
 		return response, nil
 	case vnextOwnerGranted:
 		sealed := true
@@ -967,9 +972,12 @@ func vnextOwnerServiceWrap(operation string, err error) error {
 	case errors.Is(err, errVNextAlreadyExists):
 		return vnextOwnerServiceFailure(
 			operation, vnextOwnerServiceConflict, "request or checkpoint identity already exists", err)
-	case errors.Is(err, errVNextNoSpace), errors.Is(err, errVNextMetadataFull):
+	case errors.Is(err, errVNextNoSpace):
 		return vnextOwnerServiceFailure(
 			operation, vnextOwnerServiceNoSpace, "Owner cannot satisfy the checkpoint allocation", err)
+	case errors.Is(err, errVNextMetadataFull):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable, "Owner metadata is unavailable", err)
 	case errors.Is(err, errVNextCRCSidecar):
 		return vnextOwnerServiceFailure(
 			operation, vnextOwnerServiceSidecarInvalid, "TRCRC006 validation failed", err)

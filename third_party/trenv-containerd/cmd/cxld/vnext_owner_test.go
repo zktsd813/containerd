@@ -783,36 +783,227 @@ func TestVNextOwnerGrantOrderingIsStable(t *testing.T) {
 	}
 }
 
-func TestVNextOwnerExtentBudgetFailureIsCompletelyAtomic(t *testing.T) {
+func TestVNextOwnerNoSpaceIsDurableBeforeErrorAndLeavesAllocatorUnchanged(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
 		{UUID: "device-a", Size: 256 << 10},
 		{UUID: "device-b", Size: 256 << 10},
 	})
 	capacity := fixture.devices[0].superblock.Geometry.DataPageCount
 	request := vnextOwnerMemoryRequest("extent-budget", capacity+1, 1)
+	segments, totalPages, digest, err := fixture.group.validateOwnerRequestLocked(request)
+	if err != nil {
+		t.Fatalf("validate no-space request: %v", err)
+	}
 	beforeSequence := fixture.group.journal.SnapshotSequence
 	beforeHighWater := fixture.group.journal.NextAllocationRecordID
 	beforeFree := make(map[string]uint64)
 	beforeDeviceHighWater := make(map[string]uint64)
+	beforeDeviceImages := make([][]byte, len(fixture.deviceFiles))
 	for deviceUUID, device := range fixture.group.devices {
 		beforeFree[deviceUUID] = device.allocator.freePages()
 		beforeDeviceHighWater[deviceUUID] = device.allocator.allocationIDHighWater()
 	}
+	for index, file := range fixture.deviceFiles {
+		beforeDeviceImages[index], err = os.ReadFile(file.Name())
+		if err != nil {
+			t.Fatalf("read device image %d before no-space Reserve: %v", index, err)
+		}
+	}
 	if _, err := fixture.group.reserve(request); !errors.Is(err, errVNextNoSpace) {
 		t.Fatalf("extent-budget failure returned %v", err)
 	}
-	if fixture.group.journal.SnapshotSequence != beforeSequence ||
-		fixture.group.journal.NextAllocationRecordID != beforeHighWater {
-		t.Fatal("failed placement mutated Owner journal sequence or ID high-water")
+	if fixture.group.journal.SnapshotSequence != beforeSequence+1 ||
+		fixture.group.journal.NextAllocationRecordID != beforeHighWater+1 {
+		t.Fatal("no-space result was not durably assigned exactly one Owner record")
 	}
-	if _, exists := fixture.group.journal.RequestIndex[request.RequestID]; exists {
-		t.Fatal("failed placement created an Owner transaction")
+	allocationID := fixture.group.journal.RequestIndex[request.RequestID]
+	transaction := fixture.group.journal.Transactions[allocationID]
+	if allocationID != beforeHighWater || transaction == nil ||
+		transaction.AllocationRecordID != allocationID ||
+		transaction.RequestID != request.RequestID ||
+		transaction.CheckpointID != request.CheckpointID ||
+		transaction.ProducerID != request.ProducerID ||
+		transaction.RequestDigest != digest ||
+		transaction.State != vnextOwnerRejectedNoSpace ||
+		transaction.TotalPages != totalPages ||
+		transaction.MaxExtents != request.MaxExtents ||
+		!reflect.DeepEqual(transaction.Contents, segments) ||
+		len(transaction.Fragments) != 0 {
+		t.Fatalf("no-space tombstone is incomplete: %#v", transaction)
 	}
 	for deviceUUID, device := range fixture.group.devices {
 		if device.allocator.freePages() != beforeFree[deviceUUID] ||
 			device.allocator.allocationIDHighWater() != beforeDeviceHighWater[deviceUUID] {
-			t.Fatalf("failed placement mutated device %q", deviceUUID)
+			t.Fatalf("no-space tombstone mutated allocator counters on %q", deviceUUID)
 		}
+	}
+	for index, file := range fixture.deviceFiles {
+		after, err := os.ReadFile(file.Name())
+		if err != nil {
+			t.Fatalf("read device image %d after no-space Reserve: %v", index, err)
+		}
+		if !bytes.Equal(after, beforeDeviceImages[index]) {
+			t.Fatalf("no-space tombstone changed allocator, descriptor, or payload bytes on device %d", index)
+		}
+	}
+	reopened := fixture.reopen(t)
+	recovered := reopened.journal.Transactions[allocationID]
+	if recovered == nil || recovered.State != vnextOwnerRejectedNoSpace ||
+		recovered.RequestDigest != digest || len(recovered.Fragments) != 0 {
+		t.Fatalf("immediate restart did not recover durable no-space tombstone: %#v", recovered)
+	}
+}
+
+func TestVNextOwnerRejectedNoSpaceReplaySurvivesCapacityAndRestart(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "device-only", Size: 256 << 10,
+	}})
+	capacity := fixture.devices[0].superblock.Geometry.DataPageCount
+	fillerRequest := vnextOwnerMemoryRequest("no-space-filler", capacity, 1)
+	fillerGrant, err := fixture.group.reserve(fillerRequest)
+	if err != nil {
+		t.Fatalf("reserve capacity filler: %v", err)
+	}
+	request := vnextOwnerMemoryRequest("durable-no-space", 1, 1)
+	if _, err := fixture.group.reserve(request); !errors.Is(err, errVNextNoSpace) {
+		t.Fatalf("initial no-space Reserve returned %v", err)
+	}
+	allocationID := fixture.group.journal.RequestIndex[request.RequestID]
+	if allocationID == 0 {
+		t.Fatal("no-space Reserve did not consume a positive allocation ID")
+	}
+	if err := fixture.group.abort(fillerGrant); err != nil {
+		t.Fatalf("free capacity after no-space Reserve: %v", err)
+	}
+	if got := fixture.group.devices["device-only"].allocator.freePages(); got != capacity {
+		t.Fatalf("free capacity after filler abort = %d, want %d", got, capacity)
+	}
+	beforeSequence := fixture.group.journal.SnapshotSequence
+	beforeHighWater := fixture.group.journal.NextAllocationRecordID
+	if _, err := fixture.group.reserve(request); !errors.Is(err, errVNextNoSpace) {
+		t.Fatalf("exact retry after capacity appeared returned %v", err)
+	}
+	if fixture.group.journal.SnapshotSequence != beforeSequence ||
+		fixture.group.journal.NextAllocationRecordID != beforeHighWater ||
+		fixture.group.journal.RequestIndex[request.RequestID] != allocationID {
+		t.Fatal("exact no-space replay mutated or replaced its durable tombstone")
+	}
+
+	changedDigest := request
+	changedDigest.Contents = append([]vnextContentRequest(nil), request.Contents...)
+	changedDigest.Contents[0].ObjectID++
+	if _, err := fixture.group.reserve(changedDigest); !errors.Is(err, errVNextAlreadyExists) {
+		t.Fatalf("changed request digest returned %v", err)
+	}
+	changedIdentity := request
+	changedIdentity.RequestID += "-different"
+	if _, err := fixture.group.reserve(changedIdentity); !errors.Is(err, errVNextAlreadyExists) {
+		t.Fatalf("changed request identity for tombstoned checkpoint returned %v", err)
+	}
+
+	reopened := fixture.reopen(t)
+	beforeSequence = reopened.journal.SnapshotSequence
+	beforeHighWater = reopened.journal.NextAllocationRecordID
+	if _, err := reopened.reserve(request); !errors.Is(err, errVNextNoSpace) {
+		t.Fatalf("exact no-space retry after restart returned %v", err)
+	}
+	transaction := reopened.journal.Transactions[allocationID]
+	if transaction == nil || transaction.State != vnextOwnerRejectedNoSpace ||
+		len(transaction.Fragments) != 0 ||
+		reopened.journal.SnapshotSequence != beforeSequence ||
+		reopened.journal.NextAllocationRecordID != beforeHighWater {
+		t.Fatalf("restart changed no-space tombstone: %#v", transaction)
+	}
+}
+
+func TestVNextOwnerRejectsZeroFragmentNonTombstone(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "device-only", Size: 256 << 10,
+	}})
+	capacity := fixture.devices[0].superblock.Geometry.DataPageCount
+	request := vnextOwnerMemoryRequest("zero-fragment-format", capacity+1, 1)
+	if _, err := fixture.group.reserve(request); !errors.Is(err, errVNextNoSpace) {
+		t.Fatalf("create valid no-space tombstone: %v", err)
+	}
+	allocationID := fixture.group.journal.RequestIndex[request.RequestID]
+	transaction := fixture.group.journal.Transactions[allocationID]
+	malformedTransaction := *transaction
+	malformedTransaction.State = vnextOwnerGranted
+	if err := vnextValidateOwnerTransaction(
+		&malformedTransaction, fixture.group.devices, fixture.group.ownerID, fixture.group.ownerEpoch); !errors.Is(err, errVNextCorrupt) {
+		t.Fatalf("validator accepted zero-fragment GRANTED transaction: %v", err)
+	}
+
+	encoded, err := fixture.group.journal.marshalAtSequence(
+		fixture.group.journal.SnapshotSequence, fixture.group.devices)
+	if err != nil {
+		t.Fatalf("marshal valid no-space journal: %v", err)
+	}
+	payload, err := vnextParseEnvelope(encoded, vnextOwnerJournalMagic, vnextMaxEnvelopePayload)
+	if err != nil {
+		t.Fatalf("extract valid no-space journal payload: %v", err)
+	}
+	payload = append([]byte(nil), payload...)
+	stateOffset := 8 + 4 + len(fixture.group.ownerID) + 8 + 8 + 4 + 8
+	payload[stateOffset] = byte(vnextOwnerGranted)
+	malformed, err := vnextMarshalEnvelope(vnextOwnerJournalMagic, payload)
+	if err != nil {
+		t.Fatalf("marshal malformed zero-fragment journal: %v", err)
+	}
+	if _, err := parseVNextOwnerJournal(malformed, fixture.group.devices); !errors.Is(err, errVNextCorrupt) {
+		t.Fatalf("parser accepted zero-fragment GRANTED transaction: %v", err)
+	}
+}
+
+func TestVNextOwnerNoSpacePersistenceFailureIsUnavailableAndPoisoned(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "device-only", Size: 256 << 10,
+	}})
+	capacity := fixture.devices[0].superblock.Geometry.DataPageCount
+	request := vnextOwnerMemoryRequest("no-space-persist-failure", capacity+1, 1)
+	beforeSequence := fixture.group.journal.SnapshotSequence
+	beforeHighWater := fixture.group.journal.NextAllocationRecordID
+	beforeFree := fixture.devices[0].allocator.freePages()
+	fixture.group.controlSlotBytes = 1
+	_, err := fixture.group.reserve(request)
+	if err == nil || errors.Is(err, errVNextNoSpace) || !errors.Is(err, errVNextMetadataFull) {
+		t.Fatalf("no-space tombstone persist failure returned %v", err)
+	}
+	if fixture.group.poisoned == nil {
+		t.Fatal("ambiguous no-space tombstone persistence did not poison Owner")
+	}
+	if fixture.group.journal.SnapshotSequence != beforeSequence ||
+		fixture.group.journal.NextAllocationRecordID != beforeHighWater ||
+		len(fixture.group.journal.Transactions) != 0 ||
+		fixture.devices[0].allocator.freePages() != beforeFree {
+		t.Fatal("failed no-space tombstone persistence changed visible journal or allocator state")
+	}
+}
+
+func TestVNextOwnerNoSpaceJournalWriteFailureIsNeverDefinitive(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "device-only", Size: 256 << 10,
+	}})
+	capacity := fixture.devices[0].superblock.Geometry.DataPageCount
+	request := vnextOwnerMemoryRequest("no-space-write-failure", capacity+1, 1)
+	beforeSequence := fixture.group.journal.SnapshotSequence
+	beforeHighWater := fixture.group.journal.NextAllocationRecordID
+	beforeFree := fixture.devices[0].allocator.freePages()
+	if err := fixture.controlFile.Close(); err != nil {
+		t.Fatalf("close Owner journal before injected write failure: %v", err)
+	}
+	_, err := fixture.group.reserve(request)
+	if err == nil || errors.Is(err, errVNextNoSpace) {
+		t.Fatalf("no-space tombstone write failure returned %v", err)
+	}
+	if fixture.group.poisoned == nil {
+		t.Fatal("ambiguous no-space tombstone write did not poison Owner")
+	}
+	if fixture.group.journal.SnapshotSequence != beforeSequence ||
+		fixture.group.journal.NextAllocationRecordID != beforeHighWater ||
+		len(fixture.group.journal.Transactions) != 0 ||
+		fixture.devices[0].allocator.freePages() != beforeFree {
+		t.Fatal("failed no-space tombstone write changed visible journal or allocator state")
 	}
 }
 

@@ -282,6 +282,48 @@ func TestVNextOwnerRPCReservationStatusUsesCompleteReserveIdentityAndExactGrant(
 	}
 }
 
+func TestVNextOwnerRPCReservationStatusCarriesDurableNoSpaceWithoutGrant(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "rpc-status-no-space", Size: 256 << 10,
+	}})
+	rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+	request := vnextOwnerRPCTestReserveRequest("owner-0")
+	capacity := fixture.devices[0].superblock.Geometry.DataPageCount
+	request.RequestID = "rpc-no-space-request"
+	request.CheckpointID = "rpc-no-space-checkpoint"
+	request.ProducerID = "rpc-no-space-producer"
+	request.Contents[0].ByteLength = capacity * vnextContentPageSize
+	request.Contents[0].CapacityPages = capacity
+	raw := marshalVNextOwnerRPCTestPayload(t, request)
+	reserve := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
+		Operation:         vnextOwnerRPCOperationReserve,
+		VNextOwnerReserve: raw,
+	})
+	if reserve.Ok || reserve.ErrorCode != string(vnextOwnerServiceNoSpace) {
+		t.Fatalf("RPC no-space Reserve did not return definitive no-space: %#v", reserve)
+	}
+	beforeSequence := fixture.group.journal.SnapshotSequence
+	status := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
+		Operation:                   vnextOwnerRPCOperationReservationStatus,
+		VNextOwnerReservationStatus: raw,
+	})
+	if !status.Ok {
+		t.Fatalf("RPC REJECTED_NO_SPACE status failed: %#v", status)
+	}
+	var wire vnextOwnerRPCReservationStatusResponse
+	if err := decodeStrictVNextOwnerRPC([]byte(status.Stdout), &wire); err != nil {
+		t.Fatalf("decode RPC REJECTED_NO_SPACE status: %v", err)
+	}
+	if wire.State != string(vnextOwnerReservationRejectedNoSpace) || wire.HasGrant ||
+		wire.Identity.AllocationRecordID == 0 || wire.TotalPages != 0 ||
+		len(wire.Contents) != 0 || len(wire.Extents) != 0 || len(wire.Devices) != 0 {
+		t.Fatalf("unexpected RPC REJECTED_NO_SPACE status: %#v", wire)
+	}
+	if fixture.group.journal.SnapshotSequence != beforeSequence {
+		t.Fatal("RPC REJECTED_NO_SPACE status mutated Owner journal")
+	}
+}
+
 func TestVNextOwnerRPCReservationStatusRejectsMixedPayloadBeforeLookup(t *testing.T) {
 	wire := marshalVNextOwnerRPCTestPayload(
 		t, vnextOwnerRPCTestReserveRequest("owner-0"))
