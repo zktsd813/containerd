@@ -125,6 +125,16 @@ func validPublication(t testing.TB) Publication {
 			PublicationSequence: 1,
 		},
 	}
+	mmTemplateSize, err := canonicalMMTemplateSize(publication.MMTemplate)
+	if err != nil {
+		t.Fatalf("canonical MM template size: %v", err)
+	}
+	pageMapSize, err := canonicalPageMapSize(publication.PageMap)
+	if err != nil {
+		t.Fatalf("canonical PageMap size: %v", err)
+	}
+	publication.ContentObjects[2].ByteLength = mmTemplateSize
+	publication.ContentObjects[3].ByteLength = pageMapSize
 	refreshDeviceDigest(t, &publication)
 	if err := publication.Validate(); err != nil {
 		t.Fatalf("test publication is invalid: %v", err)
@@ -395,6 +405,72 @@ func TestMappingSlotsAreBothReservedAndRootSelectsExactObject(t *testing.T) {
 			requireInvalid(t, candidate)
 		})
 	}
+}
+
+func TestMetadataContentObjectsUseExactCanonicalByteLengths(t *testing.T) {
+	publication := validPublication(t)
+	mmSize, err := canonicalMMTemplateSize(publication.MMTemplate)
+	if err != nil {
+		t.Fatalf("MM template size: %v", err)
+	}
+	mapSize, err := canonicalPageMapSize(publication.PageMap)
+	if err != nil {
+		t.Fatalf("PageMap size: %v", err)
+	}
+	if publication.ContentObjects[2].ByteLength != mmSize {
+		t.Fatalf("MM template bytes = %d, want %d", publication.ContentObjects[2].ByteLength, mmSize)
+	}
+	if publication.ContentObjects[3].ByteLength != mapSize {
+		t.Fatalf("PageMap bytes = %d, want %d", publication.ContentObjects[3].ByteLength, mapSize)
+	}
+
+	publication.ContentObjects[2].ByteLength++
+	requireInvalid(t, publication)
+
+	publication = validPublication(t)
+	publication.ContentObjects[3].ByteLength++
+	requireInvalid(t, publication)
+}
+
+func TestOversizedCanonicalPageMapCannotUseOnePageSlot(t *testing.T) {
+	publication := validPublication(t)
+	publication.PageMap.Runs = nil
+	const runCount = 80
+	for index := uint64(0); index < runCount; index++ {
+		publication.PageMap.Runs = append(publication.PageMap.Runs, PageMapRun{
+			StartVAddr: 0x1000 + index*PageSize,
+			PageCount:  1,
+			FirstPage: PageID{
+				OwnerID:            "owner-a",
+				DeviceUUID:         "device-a",
+				AllocationRecordID: 43 + index,
+				DataPageIndex:      index,
+			},
+		})
+	}
+	publication.MMTemplate.VMAs = []VMA{{
+		StartVAddr:      0x1000,
+		EndVAddr:        0x1000 + runCount*PageSize,
+		ProtectionFlags: ProtectionRead | ProtectionWrite,
+		MappingFlags:    MappingPrivate | MappingAnonymous,
+		BackingKind:     BackingAnonymous,
+		PageMapRunStart: 0,
+		PageMapRunCount: runCount,
+	}}
+	mmSize, err := canonicalMMTemplateSize(publication.MMTemplate)
+	if err != nil {
+		t.Fatalf("MM template size: %v", err)
+	}
+	mapSize, err := canonicalPageMapSize(publication.PageMap)
+	if err != nil {
+		t.Fatalf("PageMap size: %v", err)
+	}
+	if mapSize <= PageSize {
+		t.Fatalf("test PageMap is only %d bytes", mapSize)
+	}
+	publication.ContentObjects[2].ByteLength = mmSize
+	publication.ContentObjects[3].ByteLength = mapSize
+	requireInvalid(t, publication)
 }
 
 func TestEnvelopeFailsClosed(t *testing.T) {

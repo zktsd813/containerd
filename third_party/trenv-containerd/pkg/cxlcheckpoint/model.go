@@ -472,6 +472,14 @@ func validateMMTemplate(template MMTemplate, pageMap PageMap, contents map[uint6
 	if !exists || content.Kind != ContentMMTemplate {
 		return invalidf("MM template content object %d is missing or has the wrong kind", template.ContentObjectID)
 	}
+	encodedSize, err := canonicalMMTemplateSize(template)
+	if err != nil {
+		return err
+	}
+	if content.ByteLength != encodedSize {
+		return invalidf("MM template content object byte length is %d, canonical encoding is %d",
+			content.ByteLength, encodedSize)
+	}
 	if len(template.VMAs) == 0 || len(template.VMAs) > maxCollectionElements {
 		return invalidf("VMA count %d is outside 1..%d", len(template.VMAs), maxCollectionElements)
 	}
@@ -560,6 +568,14 @@ func validatePageMap(
 	content, exists := contents[pageMap.ContentObjectID]
 	if !exists || content.Kind != ContentPageMap {
 		return invalidf("PageMap content object %d is missing or has the wrong kind", pageMap.ContentObjectID)
+	}
+	encodedSize, err := canonicalPageMapSize(pageMap)
+	if err != nil {
+		return err
+	}
+	if content.ByteLength != encodedSize {
+		return invalidf("PageMap content object byte length is %d, canonical encoding is %d",
+			content.ByteLength, encodedSize)
 	}
 	if len(pageMap.Runs) == 0 || len(pageMap.Runs) > maxCollectionElements {
 		return invalidf("PageMap run count %d is outside 1..%d", len(pageMap.Runs), maxCollectionElements)
@@ -737,7 +753,38 @@ func validateMappingSlots(slots MappingSlots, pageMap PageMap, contents map[uint
 	if pageMap.ContentObjectID != slots.A.ContentObjectID && pageMap.ContentObjectID != slots.B.ContentObjectID {
 		return invalidf("PageMap content object is not one of the reserved A/B slots")
 	}
+	active := slots.A
+	if pageMap.ContentObjectID == slots.B.ContentObjectID {
+		active = slots.B
+	}
+	encodedSize, err := canonicalPageMapSize(pageMap)
+	if err != nil {
+		return err
+	}
+	capacityBytes, ok := mulLong(active.CapacityPages, PageSize)
+	if !ok || encodedSize > capacityBytes {
+		return invalidf("PageMap canonical encoding is %d bytes, active slot capacity is %d",
+			encodedSize, capacityBytes)
+	}
 	return nil
+}
+
+func canonicalMMTemplateSize(template MMTemplate) (uint64, error) {
+	encoder := newPayloadEncoder()
+	encodeMMTemplate(encoder, template)
+	if encoder.err != nil {
+		return 0, encoder.err
+	}
+	return uint64(encoder.buffer.Len()), nil
+}
+
+func canonicalPageMapSize(pageMap PageMap) (uint64, error) {
+	encoder := newPayloadEncoder()
+	encodePageMap(encoder, pageMap)
+	if encoder.err != nil {
+		return 0, encoder.err
+	}
+	return uint64(encoder.buffer.Len()), nil
 }
 
 func validateRoot(p Publication, devices map[string]Device) error {
