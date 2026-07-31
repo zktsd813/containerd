@@ -16,11 +16,12 @@ import (
 const (
 	vnextOwnerRPCProtocol = "cxld.vnext-owner.v1"
 
-	vnextOwnerRPCOperationReserve   = "vnextOwnerReserve"
-	vnextOwnerRPCOperationSeal      = "vnextOwnerSeal"
-	vnextOwnerRPCOperationCommit    = "vnextOwnerCommit"
-	vnextOwnerRPCOperationAbort     = "vnextOwnerAbort"
-	vnextOwnerRPCOperationInventory = "vnextOwnerInventory"
+	vnextOwnerRPCOperationReserve           = "vnextOwnerReserve"
+	vnextOwnerRPCOperationSeal              = "vnextOwnerSeal"
+	vnextOwnerRPCOperationCommit            = "vnextOwnerCommit"
+	vnextOwnerRPCOperationAbort             = "vnextOwnerAbort"
+	vnextOwnerRPCOperationInventory         = "vnextOwnerInventory"
+	vnextOwnerRPCOperationReservationStatus = "vnextOwnerReservationStatus"
 
 	// JSON/base64 is intentionally limited below the 64 MiB publication codec
 	// ceiling. At 40 bytes per record, eight MiB of TRCRC006 describes roughly
@@ -42,7 +43,7 @@ const (
 	// byte needs HTML-safe JSON escaping, this count keeps both the inner
 	// inventory JSON and its escaped outer execResponse below 32 MiB.
 	vnextOwnerRPCMaxInventoryDevices = 1024
-	// The complete daemon envelope currently defines fifteen fields. Keep a
+	// The complete daemon envelope currently defines sixteen fields. Keep a
 	// little legacy headroom, but reject an attacker-controlled number of
 	// unknown or duplicate members before retaining RawMessage entries.
 	vnextOwnerRPCMaxDaemonFields = 32
@@ -113,14 +114,33 @@ type vnextOwnerRPCPortableDevice struct {
 	ContentRegionBase uint64 `json:"contentRegionBase"`
 }
 
+type vnextOwnerRPCPortableContents []vnextOwnerRPCPortableContent
+type vnextOwnerRPCPortableExtents []vnextOwnerRPCPortableExtent
+type vnextOwnerRPCPortableDevices []vnextOwnerRPCPortableDevice
+
 type vnextOwnerRPCReserveResponse struct {
 	Protocol   string                         `json:"protocol"`
 	Operation  string                         `json:"operation"`
 	Identity   vnextOwnerRPCOperationIdentity `json:"identity"`
 	TotalPages uint64                         `json:"totalPages"`
-	Contents   []vnextOwnerRPCPortableContent `json:"contents"`
-	Extents    []vnextOwnerRPCPortableExtent  `json:"extents"`
-	Devices    []vnextOwnerRPCPortableDevice  `json:"devices"`
+	Contents   vnextOwnerRPCPortableContents  `json:"contents"`
+	Extents    vnextOwnerRPCPortableExtents   `json:"extents"`
+	Devices    vnextOwnerRPCPortableDevices   `json:"devices"`
+}
+
+// ReservationStatus reuses the complete Reserve request wire. Its response
+// keeps every field mandatory: no-grant states use hasGrant=false, zero
+// placement counts, and canonical empty arrays rather than null or omission.
+type vnextOwnerRPCReservationStatusResponse struct {
+	Protocol   string                         `json:"protocol"`
+	Operation  string                         `json:"operation"`
+	State      string                         `json:"state"`
+	HasGrant   bool                           `json:"hasGrant"`
+	Identity   vnextOwnerRPCOperationIdentity `json:"identity"`
+	TotalPages uint64                         `json:"totalPages"`
+	Contents   vnextOwnerRPCPortableContents  `json:"contents"`
+	Extents    vnextOwnerRPCPortableExtents   `json:"extents"`
+	Devices    vnextOwnerRPCPortableDevices   `json:"devices"`
 }
 
 type vnextOwnerRPCSidecar struct {
@@ -368,6 +388,8 @@ func runVNextOwnerRPC(
 		return rpc.abort(raw)
 	case vnextOwnerRPCOperationInventory:
 		return rpc.inventory(raw)
+	case vnextOwnerRPCOperationReservationStatus:
+		return rpc.reservationStatus(raw)
 	default:
 		return vnextOwnerRPCErrorResponse(fmt.Errorf("unsupported VNext Owner operation %q", operation))
 	}
@@ -379,7 +401,8 @@ func isVNextOwnerRPCOperation(operation string) bool {
 		vnextOwnerRPCOperationSeal,
 		vnextOwnerRPCOperationCommit,
 		vnextOwnerRPCOperationAbort,
-		vnextOwnerRPCOperationInventory:
+		vnextOwnerRPCOperationInventory,
+		vnextOwnerRPCOperationReservationStatus:
 		return true
 	default:
 		return false
@@ -392,21 +415,22 @@ type vnextOwnerRPCRawField struct {
 }
 
 var vnextOwnerRPCDaemonFields = map[string]struct{}{
-	"commandLabel":         {},
-	"timeoutMillis":        {},
-	"operation":            {},
-	"createContainer":      {},
-	"checkpointContainer":  {},
-	"restoreIntoContainer": {},
-	"switchIntoCandidate":  {},
-	"container":            {},
-	"cleanupContainers":    {},
-	"metadataResolve":      {},
-	"vnextOwnerReserve":    {},
-	"vnextOwnerSeal":       {},
-	"vnextOwnerCommit":     {},
-	"vnextOwnerAbort":      {},
-	"vnextOwnerInventory":  {},
+	"commandLabel":                {},
+	"timeoutMillis":               {},
+	"operation":                   {},
+	"createContainer":             {},
+	"checkpointContainer":         {},
+	"restoreIntoContainer":        {},
+	"switchIntoCandidate":         {},
+	"container":                   {},
+	"cleanupContainers":           {},
+	"metadataResolve":             {},
+	"vnextOwnerReserve":           {},
+	"vnextOwnerSeal":              {},
+	"vnextOwnerCommit":            {},
+	"vnextOwnerAbort":             {},
+	"vnextOwnerInventory":         {},
+	"vnextOwnerReservationStatus": {},
 }
 
 var vnextOwnerRPCLegacyPayloadFields = map[string]struct{}{
@@ -543,6 +567,8 @@ func decodeVNextOwnerRPCDaemonEnvelope(
 			request.VNextOwnerAbort = append(json.RawMessage(nil), field.raw...)
 		case "vnextOwnerInventory":
 			request.VNextOwnerInventory = append(json.RawMessage(nil), field.raw...)
+		case "vnextOwnerReservationStatus":
+			request.VNextOwnerReservationStatus = append(json.RawMessage(nil), field.raw...)
 		}
 	}
 	if !isVNextOwnerRPCOperation(strings.TrimSpace(request.Operation)) {
@@ -580,6 +606,7 @@ func vnextOwnerRPCPayload(operation string, request daemonRequest) (json.RawMess
 		{vnextOwnerRPCOperationCommit, request.VNextOwnerCommit},
 		{vnextOwnerRPCOperationAbort, request.VNextOwnerAbort},
 		{vnextOwnerRPCOperationInventory, request.VNextOwnerInventory},
+		{vnextOwnerRPCOperationReservationStatus, request.VNextOwnerReservationStatus},
 	}
 	present := 0
 	var selected json.RawMessage
@@ -710,23 +737,34 @@ func (rpc *vnextOwnerRPC) reserve(raw json.RawMessage) execResponse {
 	if err != nil {
 		return vnextOwnerRPCErrorResponse(err)
 	}
+	wireResponse, err := vnextOwnerRPCReserveResponseWire(response)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+			"reserve",
+			vnextOwnerServiceUnavailable,
+			"Owner response cannot be represented by the strict RPC contract",
+			err))
+	}
+	return marshalVNextOwnerRPCResponse(wireResponse)
+}
+
+func vnextOwnerRPCReserveResponseWire(
+	response vnextOwnerReserveResponse,
+) (vnextOwnerRPCReserveResponse, error) {
 	wireResponse := vnextOwnerRPCReserveResponse{
 		Protocol:   vnextOwnerRPCProtocol,
 		Operation:  vnextOwnerRPCOperationReserve,
 		Identity:   vnextOwnerRPCIdentityFromInternal(response.Operation),
 		TotalPages: response.TotalPages,
-		Contents:   make([]vnextOwnerRPCPortableContent, len(response.Contents)),
-		Extents:    make([]vnextOwnerRPCPortableExtent, len(response.Extents)),
-		Devices:    make([]vnextOwnerRPCPortableDevice, len(response.Devices)),
+		Contents:   make(vnextOwnerRPCPortableContents, len(response.Contents)),
+		Extents:    make(vnextOwnerRPCPortableExtents, len(response.Extents)),
+		Devices:    make(vnextOwnerRPCPortableDevices, len(response.Devices)),
 	}
 	for index, content := range response.Contents {
 		kind, ok := vnextOwnerRPCContentKindName(content.Kind)
 		if !ok {
-			return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
-				"reserve",
-				vnextOwnerServiceUnavailable,
-				"Owner response contains an unknown content kind",
-				nil))
+			return vnextOwnerRPCReserveResponse{}, fmt.Errorf(
+				"Owner response content %d has unknown kind %d", index, content.Kind)
 		}
 		wireResponse.Contents[index] = vnextOwnerRPCPortableContent{
 			Kind:             kind,
@@ -751,7 +789,72 @@ func (rpc *vnextOwnerRPC) reserve(raw json.RawMessage) execResponse {
 			ContentRegionBase: device.ContentRegionBase,
 		}
 	}
-	return marshalVNextOwnerRPCResponse(wireResponse)
+	return wireResponse, nil
+}
+
+func (rpc *vnextOwnerRPC) reservationStatus(raw json.RawMessage) execResponse {
+	request, err := decodeVNextOwnerRPCReserveRequest(raw)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	response, err := rpc.service.reservationStatus(request)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	if !response.State.valid() ||
+		response.Identity.RequestID != request.RequestID ||
+		response.Identity.CheckpointID != request.CheckpointID ||
+		response.Identity.ProducerID != request.ProducerID ||
+		response.Identity.OwnerID != request.OwnerID ||
+		response.Identity.OwnerEpoch != request.OwnerEpoch ||
+		response.Identity.OwnerEpoch == 0 ||
+		response.Identity.OwnerEpoch > uint64(math.MaxInt64) ||
+		response.Identity.AllocationRecordID > uint64(math.MaxInt64) {
+		return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+			"reservation-status",
+			vnextOwnerServiceUnavailable,
+			"Owner status identity or state cannot be represented",
+			errVNextCorrupt))
+	}
+	wire := vnextOwnerRPCReservationStatusResponse{
+		Protocol:  vnextOwnerRPCProtocol,
+		Operation: vnextOwnerRPCOperationReservationStatus,
+		State:     string(response.State),
+		Identity:  vnextOwnerRPCIdentityFromInternal(response.Identity),
+		Contents:  make(vnextOwnerRPCPortableContents, 0),
+		Extents:   make(vnextOwnerRPCPortableExtents, 0),
+		Devices:   make(vnextOwnerRPCPortableDevices, 0),
+	}
+	grantState := response.State == vnextOwnerReservationGranted ||
+		response.State == vnextOwnerReservationSealed ||
+		response.State == vnextOwnerReservationCommitted
+	if grantState != (response.Grant != nil) ||
+		(response.State == vnextOwnerReservationNotFound &&
+			response.Identity.AllocationRecordID != 0) ||
+		(response.State != vnextOwnerReservationNotFound &&
+			response.Identity.AllocationRecordID == 0) {
+		return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+			"reservation-status",
+			vnextOwnerServiceUnavailable,
+			"Owner status grant presence is inconsistent with its durable state",
+			errVNextCorrupt))
+	}
+	if response.Grant != nil {
+		grant, err := vnextOwnerRPCReserveResponseWire(*response.Grant)
+		if err != nil || grant.Identity != wire.Identity {
+			return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+				"reservation-status",
+				vnextOwnerServiceUnavailable,
+				"Owner status grant cannot be represented",
+				err))
+		}
+		wire.HasGrant = true
+		wire.TotalPages = grant.TotalPages
+		wire.Contents = grant.Contents
+		wire.Extents = grant.Extents
+		wire.Devices = grant.Devices
+	}
+	return marshalVNextOwnerRPCResponse(wire)
 }
 
 func decodeVNextOwnerRPCReserveRequest(
@@ -1138,6 +1241,11 @@ func validateVNextOwnerRPCJSONValue(
 			limit = vnextOwnerRPCMaxExternalContentPageCRCs
 		case reflect.TypeOf(vnextOwnerRPCInventoryDevices{}):
 			limit = vnextOwnerRPCMaxInventoryDevices
+		case reflect.TypeOf(vnextOwnerRPCPortableContents{}):
+			limit = vnextOwnerRPCMaxContents
+		case reflect.TypeOf(vnextOwnerRPCPortableExtents{}),
+			reflect.TypeOf(vnextOwnerRPCPortableDevices{}):
+			limit = vnextOwnerRPCMaxExtents
 		case reflect.TypeOf(vnextOwnerGatewayRouteWires{}):
 			limit = vnextOwnerGatewayMaxRoutes
 		}

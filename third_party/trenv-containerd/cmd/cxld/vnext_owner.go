@@ -879,6 +879,26 @@ func vnextOwnerRequestDigest(request vnextCheckpointAllocationRequest) [32]byte 
 func (group *vnextOwnerGroup) buildGrantLocked(
 	transaction *vnextOwnerTransaction,
 ) (vnextOwnerWriteGrant, error) {
+	grant := group.buildGrantGeometryLocked(transaction)
+	grant.fragmentGrants = make(map[string]vnextWriteGrant, len(transaction.Fragments))
+	for _, fragment := range transaction.Fragments {
+		fragmentGrant, err := group.devices[fragment.DeviceUUID].ownerFragmentGrant(
+			transaction.CheckpointID, transaction.AllocationRecordID)
+		if err != nil {
+			return vnextOwnerWriteGrant{}, err
+		}
+		grant.fragmentGrants[fragment.DeviceUUID] = fragmentGrant
+	}
+	return grant, nil
+}
+
+// buildGrantGeometryLocked reconstructs only the immutable, producer-visible
+// placement recorded in the Owner journal. It deliberately does not recover
+// device write tokens, so it is safe for read-only status of SEALED and
+// COMMITTED transactions whose producer authority has already ended.
+func (group *vnextOwnerGroup) buildGrantGeometryLocked(
+	transaction *vnextOwnerTransaction,
+) vnextOwnerWriteGrant {
 	grant := vnextOwnerWriteGrant{
 		AllocationRecordID: transaction.AllocationRecordID,
 		RequestID:          transaction.RequestID,
@@ -887,15 +907,8 @@ func (group *vnextOwnerGroup) buildGrantLocked(
 		OwnerID:            group.ownerID,
 		OwnerEpoch:         group.ownerEpoch,
 		Contents:           append([]vnextContentSegment(nil), transaction.Contents...),
-		fragmentGrants:     make(map[string]vnextWriteGrant, len(transaction.Fragments)),
 	}
 	for _, fragment := range transaction.Fragments {
-		fragmentGrant, err := group.devices[fragment.DeviceUUID].ownerFragmentGrant(
-			transaction.CheckpointID, transaction.AllocationRecordID)
-		if err != nil {
-			return vnextOwnerWriteGrant{}, err
-		}
-		grant.fragmentGrants[fragment.DeviceUUID] = fragmentGrant
 		for _, extent := range fragment.Extents {
 			grant.Extents = append(grant.Extents, vnextOwnerPageExtentGrant{
 				DeviceUUID:         fragment.DeviceUUID,
@@ -905,7 +918,7 @@ func (group *vnextOwnerGroup) buildGrantLocked(
 			})
 		}
 	}
-	return grant, nil
+	return grant
 }
 
 func (group *vnextOwnerGroup) validateGrantLocked(

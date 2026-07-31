@@ -127,51 +127,9 @@ func (client *vnextOwnerClient) Reserve(
 	if client == nil || client.transport == nil {
 		return vnextOwnerReserveResponse{}, errors.New("VNext Owner client is unavailable")
 	}
-	for name, value := range map[string]string{
-		"request ID": request.RequestID, "checkpoint ID": request.CheckpointID,
-		"producer ID": request.ProducerID, "Owner ID": request.OwnerID,
-	} {
-		if err := validateVNextOwnerClientText(name, value); err != nil {
-			return vnextOwnerReserveResponse{}, err
-		}
-	}
-	internal, err := request.internal()
+	internal, wire, err := vnextOwnerClientReserveRequestWire(request)
 	if err != nil {
-		return vnextOwnerReserveResponse{}, fmt.Errorf("validate VNext reserve request: %w", err)
-	}
-	wire := vnextOwnerRPCReserveRequest{
-		Protocol:     vnextOwnerRPCProtocol,
-		RequestID:    request.RequestID,
-		CheckpointID: request.CheckpointID,
-		ProducerID:   request.ProducerID,
-		OwnerID:      request.OwnerID,
-		OwnerEpoch:   request.OwnerEpoch,
-		Contents:     make(vnextOwnerRPCReserveContents, len(request.Contents)),
-		MaxExtents:   request.MaxExtents,
-	}
-	var externalPages uint64
-	for index, content := range request.Contents {
-		name, ok := vnextOwnerRPCContentKindName(content.Kind)
-		if !ok {
-			return vnextOwnerReserveResponse{}, fmt.Errorf(
-				"reserve content %d has unsupported kind %d", index, content.Kind)
-		}
-		wire.Contents[index] = vnextOwnerRPCReserveContent{
-			Kind:          name,
-			ObjectID:      content.ObjectID,
-			ByteLength:    content.ByteLength,
-			CapacityPages: content.CapacityPages,
-		}
-		if content.Kind != vnextOwnerServiceContentMemory &&
-			content.Kind != vnextOwnerServiceContentPublication {
-			if content.CapacityPages >
-				uint64(vnextOwnerRPCMaxExternalContentPageCRCs)-externalPages {
-				return vnextOwnerReserveResponse{}, fmt.Errorf(
-					"producer-written non-memory reserve exceeds the RPC seal limit of %d pages",
-					vnextOwnerRPCMaxExternalContentPageCRCs)
-			}
-			externalPages += content.CapacityPages
-		}
+		return vnextOwnerReserveResponse{}, err
 	}
 	raw, err := marshalVNextOwnerClientPayload(wire)
 	if err != nil {
@@ -191,6 +149,149 @@ func (client *vnextOwnerClient) Reserve(
 		return vnextOwnerReserveResponse{}, err
 	}
 	return convertVNextOwnerClientReserveResponse(request, internal, decoded)
+}
+
+func vnextOwnerClientReserveRequestWire(
+	request vnextOwnerReserveRequest,
+) (vnextCheckpointAllocationRequest, vnextOwnerRPCReserveRequest, error) {
+	for name, value := range map[string]string{
+		"request ID": request.RequestID, "checkpoint ID": request.CheckpointID,
+		"producer ID": request.ProducerID, "Owner ID": request.OwnerID,
+	} {
+		if err := validateVNextOwnerClientText(name, value); err != nil {
+			return vnextCheckpointAllocationRequest{}, vnextOwnerRPCReserveRequest{}, err
+		}
+	}
+	internal, err := request.internal()
+	if err != nil {
+		return vnextCheckpointAllocationRequest{}, vnextOwnerRPCReserveRequest{},
+			fmt.Errorf("validate VNext reserve request: %w", err)
+	}
+	wire := vnextOwnerRPCReserveRequest{
+		Protocol:     vnextOwnerRPCProtocol,
+		RequestID:    request.RequestID,
+		CheckpointID: request.CheckpointID,
+		ProducerID:   request.ProducerID,
+		OwnerID:      request.OwnerID,
+		OwnerEpoch:   request.OwnerEpoch,
+		Contents:     make(vnextOwnerRPCReserveContents, len(request.Contents)),
+		MaxExtents:   request.MaxExtents,
+	}
+	var externalPages uint64
+	for index, content := range request.Contents {
+		name, ok := vnextOwnerRPCContentKindName(content.Kind)
+		if !ok {
+			return vnextCheckpointAllocationRequest{}, vnextOwnerRPCReserveRequest{}, fmt.Errorf(
+				"reserve content %d has unsupported kind %d", index, content.Kind)
+		}
+		wire.Contents[index] = vnextOwnerRPCReserveContent{
+			Kind:          name,
+			ObjectID:      content.ObjectID,
+			ByteLength:    content.ByteLength,
+			CapacityPages: content.CapacityPages,
+		}
+		if content.Kind != vnextOwnerServiceContentMemory &&
+			content.Kind != vnextOwnerServiceContentPublication {
+			if content.CapacityPages >
+				uint64(vnextOwnerRPCMaxExternalContentPageCRCs)-externalPages {
+				return vnextCheckpointAllocationRequest{}, vnextOwnerRPCReserveRequest{}, fmt.Errorf(
+					"producer-written non-memory reserve exceeds the RPC seal limit of %d pages",
+					vnextOwnerRPCMaxExternalContentPageCRCs)
+			}
+			externalPages += content.CapacityPages
+		}
+	}
+	return internal, wire, nil
+}
+
+// ReservationStatus recovers a possibly lost Reserve response by replaying
+// the complete original request identity and ordered allocation shape. It is
+// read-only; NOT_FOUND and PREPARING remain ambiguous and never carry a grant.
+func (client *vnextOwnerClient) ReservationStatus(
+	ctx context.Context,
+	request vnextOwnerReserveRequest,
+) (vnextOwnerReservationStatusResponse, error) {
+	if client == nil || client.transport == nil {
+		return vnextOwnerReservationStatusResponse{}, errors.New(
+			"VNext Owner client is unavailable")
+	}
+	internal, wire, err := vnextOwnerClientReserveRequestWire(request)
+	if err != nil {
+		return vnextOwnerReservationStatusResponse{}, err
+	}
+	raw, err := marshalVNextOwnerClientPayload(wire)
+	if err != nil {
+		return vnextOwnerReservationStatusResponse{}, err
+	}
+	response, err := client.roundTrip(
+		ctx,
+		vnextOwnerRPCOperationReservationStatus,
+		daemonRequest{VNextOwnerReservationStatus: raw},
+	)
+	if err != nil {
+		return vnextOwnerReservationStatusResponse{}, err
+	}
+	var decoded vnextOwnerRPCReservationStatusResponse
+	if err := decodeVNextOwnerClientSuccess(
+		response, vnextOwnerRPCOperationReservationStatus, &decoded); err != nil {
+		return vnextOwnerReservationStatusResponse{}, err
+	}
+	if decoded.Protocol != vnextOwnerRPCProtocol ||
+		decoded.Operation != vnextOwnerRPCOperationReservationStatus {
+		return vnextOwnerReservationStatusResponse{}, fmt.Errorf(
+			"reservation status has protocol/operation %q/%q",
+			decoded.Protocol, decoded.Operation)
+	}
+	state := vnextOwnerReservationState(decoded.State)
+	if !state.valid() {
+		return vnextOwnerReservationStatusResponse{}, fmt.Errorf(
+			"reservation status has unknown state %q", decoded.State)
+	}
+	identity := decoded.Identity.internal()
+	if identity.RequestID != request.RequestID ||
+		identity.CheckpointID != request.CheckpointID ||
+		identity.ProducerID != request.ProducerID ||
+		identity.OwnerID != request.OwnerID ||
+		identity.OwnerEpoch != request.OwnerEpoch ||
+		identity.AllocationRecordID > uint64(math.MaxInt64) {
+		return vnextOwnerReservationStatusResponse{}, errors.New(
+			"reservation status identity does not match the exact request")
+	}
+	grantState := state == vnextOwnerReservationGranted ||
+		state == vnextOwnerReservationSealed ||
+		state == vnextOwnerReservationCommitted
+	if decoded.HasGrant != grantState ||
+		(state == vnextOwnerReservationNotFound && identity.AllocationRecordID != 0) ||
+		(state != vnextOwnerReservationNotFound && identity.AllocationRecordID == 0) {
+		return vnextOwnerReservationStatusResponse{}, errors.New(
+			"reservation status grant presence or allocation identity is inconsistent")
+	}
+	result := vnextOwnerReservationStatusResponse{State: state, Identity: identity}
+	if !decoded.HasGrant {
+		if decoded.TotalPages != 0 || len(decoded.Contents) != 0 ||
+			len(decoded.Extents) != 0 || len(decoded.Devices) != 0 {
+			return vnextOwnerReservationStatusResponse{}, errors.New(
+				"reservation status without a grant contains placement data")
+		}
+		return result, nil
+	}
+	grant, err := convertVNextOwnerClientReserveResponse(
+		request,
+		internal,
+		vnextOwnerRPCReserveResponse{
+			Protocol:   vnextOwnerRPCProtocol,
+			Operation:  vnextOwnerRPCOperationReserve,
+			Identity:   decoded.Identity,
+			TotalPages: decoded.TotalPages,
+			Contents:   decoded.Contents,
+			Extents:    decoded.Extents,
+			Devices:    decoded.Devices,
+		})
+	if err != nil {
+		return vnextOwnerReservationStatusResponse{}, err
+	}
+	result.Grant = &grant
+	return result, nil
 }
 
 func (client *vnextOwnerClient) SealVNextCheckpoint(

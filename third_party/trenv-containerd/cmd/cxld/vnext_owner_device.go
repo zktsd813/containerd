@@ -110,6 +110,98 @@ func (d *vnextPersistentDevice) validateOwnerFragmentSealed(
 	return d.validateSealedRecordLocked(record, true)
 }
 
+// ownerFragmentSealStatus distinguishes an ordinary in-progress GRANTED
+// fragment from a fully SEALED fragment without changing allocator,
+// descriptor, payload, or snapshot state. A RESERVED descriptor must still
+// match the durable allocation exactly; any other mismatch is corruption, not
+// an excuse to downgrade the status to GRANTED.
+func (d *vnextPersistentDevice) ownerFragmentSealStatus(
+	checkpointID string,
+	allocationRecordID uint64,
+) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.checkUsableLocked(); err != nil {
+		return false, err
+	}
+	record, ok := d.allocator.lookup(checkpointID)
+	if !ok || record.AllocationRecordID != allocationRecordID {
+		return false, fmt.Errorf("Owner fragment does not exist: %w", errVNextCorrupt)
+	}
+	if record.State == vnextAllocationCommitted {
+		return true, nil
+	}
+	if record.State != vnextAllocationReserved {
+		return false, fmt.Errorf(
+			"Owner fragment is state %d, expected RESERVED: %w",
+			record.State, errVNextCorrupt)
+	}
+
+	allSealed := true
+	for logicalPage := uint64(0); logicalPage < record.TotalPages; logicalPage++ {
+		dataPage, err := vnextRecordPhysicalPage(&record, logicalPage)
+		if err != nil {
+			return false, err
+		}
+		segment, err := vnextRecordContentSegment(&record, logicalPage)
+		if err != nil {
+			return false, err
+		}
+		pageWithinObject := logicalPage - segment.LogicalPageStart
+		consumed, ok := vnextMul(pageWithinObject, vnextContentPageSize)
+		if !ok {
+			return false, fmt.Errorf("content length overflow: %w", errVNextCorrupt)
+		}
+		payloadLength := vnextContentPageSize
+		if consumed < segment.ByteLength {
+			remaining := segment.ByteLength - consumed
+			if remaining < payloadLength {
+				payloadLength = remaining
+			}
+		}
+		descriptor, err := d.readDescriptorLocked(dataPage)
+		if err != nil {
+			return false, err
+		}
+		if descriptor.AllocationRecordID != record.AllocationRecordID ||
+			descriptor.OriginContentObjectID != segment.ObjectID ||
+			descriptor.LastOwnerTransactionSeq != record.OwnerTransaction ||
+			descriptor.PayloadLength != uint32(payloadLength) ||
+			descriptor.ContentKind != segment.Kind {
+			return false, fmt.Errorf(
+				"descriptor for data page %d disagrees with allocation %d: %w",
+				dataPage, allocationRecordID, errVNextCorrupt)
+		}
+		switch descriptor.State {
+		case vnextDescriptorReserved:
+			if descriptor.ContentCRC32 != 0 || descriptor.ContentReferenceCount != 0 ||
+				descriptor.Flags != 0 {
+				return false, fmt.Errorf(
+					"reserved descriptor for data page %d contains sealed metadata: %w",
+					dataPage, errVNextCorrupt)
+			}
+			allSealed = false
+		case vnextDescriptorSealed:
+			if descriptor.ContentReferenceCount != 1 || descriptor.Flags != 0 {
+				return false, fmt.Errorf(
+					"sealed descriptor for data page %d has invalid authority: %w",
+					dataPage, errVNextCorrupt)
+			}
+		default:
+			return false, fmt.Errorf(
+				"descriptor for data page %d is state %d: %w",
+				dataPage, descriptor.State, errVNextCorrupt)
+		}
+	}
+	if !allSealed {
+		return false, nil
+	}
+	if err := d.validateSealedRecordLocked(record, true); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (d *vnextPersistentDevice) validateOwnerFragmentReclaimable(
 	checkpointID string,
 	allocationRecordID uint64,

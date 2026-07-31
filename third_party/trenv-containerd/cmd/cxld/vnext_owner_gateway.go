@@ -386,6 +386,18 @@ func decodeVNextOwnerGatewayCall(
 				return err
 			},
 		}, nil
+	case vnextOwnerRPCOperationReservationStatus:
+		decoded, err := decodeVNextOwnerRPCReserveRequest(raw)
+		if err != nil {
+			return vnextOwnerGatewayCall{}, err
+		}
+		return vnextOwnerGatewayCall{
+			key: vnextOwnerGatewayRouteKey{decoded.OwnerID, decoded.OwnerEpoch},
+			invoke: func(ctx context.Context, client *vnextOwnerClient) error {
+				_, err := client.ReservationStatus(ctx, decoded)
+				return err
+			},
+		}, nil
 	case vnextOwnerRPCOperationSeal:
 		decoded, err := decodeVNextOwnerRPCSealRequest(raw)
 		if err != nil {

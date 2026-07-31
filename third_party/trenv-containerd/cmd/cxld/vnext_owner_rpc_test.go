@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -209,6 +210,89 @@ func TestVNextOwnerRPCInventoryUsesStrictDaemonFrameAndMinimalResponse(t *testin
 	if gotSequence != wantSequence || transactions != 0 {
 		t.Fatalf("inventory mutated durable Owner state: sequence=%d/%d transactions=%d",
 			gotSequence, wantSequence, transactions)
+	}
+}
+
+func TestVNextOwnerRPCReservationStatusUsesCompleteReserveIdentityAndExactGrant(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "rpc-status-device", Size: 256 << 10,
+	}})
+	rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+	wire := vnextOwnerRPCTestReserveRequest("owner-0")
+	statusRequest := daemonRequest{
+		CommandLabel: "rpc-status-test", TimeoutMillis: 0,
+		Operation:                   vnextOwnerRPCOperationReservationStatus,
+		VNextOwnerReservationStatus: marshalVNextOwnerRPCTestPayload(t, wire),
+	}
+	beforeSequence := fixture.group.journal.SnapshotSequence
+	missing := vnextOwnerRPCTestRoundTrip(t, rpc, statusRequest)
+	if !missing.Ok || missing.Operation != vnextOwnerRPCOperationReservationStatus {
+		t.Fatalf("NOT_FOUND status RPC failed: %#v", missing)
+	}
+	var missingWire vnextOwnerRPCReservationStatusResponse
+	if err := decodeStrictVNextOwnerRPC([]byte(missing.Stdout), &missingWire); err != nil {
+		t.Fatalf("decode NOT_FOUND status response: %v", err)
+	}
+	if missingWire.Protocol != vnextOwnerRPCProtocol ||
+		missingWire.Operation != vnextOwnerRPCOperationReservationStatus ||
+		missingWire.State != string(vnextOwnerReservationNotFound) ||
+		missingWire.HasGrant || missingWire.Identity.AllocationRecordID != 0 ||
+		missingWire.TotalPages != 0 || len(missingWire.Contents) != 0 ||
+		len(missingWire.Extents) != 0 || len(missingWire.Devices) != 0 {
+		t.Fatalf("unexpected NOT_FOUND status wire: %#v", missingWire)
+	}
+	if fixture.group.journal.SnapshotSequence != beforeSequence {
+		t.Fatal("NOT_FOUND status RPC mutated Owner journal")
+	}
+
+	reserve := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
+		CommandLabel: "rpc-status-test", TimeoutMillis: 0,
+		Operation:         vnextOwnerRPCOperationReserve,
+		VNextOwnerReserve: marshalVNextOwnerRPCTestPayload(t, wire),
+	})
+	if !reserve.Ok {
+		t.Fatalf("Reserve before lost response failed: %#v", reserve)
+	}
+	grantedSequence := fixture.group.journal.SnapshotSequence
+	recovered := vnextOwnerRPCTestRoundTrip(t, rpc, statusRequest)
+	if !recovered.Ok {
+		t.Fatalf("recover lost Reserve response: %#v", recovered)
+	}
+	var recoveredWire vnextOwnerRPCReservationStatusResponse
+	if err := decodeStrictVNextOwnerRPC([]byte(recovered.Stdout), &recoveredWire); err != nil {
+		t.Fatalf("decode GRANTED status response: %v", err)
+	}
+	if recoveredWire.State != string(vnextOwnerReservationGranted) ||
+		!recoveredWire.HasGrant || recoveredWire.Identity.AllocationRecordID == 0 ||
+		recoveredWire.TotalPages == 0 || len(recoveredWire.Contents) != len(wire.Contents) ||
+		len(recoveredWire.Extents) == 0 || len(recoveredWire.Devices) == 0 {
+		t.Fatalf("unexpected GRANTED status wire: %#v", recoveredWire)
+	}
+	if fixture.group.journal.SnapshotSequence != grantedSequence {
+		t.Fatal("GRANTED status RPC mutated Owner journal")
+	}
+	fields := requireVNextOwnerRPCJSONFields(
+		t, []byte(recovered.Stdout),
+		"protocol", "operation", "state", "hasGrant", "identity",
+		"totalPages", "contents", "extents", "devices")
+	if bytes.Equal(bytes.TrimSpace(fields["contents"]), []byte("null")) ||
+		bytes.Equal(bytes.TrimSpace(fields["extents"]), []byte("null")) ||
+		bytes.Equal(bytes.TrimSpace(fields["devices"]), []byte("null")) {
+		t.Fatal("status response used null for a mandatory bounded array")
+	}
+}
+
+func TestVNextOwnerRPCReservationStatusRejectsMixedPayloadBeforeLookup(t *testing.T) {
+	wire := marshalVNextOwnerRPCTestPayload(
+		t, vnextOwnerRPCTestReserveRequest("owner-0"))
+	response := runCommandWithVNextOwnerRPC(daemonRequest{
+		Operation:                   vnextOwnerRPCOperationReservationStatus,
+		VNextOwnerReservationStatus: wire,
+		VNextOwnerReserve:           wire,
+	}, nil)
+	if response.Ok || response.ErrorCode != string(vnextOwnerServiceInvalidRequest) ||
+		!strings.Contains(response.Error, "exactly one operation payload") {
+		t.Fatalf("mixed status payload was accepted: %#v", response)
 	}
 }
 

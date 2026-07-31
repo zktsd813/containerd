@@ -264,6 +264,352 @@ func mustMarshalJSON(t *testing.T, value interface{}) []byte {
 	return encoded
 }
 
+func vnextOwnerStatusTestRequest(id string, pages uint64) vnextOwnerReserveRequest {
+	return vnextOwnerReserveRequest{
+		RequestID:    "status-request-" + id,
+		CheckpointID: "status-checkpoint-" + id,
+		ProducerID:   "status-producer-" + id,
+		OwnerID:      "owner-0",
+		OwnerEpoch:   7,
+		Contents: []vnextOwnerReserveContent{
+			{
+				Kind:          vnextOwnerServiceContentMemory,
+				ObjectID:      uint64(id[0]) + 100,
+				ByteLength:    pages * vnextContentPageSize,
+				CapacityPages: pages,
+			},
+			{
+				Kind:          vnextOwnerServiceContentPublication,
+				ObjectID:      uint64(id[0]) + 200,
+				ByteLength:    vnextContentPageSize,
+				CapacityPages: 1,
+			},
+		},
+		MaxExtents: 2,
+	}
+}
+
+func vnextOwnerStatusRequestFromTransaction(
+	t *testing.T,
+	transaction *vnextOwnerTransaction,
+	ownerID string,
+	ownerEpoch uint64,
+) vnextOwnerReserveRequest {
+	t.Helper()
+	request := vnextOwnerReserveRequest{
+		RequestID:    transaction.RequestID,
+		CheckpointID: transaction.CheckpointID,
+		ProducerID:   transaction.ProducerID,
+		OwnerID:      ownerID,
+		OwnerEpoch:   ownerEpoch,
+		Contents:     make([]vnextOwnerReserveContent, len(transaction.Contents)),
+		MaxExtents:   transaction.MaxExtents,
+	}
+	for index, content := range transaction.Contents {
+		kind, ok := vnextOwnerServiceKindFromInternal(content.Kind)
+		if !ok {
+			t.Fatalf("convert status content kind %d", content.Kind)
+		}
+		request.Contents[index] = vnextOwnerReserveContent{
+			Kind:          kind,
+			ObjectID:      content.ObjectID,
+			ByteLength:    content.ByteLength,
+			CapacityPages: content.PageCount,
+		}
+	}
+	return request
+}
+
+func vnextOwnerStatusTestFreePages(group *vnextOwnerGroup) uint64 {
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	var free uint64
+	for _, deviceUUID := range group.deviceOrder {
+		free += group.devices[deviceUUID].allocator.freePages()
+	}
+	return free
+}
+
+func vnextOwnerStatusTestPersistentImage(
+	t *testing.T,
+	group *vnextOwnerGroup,
+) []byte {
+	t.Helper()
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	journal, err := group.journal.marshalAtSequence(
+		group.journal.SnapshotSequence, group.devices)
+	if err != nil {
+		t.Fatalf("marshal status-test Owner journal: %v", err)
+	}
+	image := append([]byte(nil), journal...)
+	for _, deviceUUID := range group.deviceOrder {
+		allocator := group.devices[deviceUUID].allocator
+		allocator.mu.Lock()
+		snapshot, err := allocator.marshalSnapshotLocked(
+			nil,
+			allocator.bitmap,
+			allocator.nextAllocationRecordID,
+			allocator.nextOwnerTransaction,
+			allocator.snapshotSequence)
+		allocator.mu.Unlock()
+		if err != nil {
+			t.Fatalf("marshal status-test allocator %q: %v", deviceUUID, err)
+		}
+		image = append(image, snapshot...)
+	}
+	return image
+}
+
+func TestVNextOwnerReservationStatusNotFoundIsReadOnly(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "status-not-found", Size: 256 << 10,
+	}})
+	service := newVNextOwnerServiceForFixture(t, fixture)
+	request := vnextOwnerStatusTestRequest("missing", 1)
+	beforeSequence := fixture.group.journal.SnapshotSequence
+	beforeHighWater := fixture.group.journal.NextAllocationRecordID
+	beforeFree := vnextOwnerStatusTestFreePages(fixture.group)
+	beforeImage := vnextOwnerStatusTestPersistentImage(t, fixture.group)
+	for attempt := 0; attempt < 3; attempt++ {
+		response, err := service.reservationStatus(request)
+		if err != nil {
+			t.Fatalf("read missing reservation status: %v", err)
+		}
+		if response.State != vnextOwnerReservationNotFound ||
+			response.Identity.RequestID != request.RequestID ||
+			response.Identity.CheckpointID != request.CheckpointID ||
+			response.Identity.ProducerID != request.ProducerID ||
+			response.Identity.OwnerID != request.OwnerID ||
+			response.Identity.OwnerEpoch != request.OwnerEpoch ||
+			response.Identity.AllocationRecordID != 0 || response.Grant != nil {
+			t.Fatalf("unexpected NOT_FOUND status: %#v", response)
+		}
+	}
+	if fixture.group.journal.SnapshotSequence != beforeSequence ||
+		fixture.group.journal.NextAllocationRecordID != beforeHighWater ||
+		len(fixture.group.journal.Transactions) != 0 ||
+		vnextOwnerStatusTestFreePages(fixture.group) != beforeFree {
+		t.Fatal("NOT_FOUND status mutated Owner state")
+	}
+	if afterImage := vnextOwnerStatusTestPersistentImage(t, fixture.group); !bytes.Equal(afterImage, beforeImage) {
+		t.Fatal("NOT_FOUND status changed journal, bitmap, records, or sequence")
+	}
+}
+
+func TestVNextOwnerReservationStatusReplaysExactLostGrantWithoutMutation(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
+		{UUID: "status-grant-b", Size: 256 << 10},
+		{UUID: "status-grant-a", Size: 256 << 10},
+	})
+	service := newVNextOwnerServiceForFixture(t, fixture)
+	firstCapacity := fixture.devices[0].superblock.Geometry.DataPageCount
+	request := vnextOwnerStatusTestRequest("lost-grant", firstCapacity+1)
+	reserved, err := service.reserve(request)
+	if err != nil {
+		t.Fatalf("reserve before lost response: %v", err)
+	}
+	beforeSequence := fixture.group.journal.SnapshotSequence
+	beforeHighWater := fixture.group.journal.NextAllocationRecordID
+	beforeFree := vnextOwnerStatusTestFreePages(fixture.group)
+	beforeImage := vnextOwnerStatusTestPersistentImage(t, fixture.group)
+	status, err := service.reservationStatus(request)
+	if err != nil {
+		t.Fatalf("recover lost Reserve response: %v", err)
+	}
+	if status.State != vnextOwnerReservationGranted || status.Grant == nil ||
+		!bytes.Equal(mustMarshalJSON(t, *status.Grant), mustMarshalJSON(t, reserved)) {
+		t.Fatalf("status did not replay exact grant: %#v / %#v", status, reserved)
+	}
+	if fixture.group.journal.SnapshotSequence != beforeSequence ||
+		fixture.group.journal.NextAllocationRecordID != beforeHighWater ||
+		vnextOwnerStatusTestFreePages(fixture.group) != beforeFree {
+		t.Fatal("GRANTED status mutated Owner state")
+	}
+	if afterImage := vnextOwnerStatusTestPersistentImage(t, fixture.group); !bytes.Equal(afterImage, beforeImage) {
+		t.Fatal("GRANTED status changed journal, bitmap, records, or sequence")
+	}
+
+	mismatch := request
+	mismatch.Contents = append([]vnextOwnerReserveContent(nil), request.Contents...)
+	mismatch.Contents[0].ObjectID++
+	_, err = service.reservationStatus(mismatch)
+	requireVNextOwnerServiceCode(t, err, vnextOwnerServiceConflict)
+}
+
+func TestVNextOwnerReservationStatusConcurrentRepeatedReadsRemainPure(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
+		{UUID: "status-race-b", Size: 256 << 10},
+		{UUID: "status-race-a", Size: 256 << 10},
+	})
+	service := newVNextOwnerServiceForFixture(t, fixture)
+	firstCapacity := fixture.devices[0].superblock.Geometry.DataPageCount
+	request := vnextOwnerStatusTestRequest("race", firstCapacity+1)
+	reserved, err := service.reserve(request)
+	if err != nil {
+		t.Fatalf("reserve before concurrent status: %v", err)
+	}
+	wantGrant, err := json.Marshal(reserved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeImage := vnextOwnerStatusTestPersistentImage(t, fixture.group)
+
+	const workers = 8
+	const readsPerWorker = 25
+	results := make(chan error, workers)
+	for worker := 0; worker < workers; worker++ {
+		go func() {
+			for read := 0; read < readsPerWorker; read++ {
+				status, err := service.reservationStatus(request)
+				if err != nil {
+					results <- err
+					return
+				}
+				if status.State != vnextOwnerReservationGranted || status.Grant == nil {
+					results <- errors.New("concurrent status did not return GRANTED with a grant")
+					return
+				}
+				gotGrant, err := json.Marshal(status.Grant)
+				if err != nil {
+					results <- err
+					return
+				}
+				if !bytes.Equal(gotGrant, wantGrant) {
+					results <- errors.New("concurrent status changed immutable grant geometry")
+					return
+				}
+			}
+			results <- nil
+		}()
+	}
+	for worker := 0; worker < workers; worker++ {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if afterImage := vnextOwnerStatusTestPersistentImage(t, fixture.group); !bytes.Equal(afterImage, beforeImage) {
+		t.Fatal("concurrent status changed journal, bitmap, records, or sequence")
+	}
+}
+
+func TestVNextOwnerReservationStatusPreparingRecoversToDurableFreedAborted(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
+		{UUID: "status-prepare-a", Size: 256 << 10},
+		{UUID: "status-prepare-b", Size: 256 << 10},
+	})
+	service := newVNextOwnerServiceForFixture(t, fixture)
+	firstCapacity := fixture.devices[0].superblock.Geometry.DataPageCount
+	request := vnextOwnerStatusTestRequest("prepare-crash", firstCapacity+1)
+	internal, err := request.internal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialFree := vnextOwnerStatusTestFreePages(fixture.group)
+	calls := 0
+	fixture.group.faultHook = func(stage, _ string) error {
+		if stage == vnextOwnerFailAfterPrepare {
+			calls++
+			if calls == 1 {
+				return errVNextOwnerCrashInjected
+			}
+		}
+		return nil
+	}
+	if _, err := fixture.group.reserve(internal); !errors.Is(err, errVNextOwnerCrashInjected) {
+		t.Fatalf("inject partial prepare crash: %v", err)
+	}
+	preparingSequence := fixture.group.journal.SnapshotSequence
+	preparingImage := vnextOwnerStatusTestPersistentImage(t, fixture.group)
+	preparing, err := service.reservationStatus(request)
+	if err != nil {
+		t.Fatalf("read PREPARING status: %v", err)
+	}
+	if preparing.State != vnextOwnerReservationPreparing || preparing.Grant != nil ||
+		preparing.Identity.AllocationRecordID == 0 {
+		t.Fatalf("unexpected ambiguous PREPARING status: %#v", preparing)
+	}
+	if fixture.group.journal.SnapshotSequence != preparingSequence {
+		t.Fatal("PREPARING status advanced Owner journal")
+	}
+	if afterImage := vnextOwnerStatusTestPersistentImage(t, fixture.group); !bytes.Equal(afterImage, preparingImage) {
+		t.Fatal("PREPARING status changed journal, bitmap, records, or sequence")
+	}
+
+	fixture.reopen(t)
+	restarted := newVNextOwnerServiceForFixture(t, fixture)
+	abortedImage := vnextOwnerStatusTestPersistentImage(t, fixture.group)
+	aborted, err := restarted.reservationStatus(request)
+	if err != nil {
+		t.Fatalf("read recovered ABORTED status: %v", err)
+	}
+	if aborted.State != vnextOwnerReservationAborted || aborted.Grant != nil ||
+		aborted.Identity.AllocationRecordID != preparing.Identity.AllocationRecordID {
+		t.Fatalf("unexpected recovered ABORTED status: %#v", aborted)
+	}
+	if got := vnextOwnerStatusTestFreePages(fixture.group); got != initialFree {
+		t.Fatalf("ABORTED free pages = %d, want %d", got, initialFree)
+	}
+	if afterImage := vnextOwnerStatusTestPersistentImage(t, fixture.group); !bytes.Equal(afterImage, abortedImage) {
+		t.Fatal("ABORTED status changed journal, bitmap, records, or sequence")
+	}
+	for _, device := range fixture.devices {
+		record, exists := device.allocator.lookup(request.CheckpointID)
+		if exists && record.State != vnextAllocationAborted {
+			t.Fatalf("ABORTED device record still owns pages: %#v", record)
+		}
+	}
+	fixture.reopen(t)
+	restartedAgain := newVNextOwnerServiceForFixture(t, fixture)
+	again, err := restartedAgain.reservationStatus(request)
+	if err != nil || again.State != vnextOwnerReservationAborted || again.Grant != nil {
+		t.Fatalf("ABORTED status did not survive another restart: %#v / %v", again, err)
+	}
+}
+
+func TestVNextOwnerReservationStatusDistinguishesSealedAndCommitted(t *testing.T) {
+	fixture := newVNextExternalSealTestFixture(t, vnextCRCCopyEngineCPU)
+	service := newVNextOwnerServiceForFixture(t, fixture.owner)
+	transaction := fixture.owner.group.journal.Transactions[fixture.grant.AllocationRecordID]
+	request := vnextOwnerStatusRequestFromTransaction(
+		t, transaction, fixture.grant.OwnerID, fixture.grant.OwnerEpoch)
+
+	granted, err := service.reservationStatus(request)
+	if err != nil || granted.State != vnextOwnerReservationGranted || granted.Grant == nil {
+		t.Fatalf("initial GRANTED status: %#v / %v", granted, err)
+	}
+	if err := fixture.owner.group.sealExternalCRIUOutput(
+		fixture.grant, fixture.publication, fixture.directory, fixture.cloneSidecars()); err != nil {
+		t.Fatalf("seal status memory content: %v", err)
+	}
+	fixture.sealControlPages(t)
+	sealedImage := vnextOwnerStatusTestPersistentImage(t, fixture.owner.group)
+	sealed, err := service.reservationStatus(request)
+	if err != nil || sealed.State != vnextOwnerReservationSealed || sealed.Grant == nil {
+		t.Fatalf("SEALED status: %#v / %v", sealed, err)
+	}
+	if !bytes.Equal(mustMarshalJSON(t, sealed.Grant), mustMarshalJSON(t, granted.Grant)) {
+		t.Fatal("SEALED status changed immutable grant geometry")
+	}
+	if afterImage := vnextOwnerStatusTestPersistentImage(t, fixture.owner.group); !bytes.Equal(afterImage, sealedImage) {
+		t.Fatal("SEALED status changed journal, bitmap, records, or sequence")
+	}
+	if err := fixture.owner.group.commit(fixture.grant); err != nil {
+		t.Fatalf("commit status checkpoint: %v", err)
+	}
+	committedImage := vnextOwnerStatusTestPersistentImage(t, fixture.owner.group)
+	committed, err := service.reservationStatus(request)
+	if err != nil || committed.State != vnextOwnerReservationCommitted || committed.Grant == nil {
+		t.Fatalf("COMMITTED status: %#v / %v", committed, err)
+	}
+	if !bytes.Equal(mustMarshalJSON(t, committed.Grant), mustMarshalJSON(t, granted.Grant)) {
+		t.Fatal("COMMITTED status changed immutable grant geometry")
+	}
+	if afterImage := vnextOwnerStatusTestPersistentImage(t, fixture.owner.group); !bytes.Equal(afterImage, committedImage) {
+		t.Fatal("COMMITTED status changed journal, bitmap, records, or sequence")
+	}
+}
+
 func TestVNextOwnerServiceRestartResolvesSameIdentityForAbort(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
 		{UUID: "owner-service-abort-device", Size: 256 << 10},

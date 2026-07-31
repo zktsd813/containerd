@@ -201,6 +201,106 @@ func TestVNextOwnerClientInventoryRoundTripsExactReadOnlyRequest(t *testing.T) {
 	}
 }
 
+func TestVNextOwnerClientReservationStatusRecoversExactLostGrant(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "client-status-device", Size: 256 << 10,
+	}})
+	transport := &vnextOwnerClientRecordingTransport{
+		rpc: newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture)),
+	}
+	client, err := newVNextOwnerClient(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := vnextOwnerStatusTestRequest("client", 2)
+	missing, err := client.ReservationStatus(context.Background(), request)
+	if err != nil || missing.State != vnextOwnerReservationNotFound ||
+		missing.Identity.AllocationRecordID != 0 || missing.Grant != nil {
+		t.Fatalf("client NOT_FOUND status: %#v / %v", missing, err)
+	}
+	reserved, err := client.Reserve(context.Background(), request)
+	if err != nil {
+		t.Fatalf("client Reserve before response loss: %v", err)
+	}
+	recovered, err := client.ReservationStatus(context.Background(), request)
+	if err != nil || recovered.State != vnextOwnerReservationGranted ||
+		recovered.Grant == nil ||
+		!reflect.DeepEqual(*recovered.Grant, reserved) {
+		t.Fatalf("client recovered grant: %#v, want %#v / %v", recovered, reserved, err)
+	}
+	if len(transport.requests) != 3 ||
+		transport.requests[0].Operation != vnextOwnerRPCOperationReservationStatus ||
+		len(transport.requests[0].VNextOwnerReservationStatus) == 0 ||
+		transport.requests[1].Operation != vnextOwnerRPCOperationReserve ||
+		transport.requests[2].Operation != vnextOwnerRPCOperationReservationStatus ||
+		len(transport.requests[2].VNextOwnerReservationStatus) == 0 {
+		t.Fatalf("unexpected reservation-status envelopes: %#v", transport.requests)
+	}
+}
+
+func TestVNextOwnerClientReservationStatusRejectsMalformedStrictResponse(t *testing.T) {
+	request := vnextOwnerStatusTestRequest("client-malformed", 1)
+	valid := vnextOwnerRPCReservationStatusResponse{
+		Protocol:  vnextOwnerRPCProtocol,
+		Operation: vnextOwnerRPCOperationReservationStatus,
+		State:     string(vnextOwnerReservationNotFound),
+		HasGrant:  false,
+		Identity: vnextOwnerRPCOperationIdentity{
+			RequestID: request.RequestID, CheckpointID: request.CheckpointID,
+			ProducerID: request.ProducerID, OwnerID: request.OwnerID,
+			OwnerEpoch: request.OwnerEpoch,
+		},
+		Contents: vnextOwnerRPCPortableContents{},
+		Extents:  vnextOwnerRPCPortableExtents{},
+		Devices:  vnextOwnerRPCPortableDevices{},
+	}
+	validRaw := vnextOwnerClientMarshalJSON(t, valid)
+	tests := map[string]func([]byte) []byte{
+		"unknown state": func(raw []byte) []byte {
+			object := vnextOwnerClientJSONMap(t, raw)
+			object["state"] = "MAYBE"
+			return vnextOwnerClientMarshalJSON(t, object)
+		},
+		"grant flag mismatch": func(raw []byte) []byte {
+			object := vnextOwnerClientJSONMap(t, raw)
+			object["hasGrant"] = true
+			return vnextOwnerClientMarshalJSON(t, object)
+		},
+		"null contents": func(raw []byte) []byte {
+			object := vnextOwnerClientJSONMap(t, raw)
+			object["contents"] = nil
+			return vnextOwnerClientMarshalJSON(t, object)
+		},
+		"unknown field": func(raw []byte) []byte {
+			object := vnextOwnerClientJSONMap(t, raw)
+			object["extra"] = true
+			return vnextOwnerClientMarshalJSON(t, object)
+		},
+		"trailing JSON": func(raw []byte) []byte {
+			return append(append([]byte(nil), raw...), []byte(`{}`)...)
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			client, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+				func(context.Context, daemonRequest) (execResponse, error) {
+					return execResponse{
+						Ok:        true,
+						Operation: vnextOwnerRPCOperationReservationStatus,
+						Stdout:    string(mutate(validRaw)),
+					}, nil
+				}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.ReservationStatus(
+				context.Background(), request); err == nil {
+				t.Fatal("malformed reservation status was accepted")
+			}
+		})
+	}
+}
+
 func TestVNextOwnerClientRejectsMismatchedInventoryResponses(t *testing.T) {
 	request := vnextOwnerInventoryRequest{
 		RequestID:  "client-inventory-response-request",

@@ -215,6 +215,41 @@ type vnextOwnerInventoryResponse struct {
 	Devices          []vnextOwnerInventoryDevice
 }
 
+type vnextOwnerReservationState string
+
+const (
+	vnextOwnerReservationNotFound  vnextOwnerReservationState = "NOT_FOUND"
+	vnextOwnerReservationPreparing vnextOwnerReservationState = "PREPARING"
+	vnextOwnerReservationGranted   vnextOwnerReservationState = "GRANTED"
+	vnextOwnerReservationSealed    vnextOwnerReservationState = "SEALED"
+	vnextOwnerReservationCommitted vnextOwnerReservationState = "COMMITTED"
+	vnextOwnerReservationAborted   vnextOwnerReservationState = "ABORTED"
+)
+
+func (state vnextOwnerReservationState) valid() bool {
+	switch state {
+	case vnextOwnerReservationNotFound,
+		vnextOwnerReservationPreparing,
+		vnextOwnerReservationGranted,
+		vnextOwnerReservationSealed,
+		vnextOwnerReservationCommitted,
+		vnextOwnerReservationAborted:
+		return true
+	default:
+		return false
+	}
+}
+
+// vnextOwnerReservationStatusResponse is a read-only recovery observation.
+// Identity always echoes the complete original Reserve identity. Its
+// AllocationRecordID is zero only for NOT_FOUND. Grant is present only when
+// the complete immutable placement is safe to replay.
+type vnextOwnerReservationStatusResponse struct {
+	State    vnextOwnerReservationState
+	Identity vnextOwnerOperationIdentity
+	Grant    *vnextOwnerReserveResponse
+}
+
 // vnextOwnerExternalSealRequest is the complete producer seal request. The
 // TRCRC006 map remains the memory-page evidence. ExternalContentPageCRCs must
 // cover every other producer-written page in the durable grant exactly once;
@@ -347,6 +382,125 @@ func (service *vnextOwnerService) inventory(
 		SnapshotSequence: snapshot.SnapshotSequence,
 		Devices:          append([]vnextOwnerInventoryDevice(nil), snapshot.Devices...),
 	}, nil
+}
+
+// reservationStatus does not take service.mu because group.mu is the atomic
+// Owner authority boundary. It never persists a journal or allocator
+// snapshot, advances a sequence, repairs a descriptor, or allocates a page.
+func (service *vnextOwnerService) reservationStatus(
+	request vnextOwnerReserveRequest,
+) (vnextOwnerReservationStatusResponse, error) {
+	const operation = "reservation-status"
+	if service == nil || service.group == nil {
+		return vnextOwnerReservationStatusResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable, "Owner group is not configured", nil)
+	}
+	internal, err := request.internal()
+	if err != nil {
+		return vnextOwnerReservationStatusResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceInvalidRequest, err.Error(), err)
+	}
+
+	group := service.group
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	if err := group.checkUsableLocked(); err != nil {
+		return vnextOwnerReservationStatusResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable, "Owner group is not usable", err)
+	}
+	_, _, digest, err := group.validateOwnerRequestLocked(internal)
+	if err != nil {
+		return vnextOwnerReservationStatusResponse{}, vnextOwnerServiceWrap(operation, err)
+	}
+	identity := vnextOwnerOperationIdentity{
+		RequestID:    request.RequestID,
+		CheckpointID: request.CheckpointID,
+		ProducerID:   request.ProducerID,
+		OwnerID:      request.OwnerID,
+		OwnerEpoch:   request.OwnerEpoch,
+	}
+	allocationRecordID, found := group.journal.RequestIndex[request.RequestID]
+	if !found {
+		if conflictingID, conflict := group.journal.CheckpointIndex[request.CheckpointID]; conflict {
+			return vnextOwnerReservationStatusResponse{}, vnextOwnerServiceFailure(
+				operation,
+				vnextOwnerServiceConflict,
+				fmt.Sprintf("checkpoint identity belongs to allocation %d", conflictingID),
+				errVNextAlreadyExists)
+		}
+		return vnextOwnerReservationStatusResponse{
+			State: vnextOwnerReservationNotFound, Identity: identity,
+		}, nil
+	}
+	transaction := group.journal.Transactions[allocationRecordID]
+	if transaction == nil {
+		return vnextOwnerReservationStatusResponse{}, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceUnavailable,
+			"Owner request index references a missing transaction",
+			errVNextCorrupt)
+	}
+	if transaction.RequestDigest != digest ||
+		transaction.RequestID != request.RequestID ||
+		transaction.CheckpointID != request.CheckpointID ||
+		transaction.ProducerID != request.ProducerID {
+		return vnextOwnerReservationStatusResponse{}, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceConflict,
+			"Reserve identity or ordered allocation request does not match the durable transaction",
+			errVNextAlreadyExists)
+	}
+	identity.AllocationRecordID = transaction.AllocationRecordID
+	response := vnextOwnerReservationStatusResponse{Identity: identity}
+	switch transaction.State {
+	case vnextOwnerPreparing:
+		response.State = vnextOwnerReservationPreparing
+		return response, nil
+	case vnextOwnerAborted:
+		// ABORTED is persisted only after every prepared fragment has cleared
+		// descriptors, freed its bitmap pages, and persisted the allocator.
+		// Startup recovery replays ABORTING before this state is observable.
+		response.State = vnextOwnerReservationAborted
+		return response, nil
+	case vnextOwnerGranted:
+		sealed := true
+		for _, fragment := range transaction.Fragments {
+			fragmentSealed, err := group.devices[fragment.DeviceUUID].ownerFragmentSealStatus(
+				transaction.CheckpointID, transaction.AllocationRecordID)
+			if err != nil {
+				return vnextOwnerReservationStatusResponse{}, vnextOwnerServiceFailure(
+					operation,
+					vnextOwnerServiceUnavailable,
+					"durable fragment seal status is unavailable",
+					err)
+			}
+			sealed = sealed && fragmentSealed
+		}
+		response.State = vnextOwnerReservationGranted
+		if sealed {
+			response.State = vnextOwnerReservationSealed
+		}
+	case vnextOwnerCommitted:
+		response.State = vnextOwnerReservationCommitted
+	default:
+		return vnextOwnerReservationStatusResponse{}, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceTransactionState,
+			fmt.Sprintf("durable transaction state %d is not a status-safe Reserve outcome", transaction.State),
+			errVNextInvalidState)
+	}
+
+	grant := group.buildGrantGeometryLocked(transaction)
+	portable, err := service.reserveResponse(internal, grant)
+	if err != nil {
+		return vnextOwnerReservationStatusResponse{}, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceUnavailable,
+			"durable placement cannot be represented",
+			err)
+	}
+	response.Grant = &portable
+	return response, nil
 }
 
 func (service *vnextOwnerService) reserve(

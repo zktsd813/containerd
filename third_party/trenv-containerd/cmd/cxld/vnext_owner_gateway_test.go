@@ -111,6 +111,26 @@ func vnextOwnerGatewayTestReserveDaemonRequest(
 	}
 }
 
+func vnextOwnerGatewayTestReservationStatusDaemonRequest(
+	t *testing.T,
+	request vnextOwnerReserveRequest,
+) daemonRequest {
+	t.Helper()
+	_, wire, err := vnextOwnerClientReserveRequestWire(request)
+	if err != nil {
+		t.Fatalf("validate gateway reservation-status request: %v", err)
+	}
+	raw, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("marshal gateway reservation-status request: %v", err)
+	}
+	return daemonRequest{
+		CommandLabel:                "scheduler-gateway-test",
+		Operation:                   vnextOwnerRPCOperationReservationStatus,
+		VNextOwnerReservationStatus: raw,
+	}
+}
+
 func vnextOwnerGatewayTestInventoryTransport(
 	calls *int64,
 	entered chan<- struct{},
@@ -343,10 +363,22 @@ func TestVNextOwnerGatewayUnknownAndStaleOwnersFailBeforeNetwork(t *testing.T) {
 	for _, request := range []daemonRequest{
 		vnextOwnerGatewayTestInventoryDaemonRequest(t, "unknown", 7, "unknown"),
 		vnextOwnerGatewayTestInventoryDaemonRequest(t, "owner-0", 6, "stale"),
+		vnextOwnerGatewayTestReservationStatusDaemonRequest(
+			t, func() vnextOwnerReserveRequest {
+				request := vnextOwnerStatusTestRequest("unknown-route", 1)
+				request.OwnerID = "unknown"
+				return request
+			}()),
+		vnextOwnerGatewayTestReservationStatusDaemonRequest(
+			t, func() vnextOwnerReserveRequest {
+				request := vnextOwnerStatusTestRequest("stale-route", 1)
+				request.OwnerEpoch = 6
+				return request
+			}()),
 	} {
 		response := gateway.dispatch(request)
 		if response.Ok || response.ErrorCode != string(vnextOwnerServiceIdentityMismatch) ||
-			response.Operation != vnextOwnerRPCOperationInventory || response.DurationMicros < 0 {
+			response.Operation != request.Operation || response.DurationMicros < 0 {
 			t.Fatalf("unexpected exact-route rejection: %#v", response)
 		}
 	}
@@ -513,6 +545,23 @@ func TestVNextOwnerGatewaySchedulerOnlyInventoryAndReserveUseRealMutualTLS(t *te
 	}
 	if count := vnextOwnerTLSTestTransactionCount(fixture); count != 1 {
 		t.Fatalf("remote Owner transactions = %d, want 1", count)
+	}
+	status := vnextOwnerGatewayUnixRoundTrip(
+		t, nil, gateway,
+		vnextOwnerGatewayTestReservationStatusDaemonRequest(
+			t, vnextOwnerTLSTestReserveRequest("gateway")))
+	if !status.Ok || status.Operation != vnextOwnerRPCOperationReservationStatus ||
+		status.DurationMicros < 0 {
+		t.Fatalf("gateway ReservationStatus over mTLS failed: %#v", status)
+	}
+	var statusWire vnextOwnerRPCReservationStatusResponse
+	if err := decodeStrictVNextOwnerRPC([]byte(status.Stdout), &statusWire); err != nil {
+		t.Fatalf("decode gateway ReservationStatus response: %v", err)
+	}
+	if statusWire.State != string(vnextOwnerReservationGranted) ||
+		!statusWire.HasGrant || statusWire.Identity.AllocationRecordID == 0 ||
+		len(statusWire.Extents) == 0 || len(statusWire.Devices) == 0 {
+		t.Fatalf("unexpected gateway ReservationStatus response: %#v", statusWire)
 	}
 }
 
