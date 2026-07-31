@@ -386,6 +386,22 @@ func encodeMMTemplate(encoder *payloadEncoder, template MMTemplate) {
 	}
 }
 
+func canonicalMMTemplateBytes(template MMTemplate) ([]byte, error) {
+	encoder := newPayloadEncoder()
+	encodeMMTemplate(encoder, template)
+	if encoder.err != nil {
+		return nil, encoder.err
+	}
+	return encoder.bytes(), nil
+}
+
+// CanonicalMMTemplateBytes returns the exact deterministic bytes stored in the
+// MMTemplate content object. The caller is responsible for zero-padding the
+// returned bytes to the object's reserved 4 KiB page capacity.
+func CanonicalMMTemplateBytes(template MMTemplate) ([]byte, error) {
+	return canonicalMMTemplateBytes(template)
+}
+
 func decodeMMTemplate(decoder *payloadDecoder) (MMTemplate, error) {
 	template := MMTemplate{}
 	var err error
@@ -455,6 +471,22 @@ func encodePageMap(encoder *payloadEncoder, pageMap PageMap) {
 		encoder.u64(run.FirstPage.AllocationRecordID)
 		encoder.u64(run.FirstPage.DataPageIndex)
 	}
+}
+
+func canonicalPageMapBytes(pageMap PageMap) ([]byte, error) {
+	encoder := newPayloadEncoder()
+	encodePageMap(encoder, pageMap)
+	if encoder.err != nil {
+		return nil, encoder.err
+	}
+	return encoder.bytes(), nil
+}
+
+// CanonicalPageMapBytes returns the exact deterministic bytes stored in the
+// active PageMap content object. The caller is responsible for zero-padding
+// the returned bytes to the mapping slot's reserved 4 KiB page capacity.
+func CanonicalPageMapBytes(pageMap PageMap) ([]byte, error) {
+	return canonicalPageMapBytes(pageMap)
 }
 
 func decodePageMap(decoder *payloadDecoder) (PageMap, error) {

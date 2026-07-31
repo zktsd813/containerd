@@ -739,6 +739,54 @@ func TestMetadataContentObjectsUseExactCanonicalByteLengths(t *testing.T) {
 	requireInvalid(t, publication)
 }
 
+func TestCanonicalStructuredContentBytesMatchPublishedSizes(t *testing.T) {
+	publication := validPublication(t)
+
+	mmBytes, err := CanonicalMMTemplateBytes(publication.MMTemplate)
+	if err != nil {
+		t.Fatalf("encode canonical MMTemplate bytes: %v", err)
+	}
+	mmSize, err := CanonicalMMTemplateSize(publication.MMTemplate)
+	if err != nil {
+		t.Fatalf("measure canonical MMTemplate bytes: %v", err)
+	}
+	if uint64(len(mmBytes)) != mmSize ||
+		uint64(len(mmBytes)) != publication.ContentObjects[2].ByteLength {
+		t.Fatalf("MMTemplate bytes/size/object length differ: %d/%d/%d",
+			len(mmBytes), mmSize, publication.ContentObjects[2].ByteLength)
+	}
+
+	pageMapBytes, err := CanonicalPageMapBytes(publication.PageMap)
+	if err != nil {
+		t.Fatalf("encode canonical PageMap bytes: %v", err)
+	}
+	pageMapSize, err := CanonicalPageMapSize(publication.PageMap)
+	if err != nil {
+		t.Fatalf("measure canonical PageMap bytes: %v", err)
+	}
+	if uint64(len(pageMapBytes)) != pageMapSize ||
+		uint64(len(pageMapBytes)) != publication.ContentObjects[3].ByteLength {
+		t.Fatalf("PageMap bytes/size/object length differ: %d/%d/%d",
+			len(pageMapBytes), pageMapSize, publication.ContentObjects[3].ByteLength)
+	}
+
+	// The public helpers return owned deterministic byte slices, not mutable
+	// views into codec state shared by later calls.
+	mmBytes[0] ^= 0xff
+	pageMapBytes[0] ^= 0xff
+	mmAgain, err := CanonicalMMTemplateBytes(publication.MMTemplate)
+	if err != nil {
+		t.Fatalf("re-encode canonical MMTemplate bytes: %v", err)
+	}
+	pageMapAgain, err := CanonicalPageMapBytes(publication.PageMap)
+	if err != nil {
+		t.Fatalf("re-encode canonical PageMap bytes: %v", err)
+	}
+	if bytes.Equal(mmBytes, mmAgain) || bytes.Equal(pageMapBytes, pageMapAgain) {
+		t.Fatal("mutating returned canonical bytes affected or matched a later encoding")
+	}
+}
+
 func TestOversizedCanonicalPageMapCannotUseOnePageSlot(t *testing.T) {
 	publication := validPublication(t)
 	publication.PageMap.Runs = nil

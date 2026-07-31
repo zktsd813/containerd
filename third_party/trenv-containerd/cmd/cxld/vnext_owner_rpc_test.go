@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"net"
 	"sort"
@@ -20,6 +21,66 @@ func marshalVNextOwnerRPCTestPayload(t *testing.T, value interface{}) json.RawMe
 		t.Fatalf("marshal VNext Owner RPC test payload: %v", err)
 	}
 	return payload
+}
+
+func vnextOwnerRPCWireExternalContentCRCs(
+	records []vnextExternalContentPageCRC,
+) vnextOwnerRPCExternalContentPageCRCs {
+	wire := make(vnextOwnerRPCExternalContentPageCRCs, len(records))
+	for index, record := range records {
+		wire[index] = vnextOwnerRPCExternalContentPageCRC{
+			LogicalPage:   record.LogicalPage,
+			ContentCRC32C: record.ContentCRC32C,
+			CopyEngine:    uint32(record.CopyEngine),
+		}
+	}
+	return wire
+}
+
+func requireVNextOwnerRPCJSONFields(
+	t *testing.T,
+	raw []byte,
+	want ...string,
+) map[string]json.RawMessage {
+	t.Helper()
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		t.Fatalf("decode JSON object: %v", err)
+	}
+	if len(object) != len(want) {
+		keys := make([]string, 0, len(object))
+		for key := range object {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		t.Fatalf("JSON fields are %v, expected exactly %v", keys, want)
+	}
+	for _, field := range want {
+		if _, exists := object[field]; !exists {
+			t.Fatalf("JSON object is missing field %q: %s", field, raw)
+		}
+	}
+	return object
+}
+
+func vnextOwnerRPCTestSealJSON(
+	sidecars string,
+	externalContentPageCRCs string,
+) []byte {
+	return []byte(`{
+		"protocol":"cxld.vnext-owner.v1",
+		"identity":{
+			"requestId":"request-a",
+			"checkpointId":"checkpoint-a",
+			"producerId":"producer-a",
+			"ownerId":"owner-a",
+			"ownerEpoch":7,
+			"allocationRecordId":42
+		},
+		"publicationEnvelope":"eA==",
+		"crcPageSidecars":` + sidecars + `,
+		"externalContentPageCRCs":` + externalContentPageCRCs + `
+	}`)
 }
 
 func vnextOwnerRPCTestReserveRequest(ownerID string) vnextOwnerRPCReserveRequest {
@@ -289,6 +350,231 @@ func TestVNextOwnerRPCRejectsDuplicateCaseVariantAndMixedEnvelopeBeforeTypedDeco
 	}
 }
 
+func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
+	validRecord := `{"logicalPage":4,"contentCrc32c":0,"copyEngine":1}`
+	tests := []struct {
+		name    string
+		raw     []byte
+		target  interface{}
+		contain string
+	}{
+		{
+			name: "seal external CRC array",
+			raw: []byte(`{
+				"protocol":"cxld.vnext-owner.v1",
+				"identity":{
+					"requestId":"r","checkpointId":"c","producerId":"p",
+					"ownerId":"o","ownerEpoch":1,"allocationRecordId":1
+				},
+				"publicationEnvelope":"eA==",
+				"crcPageSidecars":[]
+			}`),
+			target:  &vnextOwnerRPCSealRequest{},
+			contain: `missing required field "externalContentPageCRCs"`,
+		},
+		{
+			name: "external CRC value",
+			raw: vnextOwnerRPCTestSealJSON(
+				"[]", `[{"logicalPage":4,"copyEngine":1}]`),
+			target:  &vnextOwnerRPCSealRequest{},
+			contain: `missing required field "contentCrc32c"`,
+		},
+		{
+			name: "external CRC logical page",
+			raw: vnextOwnerRPCTestSealJSON(
+				"[]", `[{"contentCrc32c":0,"copyEngine":1}]`),
+			target:  &vnextOwnerRPCSealRequest{},
+			contain: `missing required field "logicalPage"`,
+		},
+		{
+			name: "external CRC copy engine",
+			raw: vnextOwnerRPCTestSealJSON(
+				"[]", `[{"logicalPage":4,"contentCrc32c":0}]`),
+			target:  &vnextOwnerRPCSealRequest{},
+			contain: `missing required field "copyEngine"`,
+		},
+		{
+			name: "sidecar bytes",
+			raw: vnextOwnerRPCTestSealJSON(
+				`[{"pagesImageId":7}]`, "["+validRecord+"]"),
+			target:  &vnextOwnerRPCSealRequest{},
+			contain: `missing required field "bytes"`,
+		},
+		{
+			name: "reserve content capacity",
+			raw: []byte(`{
+				"protocol":"cxld.vnext-owner.v1",
+				"requestId":"r","checkpointId":"c","producerId":"p","ownerId":"o",
+				"ownerEpoch":1,
+				"contents":[{"kind":"memory","objectId":1,"byteLength":4096}],
+				"maxExtents":1
+			}`),
+			target:  &vnextOwnerRPCReserveRequest{},
+			contain: `missing required field "capacityPages"`,
+		},
+		{
+			name: "lifecycle allocation identity",
+			raw: []byte(`{
+				"protocol":"cxld.vnext-owner.v1",
+				"identity":{
+					"requestId":"r","checkpointId":"c","producerId":"p",
+					"ownerId":"o","ownerEpoch":1
+				}
+			}`),
+			target:  &vnextOwnerRPCLifecycleRequest{},
+			contain: `missing required field "allocationRecordId"`,
+		},
+		{
+			name:    "null external CRC array",
+			raw:     vnextOwnerRPCTestSealJSON("[]", "null"),
+			target:  &vnextOwnerRPCSealRequest{},
+			contain: "must be a JSON array",
+		},
+		{
+			name: "case variant external CRC field",
+			raw: vnextOwnerRPCTestSealJSON(
+				"[]", `[{"logicalPage":4,"ContentCrc32c":0,"copyEngine":1}]`),
+			target:  &vnextOwnerRPCSealRequest{},
+			contain: "unknown field",
+		},
+		{
+			name: "duplicate external CRC field",
+			raw: vnextOwnerRPCTestSealJSON(
+				"[]", `[{"logicalPage":4,"contentCrc32c":0,"contentCrc32c":1,"copyEngine":1}]`),
+			target:  &vnextOwnerRPCSealRequest{},
+			contain: "duplicate field",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := decodeStrictVNextOwnerRPC(test.raw, test.target); err == nil ||
+				!strings.Contains(err.Error(), test.contain) {
+				t.Fatalf("strict required-field error=%v, expected %q", err, test.contain)
+			}
+		})
+	}
+
+	// CRC-32C zero is valid evidence, so an explicitly present zero must remain
+	// distinguishable from the missing-field case above.
+	var decoded vnextOwnerRPCSealRequest
+	if err := decodeStrictVNextOwnerRPC(
+		vnextOwnerRPCTestSealJSON("[]", "["+validRecord+"]"), &decoded); err != nil {
+		t.Fatalf("explicit zero CRC was rejected: %v", err)
+	}
+	if len(decoded.ExternalContentPageCRCs) != 1 ||
+		decoded.ExternalContentPageCRCs[0].ContentCRC32C != 0 {
+		t.Fatalf("explicit zero CRC changed during decode: %#v", decoded.ExternalContentPageCRCs)
+	}
+}
+
+func TestVNextOwnerRPCExternalContentCRCUnsignedAndEngineContract(t *testing.T) {
+	valid := []struct {
+		name   string
+		record string
+	}{
+		{
+			name:   "zero CRC and first logical page",
+			record: `{"logicalPage":0,"contentCrc32c":0,"copyEngine":1}`,
+		},
+		{
+			name: "maximum public values",
+			record: `{"logicalPage":9223372036854775807,` +
+				`"contentCrc32c":4294967295,"copyEngine":3}`,
+		},
+		{
+			name:   "DML software engine",
+			record: `{"logicalPage":4,"contentCrc32c":1,"copyEngine":2}`,
+		},
+	}
+	for _, test := range valid {
+		t.Run("accept "+test.name, func(t *testing.T) {
+			var request vnextOwnerRPCSealRequest
+			if err := decodeStrictVNextOwnerRPC(
+				vnextOwnerRPCTestSealJSON("[]", "["+test.record+"]"), &request); err != nil {
+				t.Fatalf("valid unsigned record was rejected: %v", err)
+			}
+		})
+	}
+
+	invalidTyped := []struct {
+		name   string
+		record string
+	}{
+		{"negative logical page", `{"logicalPage":-1,"contentCrc32c":0,"copyEngine":1}`},
+		{"logical page uint64 overflow", `{"logicalPage":18446744073709551616,"contentCrc32c":0,"copyEngine":1}`},
+		{"fractional logical page", `{"logicalPage":1.0,"contentCrc32c":0,"copyEngine":1}`},
+		{"exponent logical page", `{"logicalPage":1e0,"contentCrc32c":0,"copyEngine":1}`},
+		{"string logical page", `{"logicalPage":"1","contentCrc32c":0,"copyEngine":1}`},
+		{"null logical page", `{"logicalPage":null,"contentCrc32c":0,"copyEngine":1}`},
+		{"negative CRC", `{"logicalPage":1,"contentCrc32c":-1,"copyEngine":1}`},
+		{"CRC uint32 overflow", `{"logicalPage":1,"contentCrc32c":4294967296,"copyEngine":1}`},
+		{"fractional CRC", `{"logicalPage":1,"contentCrc32c":1.0,"copyEngine":1}`},
+		{"exponent CRC", `{"logicalPage":1,"contentCrc32c":1e0,"copyEngine":1}`},
+		{"string CRC", `{"logicalPage":1,"contentCrc32c":"1","copyEngine":1}`},
+		{"null CRC", `{"logicalPage":1,"contentCrc32c":null,"copyEngine":1}`},
+		{"negative copy engine", `{"logicalPage":1,"contentCrc32c":1,"copyEngine":-1}`},
+		{"copy engine uint32 overflow", `{"logicalPage":1,"contentCrc32c":1,"copyEngine":4294967296}`},
+		{"fractional copy engine", `{"logicalPage":1,"contentCrc32c":1,"copyEngine":1.0}`},
+		{"exponent copy engine", `{"logicalPage":1,"contentCrc32c":1,"copyEngine":1e0}`},
+		{"string copy engine", `{"logicalPage":1,"contentCrc32c":1,"copyEngine":"1"}`},
+		{"null copy engine", `{"logicalPage":1,"contentCrc32c":1,"copyEngine":null}`},
+	}
+	for _, test := range invalidTyped {
+		t.Run("reject "+test.name, func(t *testing.T) {
+			var request vnextOwnerRPCSealRequest
+			if err := decodeStrictVNextOwnerRPC(
+				vnextOwnerRPCTestSealJSON("[]", "["+test.record+"]"), &request); err == nil {
+				t.Fatalf("invalid unsigned record was accepted: %s", test.record)
+			}
+		})
+	}
+
+	rpc := &vnextOwnerRPC{service: &vnextOwnerService{}}
+	semanticInvalid := []struct {
+		name    string
+		records string
+		contain string
+	}{
+		{
+			name: "signed ABI overflow",
+			records: `[{"logicalPage":9223372036854775808,` +
+				`"contentCrc32c":0,"copyEngine":1}]`,
+			contain: "signed ABI",
+		},
+		{
+			name:    "zero copy engine",
+			records: `[{"logicalPage":1,"contentCrc32c":0,"copyEngine":0}]`,
+			contain: "copy engine",
+		},
+		{
+			name:    "unknown copy engine",
+			records: `[{"logicalPage":1,"contentCrc32c":0,"copyEngine":4}]`,
+			contain: "copy engine",
+		},
+		{
+			name: "identical duplicate logical page",
+			records: `[{"logicalPage":1,"contentCrc32c":0,"copyEngine":1},` +
+				`{"logicalPage":1,"contentCrc32c":0,"copyEngine":1}]`,
+			contain: "duplicated",
+		},
+		{
+			name: "conflicting duplicate logical page",
+			records: `[{"logicalPage":1,"contentCrc32c":0,"copyEngine":1},` +
+				`{"logicalPage":1,"contentCrc32c":1,"copyEngine":2}]`,
+			contain: "duplicated",
+		},
+	}
+	for _, test := range semanticInvalid {
+		t.Run("reject "+test.name, func(t *testing.T) {
+			response := rpc.seal(vnextOwnerRPCTestSealJSON("[]", test.records))
+			if response.Ok || response.ErrorCode != string(vnextOwnerServiceInvalidRequest) ||
+				!strings.Contains(response.Error, test.contain) {
+				t.Fatalf("semantic record error=%#v, expected %q", response, test.contain)
+			}
+		})
+	}
+}
+
 func TestVNextOwnerRPCFailsClosedWhenUnavailableOrPayloadShapeIsAmbiguous(t *testing.T) {
 	reserve := marshalVNextOwnerRPCTestPayload(t, vnextOwnerRPCTestReserveRequest("owner-0"))
 	unavailable := runCommandWithVNextOwnerRPC(daemonRequest{
@@ -399,16 +685,79 @@ func TestVNextOwnerRPCRejectsResponseUnsafeExtentBudgetBeforeReservation(t *test
 	}
 }
 
-func TestVNextOwnerRPCSealReturnsExactPublicationLocator(t *testing.T) {
+func TestVNextOwnerRPCReserveBoundsFutureExternalSealEvidenceBeforeMutation(t *testing.T) {
+	rpc := &vnextOwnerRPC{service: &vnextOwnerService{}}
+	requestWithPages := func(kind string, pages uint64) vnextOwnerRPCReserveRequest {
+		return vnextOwnerRPCReserveRequest{
+			Protocol:   vnextOwnerRPCProtocol,
+			OwnerEpoch: 1,
+			Contents: []vnextOwnerRPCReserveContent{
+				{
+					Kind:          kind,
+					ObjectID:      1,
+					ByteLength:    0,
+					CapacityPages: pages,
+				},
+				{
+					Kind:          "publication",
+					ObjectID:      2,
+					ByteLength:    vnextContentPageSize,
+					CapacityPages: 1,
+				},
+			},
+			MaxExtents: 1,
+		}
+	}
+
+	exact := rpc.reserve(marshalVNextOwnerRPCTestPayload(
+		t,
+		requestWithPages("page_map", vnextOwnerRPCMaxExternalContentPageCRCs)))
+	if exact.Ok || exact.ErrorCode != string(vnextOwnerServiceInvalidRequest) ||
+		strings.Contains(exact.Error, "RPC seal limit") {
+		t.Fatalf("exact external evidence limit was rejected by the adapter: %#v", exact)
+	}
+
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
+		{UUID: "rpc-external-limit-device", Size: 128 << 10},
+	})
+	boundedRPC := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+	oversized := boundedRPC.reserve(marshalVNextOwnerRPCTestPayload(
+		t,
+		requestWithPages("page_map", vnextOwnerRPCMaxExternalContentPageCRCs+1)))
+	if oversized.Ok || oversized.ErrorCode != string(vnextOwnerServiceInvalidRequest) ||
+		!strings.Contains(oversized.Error, "RPC seal limit") {
+		t.Fatalf("unsealable external allocation crossed the adapter: %#v", oversized)
+	}
+	if len(fixture.group.journal.Transactions) != 0 {
+		t.Fatalf("unsealable external allocation mutated durable Owner state: %#v",
+			fixture.group.journal.Transactions)
+	}
+
+	// Memory retains its separate bounded TRCRC006 transport and publication is
+	// Owner-written. Neither belongs in externalContentPageCRCs.
+	memory := rpc.reserve(marshalVNextOwnerRPCTestPayload(
+		t,
+		requestWithPages("memory", vnextOwnerRPCMaxExternalContentPageCRCs+1)))
+	if memory.Ok || memory.ErrorCode != string(vnextOwnerServiceInvalidRequest) ||
+		strings.Contains(memory.Error, "RPC seal limit") {
+		t.Fatalf("memory pages were counted as external CRC records: %#v", memory)
+	}
+}
+
+func TestVNextOwnerRPCSealReturnsCompleteCandidateRoot(t *testing.T) {
 	fixture := newVNextExternalSealTestFixture(t, vnextCRCCopyEngineCPU)
+	// RootVersion is the publication sequence, not the PageMap version.
+	fixture.publication.Root.PublicationSequence = 11
 	service, err := newVNextOwnerService(fixture.owner.group, fixture.directory)
 	if err != nil {
 		t.Fatalf("build RPC seal service: %v", err)
 	}
-	envelope, err := cxlcheckpoint.Encode(fixture.publication)
+	externalContentPageCRCs := vnextPrepareCompleteExternalContent(t, fixture)
+	storage, err := cxlcheckpoint.EncodeForStorage(fixture.publication)
 	if err != nil {
-		t.Fatalf("encode RPC seal publication: %v", err)
+		t.Fatalf("encode RPC seal publication storage: %v", err)
 	}
+	envelope := storage.ExactBytes
 	imageIDs := make([]int, 0, len(fixture.sidecars))
 	for imageID := range fixture.sidecars {
 		imageIDs = append(imageIDs, int(imageID))
@@ -429,25 +778,80 @@ func TestVNextOwnerRPCSealReturnsExactPublicationLocator(t *testing.T) {
 			Identity:            vnextOwnerRPCIdentityFromInternal(vnextOwnerServiceIdentity(fixture.grant)),
 			PublicationEnvelope: envelope,
 			CRCPageSidecars:     sidecars,
+			ExternalContentPageCRCs: vnextOwnerRPCWireExternalContentCRCs(
+				externalContentPageCRCs),
 		}),
 	})
 	if !response.Ok {
 		t.Fatalf("seal RPC failed: %#v", response)
 	}
-	var locator vnextOwnerRPCSealResponse
-	if err := json.Unmarshal([]byte(response.Stdout), &locator); err != nil {
-		t.Fatalf("decode seal locator: %v", err)
+	var sealed vnextOwnerRPCSealResponse
+	if err := json.Unmarshal([]byte(response.Stdout), &sealed); err != nil {
+		t.Fatalf("decode seal root: %v", err)
 	}
-	if locator.PublicationByteLength != uint64(len(envelope)) ||
-		len(locator.PublicationSHA256) != 64 || len(locator.PageRuns) == 0 {
-		t.Fatalf("seal RPC returned incomplete exact locator: %#v", locator)
+	wantRoot := fixture.publication.Root
+	if sealed.Protocol != vnextOwnerRPCProtocol ||
+		sealed.Operation != vnextOwnerRPCOperationSeal ||
+		sealed.Root.RootID != wantRoot.RootID ||
+		sealed.Root.RootVersion != wantRoot.PublicationSequence ||
+		sealed.Root.MMTemplateID != wantRoot.MMTemplateID ||
+		sealed.Root.PageMapID != wantRoot.PageMapID ||
+		sealed.Root.PageMapVersion != wantRoot.PageMapVersion ||
+		sealed.Root.DeviceTableDigest != hex.EncodeToString(wantRoot.DeviceTableDigest[:]) ||
+		sealed.Root.ContractID != cxlcheckpoint.V6CompatibilityID ||
+		sealed.Root.Locator.PublicationByteLength != uint64(len(envelope)) ||
+		sealed.Root.Locator.PublicationSHA256 != hex.EncodeToString(storage.SHA256[:]) ||
+		len(sealed.Root.Locator.PageRuns) != len(storage.PageRuns) ||
+		len(storage.PageRuns) == 0 {
+		t.Fatalf("seal RPC returned incomplete candidate root: %#v", sealed)
+	}
+	for index, wantRun := range storage.PageRuns {
+		gotRun := sealed.Root.Locator.PageRuns[index]
+		if gotRun.PageCount != wantRun.PageCount ||
+			gotRun.FirstPage.OwnerID != wantRun.FirstPage.OwnerID ||
+			gotRun.FirstPage.DeviceID != wantRun.FirstPage.DeviceUUID ||
+			gotRun.FirstPage.DataPageIndex != wantRun.FirstPage.DataPageIndex ||
+			gotRun.FirstPage.AllocationRecordID != wantRun.FirstPage.AllocationRecordID {
+			t.Fatalf("seal RPC page run %d=%#v, expected %#v", index, gotRun, wantRun)
+		}
 	}
 
-	// The bounded Owner service does not yet expose direct writes for these
-	// remaining control objects. Seal them through the existing test-only
-	// Owner helper, then prove that the actual RPC dispatcher reaches commit
-	// and that its terminal retry is idempotent.
-	fixture.sealControlPages(t)
+	responseFields := requireVNextOwnerRPCJSONFields(
+		t, []byte(response.Stdout), "protocol", "operation", "root")
+	rootFields := requireVNextOwnerRPCJSONFields(
+		t,
+		responseFields["root"],
+		"rootId",
+		"rootVersion",
+		"mmTemplateId",
+		"pageMapId",
+		"pageMapVersion",
+		"deviceTableDigest",
+		"contractId",
+		"locator")
+	locatorFields := requireVNextOwnerRPCJSONFields(
+		t,
+		rootFields["locator"],
+		"publicationByteLength",
+		"publicationSha256",
+		"pageRuns")
+	var pageRuns []json.RawMessage
+	if err := json.Unmarshal(locatorFields["pageRuns"], &pageRuns); err != nil || len(pageRuns) == 0 {
+		t.Fatalf("decode exact root PageID runs: %v / %d", err, len(pageRuns))
+	}
+	pageRunFields := requireVNextOwnerRPCJSONFields(t, pageRuns[0], "firstPage", "pageCount")
+	requireVNextOwnerRPCJSONFields(
+		t,
+		pageRunFields["firstPage"],
+		"ownerId",
+		"deviceId",
+		"dataPageIndex",
+		"allocationRecordId")
+
+	transaction := fixture.owner.group.journal.Transactions[fixture.grant.AllocationRecordID]
+	if transaction == nil || transaction.State != vnextOwnerGranted {
+		t.Fatalf("seal published rather than returning a candidate root: %#v", transaction)
+	}
 	commitPayload := marshalVNextOwnerRPCTestPayload(t, vnextOwnerRPCLifecycleRequest{
 		Protocol: vnextOwnerRPCProtocol,
 		Identity: vnextOwnerRPCIdentityFromInternal(vnextOwnerServiceIdentity(fixture.grant)),
@@ -484,6 +888,7 @@ func TestVNextOwnerRPCSealRejectsDuplicateSidecarBeforeServiceMutation(t *testin
 				{PagesImageID: 7, Bytes: []byte{1}},
 				{PagesImageID: 7, Bytes: []byte{2}},
 			},
+			ExternalContentPageCRCs: vnextOwnerRPCExternalContentPageCRCs{},
 		}),
 	}, rpc)
 	if response.Ok || response.ErrorCode != string(vnextOwnerServiceInvalidRequest) ||
@@ -664,9 +1069,10 @@ func TestDaemonConnectionAdmissionCapsThirtyTwoIncompleteSmallFrames(t *testing.
 func TestVNextOwnerRPCRejectsBulkPayloadAboveControlTransportLimit(t *testing.T) {
 	rpc := &vnextOwnerRPC{service: &vnextOwnerService{}}
 	response := rpc.seal(marshalVNextOwnerRPCTestPayload(t, vnextOwnerRPCSealRequest{
-		Protocol:            vnextOwnerRPCProtocol,
-		PublicationEnvelope: make([]byte, vnextOwnerRPCMaxPublicationBytes+1),
-		CRCPageSidecars:     vnextOwnerRPCSidecars{},
+		Protocol:                vnextOwnerRPCProtocol,
+		PublicationEnvelope:     make([]byte, vnextOwnerRPCMaxPublicationBytes+1),
+		CRCPageSidecars:         vnextOwnerRPCSidecars{},
+		ExternalContentPageCRCs: vnextOwnerRPCExternalContentPageCRCs{},
 	}))
 	if response.Ok || response.ErrorCode != string(vnextOwnerServiceInvalidRequest) ||
 		!strings.Contains(response.Error, "allowed range") {
@@ -675,23 +1081,37 @@ func TestVNextOwnerRPCRejectsBulkPayloadAboveControlTransportLimit(t *testing.T)
 }
 
 func TestVNextOwnerRPCBoundsStructuralArraysDuringJSONDecode(t *testing.T) {
+	content := `{"kind":"memory","objectId":1,"byteLength":4096,"capacityPages":1}`
 	tooManyContents := "[" +
-		strings.TrimSuffix(strings.Repeat("{},", vnextOwnerRPCMaxContents+1), ",") +
+		strings.TrimSuffix(strings.Repeat(content+",", vnextOwnerRPCMaxContents+1), ",") +
 		"]"
 	reserve := (&vnextOwnerRPC{}).reserve(json.RawMessage(
-		`{"protocol":"` + vnextOwnerRPCProtocol + `","contents":` + tooManyContents + `}`))
+		`{"protocol":"` + vnextOwnerRPCProtocol + `",` +
+			`"requestId":"r","checkpointId":"c","producerId":"p","ownerId":"o",` +
+			`"ownerEpoch":1,"contents":` + tooManyContents + `,"maxExtents":1}`))
 	if reserve.Ok || reserve.ErrorCode != string(vnextOwnerServiceInvalidRequest) ||
 		!strings.Contains(reserve.Error, "more than") {
 		t.Fatalf("oversized contents array was fully decoded: %#v", reserve)
 	}
 
+	sidecar := `{"pagesImageId":1,"bytes":"AQ=="}`
 	tooManySidecars := "[" +
-		strings.TrimSuffix(strings.Repeat("{},", vnextOwnerRPCMaxSidecars+1), ",") +
+		strings.TrimSuffix(strings.Repeat(sidecar+",", vnextOwnerRPCMaxSidecars+1), ",") +
 		"]"
-	seal := (&vnextOwnerRPC{}).seal(json.RawMessage(
-		`{"protocol":"` + vnextOwnerRPCProtocol + `","crcPageSidecars":` + tooManySidecars + `}`))
+	seal := (&vnextOwnerRPC{}).seal(vnextOwnerRPCTestSealJSON(tooManySidecars, "[]"))
 	if seal.Ok || seal.ErrorCode != string(vnextOwnerServiceInvalidRequest) ||
 		!strings.Contains(seal.Error, "more than") {
 		t.Fatalf("oversized sidecar array was fully decoded: %#v", seal)
+	}
+
+	externalRecord := `{"logicalPage":1,"contentCrc32c":0,"copyEngine":1}`
+	tooManyExternalRecords := "[" + strings.TrimSuffix(
+		strings.Repeat(
+			externalRecord+",", vnextOwnerRPCMaxExternalContentPageCRCs+1), ",") + "]"
+	external := (&vnextOwnerRPC{}).seal(
+		vnextOwnerRPCTestSealJSON("[]", tooManyExternalRecords))
+	if external.Ok || external.ErrorCode != string(vnextOwnerServiceInvalidRequest) ||
+		!strings.Contains(external.Error, "more than") {
+		t.Fatalf("oversized external CRC array was fully decoded: %#v", external)
 	}
 }

@@ -198,10 +198,15 @@ type vnextOwnerReserveResponse struct {
 	Devices    []vnextOwnerPortableDevice
 }
 
-type vnextOwnerSealRequest struct {
-	Operation           vnextOwnerOperationIdentity
-	PublicationEnvelope []byte
-	CRCPageSidecars     map[uint32][]byte
+// vnextOwnerExternalSealRequest is the complete producer seal request. The
+// TRCRC006 map remains the memory-page evidence. ExternalContentPageCRCs must
+// cover every other producer-written page in the durable grant exactly once;
+// it cannot name the Owner-written publication slot.
+type vnextOwnerExternalSealRequest struct {
+	Operation               vnextOwnerOperationIdentity
+	PublicationEnvelope     []byte
+	CRCPageSidecars         map[uint32][]byte
+	ExternalContentPageCRCs []vnextExternalContentPageCRC
 }
 
 type vnextOwnerPublicationPageRun struct {
@@ -209,14 +214,31 @@ type vnextOwnerPublicationPageRun struct {
 	PageCount uint64
 }
 
-// vnextOwnerSealResponse is sufficient for the Scheduler to construct a
-// CxlCheckpointRootLocator. PublicationByteLength and PublicationSHA256 cover
-// only the exact canonical TRPUB006 bytes. PageRuns cover ceil(exact/4096)
-// pages, never the complete pre-reserved publication-slot capacity.
-type vnextOwnerSealResponse struct {
+// vnextOwnerCheckpointRootLocator addresses only the exact canonical
+// TRPUB006 bytes. PageRuns cover ceil(PublicationByteLength/4096), never the
+// complete pre-reserved publication-slot capacity.
+type vnextOwnerCheckpointRootLocator struct {
 	PublicationByteLength uint64
 	PublicationSHA256     [32]byte
 	PageRuns              []vnextOwnerPublicationPageRun
+}
+
+// vnextOwnerCheckpointRoot is the complete candidate root returned by seal.
+// Seal does not make this root Scheduler-visible: commit must succeed first,
+// after which the Scheduler may transition the checkpoint to AVAILABLE.
+type vnextOwnerCheckpointRoot struct {
+	RootID            string
+	RootVersion       uint64
+	MMTemplateID      string
+	PageMapID         string
+	PageMapVersion    uint64
+	DeviceTableDigest [32]byte
+	ContractID        string
+	Locator           vnextOwnerCheckpointRootLocator
+}
+
+type vnextOwnerSealResponse struct {
+	Root vnextOwnerCheckpointRoot
 }
 
 func newVNextOwnerService(
@@ -456,8 +478,11 @@ func (service *vnextOwnerService) reserveResponse(
 	return response, nil
 }
 
-func (service *vnextOwnerService) seal(
-	request vnextOwnerSealRequest,
+// sealExternal is the fail-closed VNext boundary for a complete externally
+// produced checkpoint. Exact non-memory coverage is mandatory even when the
+// record slice is empty; there is no service-level memory-only fallback.
+func (service *vnextOwnerService) sealExternal(
+	request vnextOwnerExternalSealRequest,
 ) (vnextOwnerSealResponse, error) {
 	const operation = "seal"
 	service.mu.Lock()
@@ -516,8 +541,12 @@ func (service *vnextOwnerService) seal(
 	if err := vnextOwnerServiceRequireSidecars(publication, request.CRCPageSidecars); err != nil {
 		return vnextOwnerSealResponse{}, err
 	}
-	if err := service.group.sealExternalCRIUOutput(
-		grant, publication, service.directory, request.CRCPageSidecars); err != nil {
+	if err := service.group.sealExternalCheckpointContent(
+		grant,
+		publication,
+		service.directory,
+		request.CRCPageSidecars,
+		request.ExternalContentPageCRCs); err != nil {
 		return vnextOwnerSealResponse{}, vnextOwnerServiceWrap(operation, err)
 	}
 	for page := uint64(0); page < storage.CapacityPages; page++ {
@@ -531,12 +560,23 @@ func (service *vnextOwnerService) seal(
 		}
 	}
 	response := vnextOwnerSealResponse{
-		PublicationByteLength: uint64(len(storage.ExactBytes)),
-		PublicationSHA256:     storage.SHA256,
-		PageRuns:              make([]vnextOwnerPublicationPageRun, len(storage.PageRuns)),
+		Root: vnextOwnerCheckpointRoot{
+			RootID:            publication.Root.RootID,
+			RootVersion:       publication.Root.PublicationSequence,
+			MMTemplateID:      publication.Root.MMTemplateID,
+			PageMapID:         publication.Root.PageMapID,
+			PageMapVersion:    publication.Root.PageMapVersion,
+			DeviceTableDigest: publication.Root.DeviceTableDigest,
+			ContractID:        cxlcheckpoint.V6CompatibilityID,
+			Locator: vnextOwnerCheckpointRootLocator{
+				PublicationByteLength: uint64(len(storage.ExactBytes)),
+				PublicationSHA256:     storage.SHA256,
+				PageRuns:              make([]vnextOwnerPublicationPageRun, len(storage.PageRuns)),
+			},
+		},
 	}
 	for index, run := range storage.PageRuns {
-		response.PageRuns[index] = vnextOwnerPublicationPageRun{
+		response.Root.Locator.PageRuns[index] = vnextOwnerPublicationPageRun{
 			FirstPage: run.FirstPage,
 			PageCount: run.PageCount,
 		}

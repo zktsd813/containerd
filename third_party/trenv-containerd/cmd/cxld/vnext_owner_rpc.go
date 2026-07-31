@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"reflect"
 	"strings"
 )
@@ -26,8 +27,15 @@ const (
 	vnextOwnerRPCMaxPublicationBytes = 8 << 20
 	vnextOwnerRPCMaxSidecarBytes     = 8 << 20
 	vnextOwnerRPCMaxSidecars         = 4096
-	vnextOwnerRPCMaxContents         = 4096
-	vnextOwnerRPCMaxExtents          = 256
+	// One record is emitted for every producer-written non-memory,
+	// non-publication content page. This bound keeps the worst-case compact
+	// JSON array near 9.8 MiB, leaving enough of the 32 MiB control frame for
+	// base64 expansion of both decoded eight-MiB bulk fields and bounded object
+	// overhead. Larger checkpoints require a future streaming or SCM_RIGHTS
+	// protocol.
+	vnextOwnerRPCMaxExternalContentPageCRCs = 1 << 17
+	vnextOwnerRPCMaxContents                = 4096
+	vnextOwnerRPCMaxExtents                 = 256
 	// The complete daemon envelope currently defines fourteen fields. Keep a
 	// little legacy headroom, but reject an attacker-controlled number of
 	// unknown or duplicate members before retaining RawMessage entries.
@@ -116,16 +124,25 @@ type vnextOwnerRPCSidecar struct {
 
 type vnextOwnerRPCSidecars []vnextOwnerRPCSidecar
 
+type vnextOwnerRPCExternalContentPageCRC struct {
+	LogicalPage   uint64 `json:"logicalPage"`
+	ContentCRC32C uint32 `json:"contentCrc32c"`
+	CopyEngine    uint32 `json:"copyEngine"`
+}
+
+type vnextOwnerRPCExternalContentPageCRCs []vnextOwnerRPCExternalContentPageCRC
+
 type vnextOwnerRPCSealRequest struct {
-	Protocol            string                         `json:"protocol"`
-	Identity            vnextOwnerRPCOperationIdentity `json:"identity"`
-	PublicationEnvelope []byte                         `json:"publicationEnvelope"`
-	CRCPageSidecars     vnextOwnerRPCSidecars          `json:"crcPageSidecars"`
+	Protocol                string                               `json:"protocol"`
+	Identity                vnextOwnerRPCOperationIdentity       `json:"identity"`
+	PublicationEnvelope     []byte                               `json:"publicationEnvelope"`
+	CRCPageSidecars         vnextOwnerRPCSidecars                `json:"crcPageSidecars"`
+	ExternalContentPageCRCs vnextOwnerRPCExternalContentPageCRCs `json:"externalContentPageCRCs"`
 }
 
 type vnextOwnerRPCPageID struct {
 	OwnerID            string `json:"ownerId"`
-	DeviceUUID         string `json:"deviceUuid"`
+	DeviceID           string `json:"deviceId"`
 	DataPageIndex      uint64 `json:"dataPageIndex"`
 	AllocationRecordID uint64 `json:"allocationRecordId"`
 }
@@ -135,12 +152,27 @@ type vnextOwnerRPCPublicationPageRun struct {
 	PageCount uint64              `json:"pageCount"`
 }
 
-type vnextOwnerRPCSealResponse struct {
-	Protocol              string                            `json:"protocol"`
-	Operation             string                            `json:"operation"`
+type vnextOwnerRPCRootLocator struct {
 	PublicationByteLength uint64                            `json:"publicationByteLength"`
 	PublicationSHA256     string                            `json:"publicationSha256"`
 	PageRuns              []vnextOwnerRPCPublicationPageRun `json:"pageRuns"`
+}
+
+type vnextOwnerRPCCheckpointRoot struct {
+	RootID            string                   `json:"rootId"`
+	RootVersion       uint64                   `json:"rootVersion"`
+	MMTemplateID      string                   `json:"mmTemplateId"`
+	PageMapID         string                   `json:"pageMapId"`
+	PageMapVersion    uint64                   `json:"pageMapVersion"`
+	DeviceTableDigest string                   `json:"deviceTableDigest"`
+	ContractID        string                   `json:"contractId"`
+	Locator           vnextOwnerRPCRootLocator `json:"locator"`
+}
+
+type vnextOwnerRPCSealResponse struct {
+	Protocol  string                      `json:"protocol"`
+	Operation string                      `json:"operation"`
+	Root      vnextOwnerRPCCheckpointRoot `json:"root"`
 }
 
 type vnextOwnerRPCLifecycleRequest struct {
@@ -201,6 +233,33 @@ func (sidecars *vnextOwnerRPCSidecars) UnmarshalJSON(raw []byte) error {
 		return err
 	}
 	*sidecars = decoded
+	return nil
+}
+
+func (records *vnextOwnerRPCExternalContentPageCRCs) UnmarshalJSON(raw []byte) error {
+	decoder, err := newVNextOwnerRPCBoundedArrayDecoder(raw, "externalContentPageCRCs")
+	if err != nil {
+		return err
+	}
+	decoded := make(vnextOwnerRPCExternalContentPageCRCs, 0)
+	for decoder.More() {
+		if len(decoded) >= vnextOwnerRPCMaxExternalContentPageCRCs {
+			return fmt.Errorf(
+				"VNext Owner external content CRCs contain more than %d elements",
+				vnextOwnerRPCMaxExternalContentPageCRCs)
+		}
+		var record vnextOwnerRPCExternalContentPageCRC
+		if err := decoder.Decode(&record); err != nil {
+			return fmt.Errorf(
+				"decode VNext Owner external content CRC %d: %w", len(decoded), err)
+		}
+		decoded = append(decoded, record)
+	}
+	if err := finishVNextOwnerRPCBoundedArray(
+		decoder, "externalContentPageCRCs"); err != nil {
+		return err
+	}
+	*records = decoded
 	return nil
 }
 
@@ -527,6 +586,7 @@ func (rpc *vnextOwnerRPC) reserve(raw json.RawMessage) execResponse {
 		Contents:     make([]vnextOwnerReserveContent, len(wire.Contents)),
 		MaxExtents:   wire.MaxExtents,
 	}
+	var externalContentPages uint64
 	for index, content := range wire.Contents {
 		kind, ok := vnextOwnerRPCContentKind(content.Kind)
 		if !ok {
@@ -538,6 +598,16 @@ func (rpc *vnextOwnerRPC) reserve(raw json.RawMessage) execResponse {
 			ObjectID:      content.ObjectID,
 			ByteLength:    content.ByteLength,
 			CapacityPages: content.CapacityPages,
+		}
+		if kind != vnextOwnerServiceContentMemory &&
+			kind != vnextOwnerServiceContentPublication {
+			if content.CapacityPages >
+				uint64(vnextOwnerRPCMaxExternalContentPageCRCs)-externalContentPages {
+				return vnextOwnerRPCErrorResponse(fmt.Errorf(
+					"producer-written non-memory content exceeds the RPC seal limit of %d pages",
+					vnextOwnerRPCMaxExternalContentPageCRCs))
+			}
+			externalContentPages += content.CapacityPages
 		}
 	}
 	response, err := rpc.service.reserve(request)
@@ -625,26 +695,74 @@ func (rpc *vnextOwnerRPC) seal(raw json.RawMessage) execResponse {
 		totalSidecarBytes += len(sidecar.Bytes)
 		sidecars[sidecar.PagesImageID] = sidecar.Bytes
 	}
-	response, err := rpc.service.seal(vnextOwnerSealRequest{
-		Operation:           wire.Identity.internal(),
-		PublicationEnvelope: wire.PublicationEnvelope,
-		CRCPageSidecars:     sidecars,
+	if len(wire.ExternalContentPageCRCs) > vnextOwnerRPCMaxExternalContentPageCRCs {
+		return vnextOwnerRPCErrorResponse(fmt.Errorf(
+			"external content CRC count %d exceeds %d",
+			len(wire.ExternalContentPageCRCs),
+			vnextOwnerRPCMaxExternalContentPageCRCs))
+	}
+	externalContentPageCRCs := make(
+		[]vnextExternalContentPageCRC, len(wire.ExternalContentPageCRCs))
+	seenLogicalPages := make(map[uint64]struct{}, len(wire.ExternalContentPageCRCs))
+	for index, record := range wire.ExternalContentPageCRCs {
+		if record.LogicalPage > uint64(math.MaxInt64) {
+			return vnextOwnerRPCErrorResponse(fmt.Errorf(
+				"external content CRC %d logical page %d exceeds the signed ABI",
+				index, record.LogicalPage))
+		}
+		engine := vnextCRCCopyEngine(record.CopyEngine)
+		if !engine.valid() {
+			return vnextOwnerRPCErrorResponse(fmt.Errorf(
+				"external content CRC %d has unsupported copy engine %d",
+				index, record.CopyEngine))
+		}
+		if _, duplicate := seenLogicalPages[record.LogicalPage]; duplicate {
+			return vnextOwnerRPCErrorResponse(fmt.Errorf(
+				"external content logical page %d is duplicated",
+				record.LogicalPage))
+		}
+		seenLogicalPages[record.LogicalPage] = struct{}{}
+		externalContentPageCRCs[index] = vnextExternalContentPageCRC{
+			LogicalPage:   record.LogicalPage,
+			ContentCRC32C: record.ContentCRC32C,
+			CopyEngine:    engine,
+		}
+	}
+	response, err := rpc.service.sealExternal(vnextOwnerExternalSealRequest{
+		Operation:               wire.Identity.internal(),
+		PublicationEnvelope:     wire.PublicationEnvelope,
+		CRCPageSidecars:         sidecars,
+		ExternalContentPageCRCs: externalContentPageCRCs,
 	})
 	if err != nil {
 		return vnextOwnerRPCErrorResponse(err)
 	}
 	wireResponse := vnextOwnerRPCSealResponse{
-		Protocol:              vnextOwnerRPCProtocol,
-		Operation:             vnextOwnerRPCOperationSeal,
-		PublicationByteLength: response.PublicationByteLength,
-		PublicationSHA256:     hex.EncodeToString(response.PublicationSHA256[:]),
-		PageRuns:              make([]vnextOwnerRPCPublicationPageRun, len(response.PageRuns)),
+		Protocol:  vnextOwnerRPCProtocol,
+		Operation: vnextOwnerRPCOperationSeal,
+		Root: vnextOwnerRPCCheckpointRoot{
+			RootID:            response.Root.RootID,
+			RootVersion:       response.Root.RootVersion,
+			MMTemplateID:      response.Root.MMTemplateID,
+			PageMapID:         response.Root.PageMapID,
+			PageMapVersion:    response.Root.PageMapVersion,
+			DeviceTableDigest: hex.EncodeToString(response.Root.DeviceTableDigest[:]),
+			ContractID:        response.Root.ContractID,
+			Locator: vnextOwnerRPCRootLocator{
+				PublicationByteLength: response.Root.Locator.PublicationByteLength,
+				PublicationSHA256: hex.EncodeToString(
+					response.Root.Locator.PublicationSHA256[:]),
+				PageRuns: make(
+					[]vnextOwnerRPCPublicationPageRun,
+					len(response.Root.Locator.PageRuns)),
+			},
+		},
 	}
-	for index, run := range response.PageRuns {
-		wireResponse.PageRuns[index] = vnextOwnerRPCPublicationPageRun{
+	for index, run := range response.Root.Locator.PageRuns {
+		wireResponse.Root.Locator.PageRuns[index] = vnextOwnerRPCPublicationPageRun{
 			FirstPage: vnextOwnerRPCPageID{
 				OwnerID:            run.FirstPage.OwnerID,
-				DeviceUUID:         run.FirstPage.DeviceUUID,
+				DeviceID:           run.FirstPage.DeviceUUID,
 				DataPageIndex:      run.FirstPage.DataPageIndex,
 				AllocationRecordID: run.FirstPage.AllocationRecordID,
 			},
@@ -745,6 +863,7 @@ func validateVNextOwnerRPCJSONValue(
 			return fmt.Errorf("%s must be a JSON object", path)
 		}
 		fields := make(map[string]reflect.Type, valueType.NumField())
+		fieldOrder := make([]string, 0, valueType.NumField())
 		for index := 0; index < valueType.NumField(); index++ {
 			field := valueType.Field(index)
 			if field.PkgPath != "" {
@@ -756,6 +875,7 @@ func validateVNextOwnerRPCJSONValue(
 			}
 			if name != "-" {
 				fields[name] = field.Type
+				fieldOrder = append(fieldOrder, name)
 			}
 		}
 		seen := make(map[string]struct{}, len(fields))
@@ -788,6 +908,11 @@ func validateVNextOwnerRPCJSONValue(
 		if delimiter, ok := token.(json.Delim); !ok || delimiter != '}' {
 			return fmt.Errorf("%s has an invalid object terminator", path)
 		}
+		for _, name := range fieldOrder {
+			if _, present := seen[name]; !present {
+				return fmt.Errorf("%s is missing required field %q", path, name)
+			}
+		}
 		return nil
 	case reflect.Slice:
 		if valueType.Elem().Kind() == reflect.Uint8 {
@@ -814,6 +939,8 @@ func validateVNextOwnerRPCJSONValue(
 			limit = vnextOwnerRPCMaxContents
 		case reflect.TypeOf(vnextOwnerRPCSidecars{}):
 			limit = vnextOwnerRPCMaxSidecars
+		case reflect.TypeOf(vnextOwnerRPCExternalContentPageCRCs{}):
+			limit = vnextOwnerRPCMaxExternalContentPageCRCs
 		}
 		count := 0
 		for decoder.More() {

@@ -938,12 +938,11 @@ func validateMappingSlots(slots MappingSlots, pageMap PageMap, contents map[uint
 }
 
 func canonicalMMTemplateSize(template MMTemplate) (uint64, error) {
-	encoder := newPayloadEncoder()
-	encodeMMTemplate(encoder, template)
-	if encoder.err != nil {
-		return 0, encoder.err
+	encoded, err := canonicalMMTemplateBytes(template)
+	if err != nil {
+		return 0, err
 	}
-	return uint64(encoder.buffer.Len()), nil
+	return uint64(len(encoded)), nil
 }
 
 // CanonicalMMTemplateSize returns the exact number of bytes that a producer
@@ -953,12 +952,11 @@ func CanonicalMMTemplateSize(template MMTemplate) (uint64, error) {
 }
 
 func canonicalPageMapSize(pageMap PageMap) (uint64, error) {
-	encoder := newPayloadEncoder()
-	encodePageMap(encoder, pageMap)
-	if encoder.err != nil {
-		return 0, encoder.err
+	encoded, err := canonicalPageMapBytes(pageMap)
+	if err != nil {
+		return 0, err
 	}
-	return uint64(encoder.buffer.Len()), nil
+	return uint64(len(encoded)), nil
 }
 
 // CanonicalPageMapSize returns the exact bytes used by this PageMap version.

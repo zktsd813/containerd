@@ -569,21 +569,59 @@ func TestVNextOwnerServiceMultiPagePublicationCrossesDevicesAndRetriesAfterResta
 	binary.LittleEndian.PutUint32(
 		sidecars[7][vnextCRCPageSidecarHeaderSize+28:vnextCRCPageSidecarHeaderSize+32],
 		crc32.Checksum(memoryPayload, vnextCRCTable))
+	grant, _, err := service.resolveOperation(
+		"test-seal", reserved.Operation, vnextOwnerGranted, true)
+	if err != nil {
+		t.Fatalf("resolve multi-page external grant: %v", err)
+	}
+	mmBytes, err := cxlcheckpoint.CanonicalMMTemplateBytes(mmTemplate)
+	if err != nil {
+		t.Fatalf("encode multi-page MMTemplate: %v", err)
+	}
+	pageMapBytes, err := cxlcheckpoint.CanonicalPageMapBytes(pageMap)
+	if err != nil {
+		t.Fatalf("encode multi-page PageMap: %v", err)
+	}
+	externalRecords := []vnextExternalContentPageCRC{
+		{
+			LogicalPage: 3,
+			ContentCRC32C: vnextWriteExternalGrantLogicalPage(
+				t, fixture.group, grant, 3, mmBytes),
+			CopyEngine: vnextCRCCopyEngineCPU,
+		},
+		{
+			LogicalPage: 4,
+			ContentCRC32C: vnextWriteExternalGrantLogicalPage(
+				t, fixture.group, grant, 4, pageMapBytes),
+			CopyEngine: vnextCRCCopyEngineCPU,
+		},
+		{
+			LogicalPage: 5,
+			ContentCRC32C: vnextWriteExternalGrantLogicalPage(
+				t,
+				fixture.group,
+				grant,
+				5,
+				bytes.Repeat([]byte{0x63}, int(pageMapSize))),
+			CopyEngine: vnextCRCCopyEngineCPU,
+		},
+	}
 
-	sealed, err := service.seal(vnextOwnerSealRequest{
-		Operation:           reserved.Operation,
-		PublicationEnvelope: storage.ExactBytes,
-		CRCPageSidecars:     sidecars,
+	sealed, err := service.sealExternal(vnextOwnerExternalSealRequest{
+		Operation:               reserved.Operation,
+		PublicationEnvelope:     storage.ExactBytes,
+		CRCPageSidecars:         sidecars,
+		ExternalContentPageCRCs: externalRecords,
 	})
 	if err != nil {
 		t.Fatalf("seal multi-page publication: %v", err)
 	}
-	if sealed.PublicationByteLength != uint64(len(storage.ExactBytes)) ||
-		sealed.PublicationSHA256 != storage.SHA256 ||
-		len(sealed.PageRuns) != len(storage.PageRuns) {
+	if sealed.Root.Locator.PublicationByteLength != uint64(len(storage.ExactBytes)) ||
+		sealed.Root.Locator.PublicationSHA256 != storage.SHA256 ||
+		len(sealed.Root.Locator.PageRuns) != len(storage.PageRuns) {
 		t.Fatalf("seal returned a different root locator: %#v", sealed)
 	}
-	for index, run := range sealed.PageRuns {
+	for index, run := range sealed.Root.Locator.PageRuns {
 		if run.FirstPage != storage.PageRuns[index].FirstPage ||
 			run.PageCount != storage.PageRuns[index].PageCount {
 			t.Fatalf("seal run %d = %#v, want %#v", index, run, storage.PageRuns[index])
@@ -604,10 +642,11 @@ func TestVNextOwnerServiceMultiPagePublicationCrossesDevicesAndRetriesAfterResta
 
 	fixture.reopen(t)
 	restarted := newVNextOwnerServiceForFixture(t, fixture)
-	retried, err := restarted.seal(vnextOwnerSealRequest{
-		Operation:           reserved.Operation,
-		PublicationEnvelope: storage.ExactBytes,
-		CRCPageSidecars:     sidecars,
+	retried, err := restarted.sealExternal(vnextOwnerExternalSealRequest{
+		Operation:               reserved.Operation,
+		PublicationEnvelope:     storage.ExactBytes,
+		CRCPageSidecars:         sidecars,
+		ExternalContentPageCRCs: externalRecords,
 	})
 	if err != nil {
 		t.Fatalf("retry multi-page publication seal after restart: %v", err)
@@ -624,39 +663,41 @@ func TestVNextOwnerServiceRestartResolvesSameIdentityForCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build external Owner service: %v", err)
 	}
+	externalRecords := vnextPrepareCompleteExternalContent(t, fixture)
 	envelope, err := cxlcheckpoint.Encode(fixture.publication)
 	if err != nil {
 		t.Fatalf("encode strict external publication: %v", err)
 	}
 	identity := vnextOwnerServiceIdentity(fixture.grant)
-	sealed, err := service.seal(vnextOwnerSealRequest{
-		Operation:           identity,
-		PublicationEnvelope: envelope,
-		CRCPageSidecars:     fixture.cloneSidecars(),
+	sealed, err := service.sealExternal(vnextOwnerExternalSealRequest{
+		Operation:               identity,
+		PublicationEnvelope:     envelope,
+		CRCPageSidecars:         fixture.cloneSidecars(),
+		ExternalContentPageCRCs: externalRecords,
 	})
 	if err != nil {
 		t.Fatalf("seal external pages through Owner service: %v", err)
 	}
-	if sealed.PublicationByteLength != uint64(len(envelope)) ||
-		sealed.PublicationSHA256 != sha256.Sum256(envelope) ||
-		len(sealed.PageRuns) != 1 ||
-		sealed.PageRuns[0].PageCount != 1 {
+	if sealed.Root.Locator.PublicationByteLength != uint64(len(envelope)) ||
+		sealed.Root.Locator.PublicationSHA256 != sha256.Sum256(envelope) ||
+		len(sealed.Root.Locator.PageRuns) != 1 ||
+		sealed.Root.Locator.PageRuns[0].PageCount != 1 {
 		t.Fatalf("unexpected portable publication root locator: %#v", sealed)
 	}
 	publicationStorage, err := cxlcheckpoint.EncodeForStorage(fixture.publication)
 	if err != nil {
 		t.Fatalf("prepare expected publication storage: %v", err)
 	}
-	if sealed.PageRuns[0].FirstPage != publicationStorage.PageRuns[0].FirstPage {
+	if sealed.Root.Locator.PageRuns[0].FirstPage != publicationStorage.PageRuns[0].FirstPage {
 		t.Fatalf("seal response PageID = %#v, want %#v",
-			sealed.PageRuns[0].FirstPage, publicationStorage.PageRuns[0].FirstPage)
+			sealed.Root.Locator.PageRuns[0].FirstPage, publicationStorage.PageRuns[0].FirstPage)
 	}
-	publicationDevice := fixture.owner.group.devices[sealed.PageRuns[0].FirstPage.DeviceUUID]
+	publicationDevice := fixture.owner.group.devices[sealed.Root.Locator.PageRuns[0].FirstPage.DeviceUUID]
 	publicationDevice.mu.Lock()
 	storedPublicationPage, readErr := publicationDevice.readContentPageLocked(
-		sealed.PageRuns[0].FirstPage.DataPageIndex)
+		sealed.Root.Locator.PageRuns[0].FirstPage.DataPageIndex)
 	publicationDescriptor, descriptorErr := publicationDevice.readDescriptorLocked(
-		sealed.PageRuns[0].FirstPage.DataPageIndex)
+		sealed.Root.Locator.PageRuns[0].FirstPage.DataPageIndex)
 	publicationDevice.mu.Unlock()
 	if readErr != nil || descriptorErr != nil {
 		t.Fatalf("read Owner-written publication page/descriptor: %v / %v",
@@ -666,8 +707,6 @@ func TestVNextOwnerServiceRestartResolvesSameIdentityForCommit(t *testing.T) {
 		!bytes.Equal(storedPublicationPage, publicationStorage.PaddedBytes[:vnextContentPageSize]) {
 		t.Fatalf("Owner did not atomically store the zero-padded publication slot")
 	}
-	fixture.sealControlPages(t)
-
 	fixture.owner.reopen(t)
 	restarted := newVNextOwnerServiceForFixture(t, fixture.owner)
 	if err := restarted.commit(identity); err != nil {
@@ -689,7 +728,7 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("build Owner service: %v", err)
 		}
-		_, err = service.seal(vnextOwnerSealRequest{
+		_, err = service.sealExternal(vnextOwnerExternalSealRequest{
 			Operation:           vnextOwnerServiceIdentity(fixture.grant),
 			PublicationEnvelope: []byte("TRPUB005"),
 			CRCPageSidecars:     fixture.cloneSidecars(),
@@ -710,7 +749,7 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 		}
 		sidecars := fixture.cloneSidecars()
 		delete(sidecars, 8)
-		_, err = service.seal(vnextOwnerSealRequest{
+		_, err = service.sealExternal(vnextOwnerExternalSealRequest{
 			Operation:           vnextOwnerServiceIdentity(fixture.grant),
 			PublicationEnvelope: envelope,
 			CRCPageSidecars:     sidecars,
@@ -730,13 +769,15 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 			t.Fatalf("encode publication: %v", err)
 		}
 		sidecars := fixture.cloneSidecars()
+		externalRecords := vnextPrepareCompleteExternalContent(t, fixture)
 		offset := vnextCRCPageSidecarHeaderSize + vnextCRCPageSidecarRecordSize
 		crc := binary.LittleEndian.Uint32(sidecars[8][offset+28 : offset+32])
 		binary.LittleEndian.PutUint32(sidecars[8][offset+28:offset+32], crc^1)
-		_, err = service.seal(vnextOwnerSealRequest{
-			Operation:           vnextOwnerServiceIdentity(fixture.grant),
-			PublicationEnvelope: envelope,
-			CRCPageSidecars:     sidecars,
+		_, err = service.sealExternal(vnextOwnerExternalSealRequest{
+			Operation:               vnextOwnerServiceIdentity(fixture.grant),
+			PublicationEnvelope:     envelope,
+			CRCPageSidecars:         sidecars,
+			ExternalContentPageCRCs: externalRecords,
 		})
 		requireVNextOwnerServiceCode(t, err, vnextOwnerServicePayloadMismatch)
 		fixture.assertAllocationDescriptorState(t, vnextDescriptorReserved)
@@ -750,12 +791,12 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 		}
 		identity := vnextOwnerServiceIdentity(fixture.grant)
 		identity.ProducerID = "different-producer"
-		_, err = service.seal(vnextOwnerSealRequest{Operation: identity})
+		_, err = service.sealExternal(vnextOwnerExternalSealRequest{Operation: identity})
 		requireVNextOwnerServiceCode(t, err, vnextOwnerServiceIdentityMismatch)
 		fixture.assertAllocationDescriptorState(t, vnextDescriptorReserved)
 	})
 
-	t.Run("control-descriptors-required", func(t *testing.T) {
+	t.Run("complete-evidence-seals-control-descriptors", func(t *testing.T) {
 		fixture := newVNextExternalSealTestFixture(t, vnextCRCCopyEngineCPU)
 		service, err := newVNextOwnerService(fixture.owner.group, fixture.directory)
 		if err != nil {
@@ -766,17 +807,17 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 			t.Fatalf("encode publication: %v", err)
 		}
 		identity := vnextOwnerServiceIdentity(fixture.grant)
-		if _, err := service.seal(vnextOwnerSealRequest{
-			Operation:           identity,
-			PublicationEnvelope: envelope,
-			CRCPageSidecars:     fixture.cloneSidecars(),
+		externalRecords := vnextPrepareCompleteExternalContent(t, fixture)
+		if _, err := service.sealExternal(vnextOwnerExternalSealRequest{
+			Operation:               identity,
+			PublicationEnvelope:     envelope,
+			CRCPageSidecars:         fixture.cloneSidecars(),
+			ExternalContentPageCRCs: externalRecords,
 		}); err != nil {
 			t.Fatalf("seal strict Owner service request: %v", err)
 		}
-		requireVNextOwnerServiceCode(t, service.commit(identity), vnextOwnerServiceTransactionState)
-		fixture.sealControlPages(t)
 		if err := service.commit(identity); err != nil {
-			t.Fatalf("commit after all control descriptors were sealed: %v", err)
+			t.Fatalf("commit after unified seal covered all control descriptors: %v", err)
 		}
 	})
 }
@@ -796,7 +837,7 @@ func TestVNextOwnerServiceUsesExactTRCRC006Bytes(t *testing.T) {
 	// Append one byte. The sidecar parser must reject it instead of accepting
 	// a prefix or silently choosing an older contiguous format.
 	sidecars[7] = append(sidecars[7], 0)
-	_, err = service.seal(vnextOwnerSealRequest{
+	_, err = service.sealExternal(vnextOwnerExternalSealRequest{
 		Operation:           vnextOwnerServiceIdentity(fixture.grant),
 		PublicationEnvelope: envelope,
 		CRCPageSidecars:     sidecars,
@@ -821,5 +862,384 @@ func TestVNextOwnerServiceUsesExactTRCRC006Bytes(t *testing.T) {
 		if got != want {
 			t.Fatalf("sidecar CRC for logical page %d is %#x, expected %#x", page.logicalPage, got, want)
 		}
+	}
+}
+
+func vnextWriteExternalLogicalPage(
+	t *testing.T,
+	fixture *vnextExternalSealTestFixture,
+	logicalPage uint64,
+	exactPayload []byte,
+) uint32 {
+	t.Helper()
+	return vnextWriteExternalGrantLogicalPage(
+		t, fixture.owner.group, fixture.grant, logicalPage, exactPayload)
+}
+
+func vnextWriteExternalGrantLogicalPage(
+	t *testing.T,
+	group *vnextOwnerGroup,
+	grant vnextOwnerWriteGrant,
+	logicalPage uint64,
+	exactPayload []byte,
+) uint32 {
+	t.Helper()
+	if len(exactPayload) > int(vnextContentPageSize) {
+		t.Fatalf("external logical page %d payload is %d bytes", logicalPage, len(exactPayload))
+	}
+	page := make([]byte, int(vnextContentPageSize))
+	copy(page, exactPayload)
+	pageID := vnextExternalSealTestPageID(t, grant, logicalPage)
+	device := group.devices[pageID.DeviceUUID]
+	if device == nil {
+		t.Fatalf("external logical page %d references unknown device %q",
+			logicalPage, pageID.DeviceUUID)
+	}
+	contentOffset, err := device.superblock.Geometry.contentOffset(pageID.DataPageIndex)
+	if err != nil {
+		t.Fatalf("resolve external logical page %d: %v", logicalPage, err)
+	}
+	if err := vnextWriteAtFull(device.file, page, contentOffset); err != nil {
+		t.Fatalf("write external logical page %d: %v", logicalPage, err)
+	}
+	if err := device.file.Sync(); err != nil {
+		t.Fatalf("sync external logical page %d: %v", logicalPage, err)
+	}
+	return crc32.Checksum(page, vnextCRCTable)
+}
+
+func vnextPrepareCompleteExternalContent(
+	t *testing.T,
+	fixture *vnextExternalSealTestFixture,
+) []vnextExternalContentPageCRC {
+	t.Helper()
+	mmBytes, err := cxlcheckpoint.CanonicalMMTemplateBytes(fixture.publication.MMTemplate)
+	if err != nil {
+		t.Fatalf("encode fixture MMTemplate: %v", err)
+	}
+	pageMapBytes, err := cxlcheckpoint.CanonicalPageMapBytes(fixture.publication.PageMap)
+	if err != nil {
+		t.Fatalf("encode fixture active PageMap: %v", err)
+	}
+	// A non-empty inactive slot has no semantic representation in the current
+	// publication. Arbitrary older bytes are therefore valid when their exact
+	// grant length, zero tail, and CRC are all correct.
+	inactiveBytes := bytes.Repeat([]byte{0x6d}, fixture.controlSize[2])
+	payloads := map[uint64][]byte{
+		4: mmBytes,
+		5: pageMapBytes,
+		6: inactiveBytes,
+	}
+	records := make([]vnextExternalContentPageCRC, 0, len(payloads))
+	for logicalPage := uint64(4); logicalPage <= 6; logicalPage++ {
+		payload := payloads[logicalPage]
+		content := fixture.grant.Contents[logicalPage-4+1]
+		if content.LogicalPageStart != logicalPage ||
+			content.ByteLength != uint64(len(payload)) {
+			t.Fatalf("fixture content at logical page %d is %#v for %d bytes",
+				logicalPage, content, len(payload))
+		}
+		records = append(records, vnextExternalContentPageCRC{
+			LogicalPage:   logicalPage,
+			ContentCRC32C: vnextWriteExternalLogicalPage(t, fixture, logicalPage, payload),
+			CopyEngine:    vnextCRCCopyEngineCPU,
+		})
+	}
+	return records
+}
+
+func vnextCloneExternalContentCRCs(
+	records []vnextExternalContentPageCRC,
+) []vnextExternalContentPageCRC {
+	return append([]vnextExternalContentPageCRC(nil), records...)
+}
+
+func vnextSetExternalContentRecordCRC(
+	t *testing.T,
+	records []vnextExternalContentPageCRC,
+	logicalPage uint64,
+	crc uint32,
+) {
+	t.Helper()
+	for index := range records {
+		if records[index].LogicalPage == logicalPage {
+			records[index].ContentCRC32C = crc
+			return
+		}
+	}
+	t.Fatalf("external CRC record for logical page %d is missing", logicalPage)
+}
+
+func TestVNextOwnerServiceCompleteExternalSealAndCommit(t *testing.T) {
+	fixture := newVNextExternalSealTestFixture(t, vnextCRCCopyEngineCPU)
+	// Keep PageMapVersion at 1 but make the committed-root sequence distinct,
+	// so this test catches accidentally sourcing RootVersion from PageMap.
+	fixture.publication.Root.PublicationSequence = 11
+	service, err := newVNextOwnerService(fixture.owner.group, fixture.directory)
+	if err != nil {
+		t.Fatalf("build complete external Owner service: %v", err)
+	}
+	records := vnextPrepareCompleteExternalContent(t, fixture)
+	envelope, err := cxlcheckpoint.Encode(fixture.publication)
+	if err != nil {
+		t.Fatalf("encode complete external publication: %v", err)
+	}
+	identity := vnextOwnerServiceIdentity(fixture.grant)
+	sealed, err := service.sealExternal(vnextOwnerExternalSealRequest{
+		Operation:               identity,
+		PublicationEnvelope:     envelope,
+		CRCPageSidecars:         fixture.cloneSidecars(),
+		ExternalContentPageCRCs: records,
+	})
+	if err != nil {
+		t.Fatalf("seal complete external checkpoint: %v", err)
+	}
+	if sealed.Root.Locator.PublicationByteLength != uint64(len(envelope)) ||
+		sealed.Root.Locator.PublicationSHA256 != sha256.Sum256(envelope) ||
+		len(sealed.Root.Locator.PageRuns) != 1 {
+		t.Fatalf("unexpected complete external seal response: %#v", sealed)
+	}
+	publicationRoot := fixture.publication.Root
+	if sealed.Root.RootID != publicationRoot.RootID ||
+		sealed.Root.RootVersion != publicationRoot.PublicationSequence ||
+		sealed.Root.MMTemplateID != publicationRoot.MMTemplateID ||
+		sealed.Root.PageMapID != publicationRoot.PageMapID ||
+		sealed.Root.PageMapVersion != publicationRoot.PageMapVersion ||
+		sealed.Root.DeviceTableDigest != publicationRoot.DeviceTableDigest ||
+		sealed.Root.ContractID != cxlcheckpoint.V6CompatibilityID {
+		t.Fatalf("seal returned a root that differs from TRPUB006: %#v", sealed.Root)
+	}
+	fixture.assertAllocationDescriptorState(t, vnextDescriptorSealed)
+	transaction := fixture.owner.group.journal.Transactions[identity.AllocationRecordID]
+	if transaction == nil || transaction.State != vnextOwnerGranted {
+		t.Fatalf("seal changed lifecycle state before commit: %#v", transaction)
+	}
+	if err := service.commit(identity); err != nil {
+		t.Fatalf("commit complete external checkpoint: %v", err)
+	}
+}
+
+func TestVNextOwnerServiceCompleteExternalSealFailsBeforeAnyDescriptorWrite(t *testing.T) {
+	tests := []struct {
+		name   string
+		code   vnextOwnerServiceErrorCode
+		mutate func(*testing.T, *vnextExternalSealTestFixture, []vnextExternalContentPageCRC) []vnextExternalContentPageCRC
+	}{
+		{
+			name: "wrong-crc",
+			code: vnextOwnerServicePayloadMismatch,
+			mutate: func(_ *testing.T, _ *vnextExternalSealTestFixture, records []vnextExternalContentPageCRC) []vnextExternalContentPageCRC {
+				records[0].ContentCRC32C ^= 1
+				return records
+			},
+		},
+		{
+			name: "missing-record",
+			code: vnextOwnerServiceSidecarInvalid,
+			mutate: func(_ *testing.T, _ *vnextExternalSealTestFixture, records []vnextExternalContentPageCRC) []vnextExternalContentPageCRC {
+				return records[:len(records)-1]
+			},
+		},
+		{
+			name: "duplicate-record",
+			code: vnextOwnerServiceSidecarInvalid,
+			mutate: func(_ *testing.T, _ *vnextExternalSealTestFixture, records []vnextExternalContentPageCRC) []vnextExternalContentPageCRC {
+				return append(records, records[0])
+			},
+		},
+		{
+			name: "extra-record",
+			code: vnextOwnerServiceSidecarInvalid,
+			mutate: func(_ *testing.T, _ *vnextExternalSealTestFixture, records []vnextExternalContentPageCRC) []vnextExternalContentPageCRC {
+				return append(records, vnextExternalContentPageCRC{
+					LogicalPage:   99,
+					ContentCRC32C: 1,
+					CopyEngine:    vnextCRCCopyEngineCPU,
+				})
+			},
+		},
+		{
+			name: "memory-record",
+			code: vnextOwnerServiceSidecarInvalid,
+			mutate: func(_ *testing.T, _ *vnextExternalSealTestFixture, records []vnextExternalContentPageCRC) []vnextExternalContentPageCRC {
+				return append(records, vnextExternalContentPageCRC{
+					LogicalPage:   0,
+					ContentCRC32C: 1,
+					CopyEngine:    vnextCRCCopyEngineCPU,
+				})
+			},
+		},
+		{
+			name: "publication-record",
+			code: vnextOwnerServiceSidecarInvalid,
+			mutate: func(_ *testing.T, _ *vnextExternalSealTestFixture, records []vnextExternalContentPageCRC) []vnextExternalContentPageCRC {
+				return append(records, vnextExternalContentPageCRC{
+					LogicalPage:   7,
+					ContentCRC32C: 1,
+					CopyEngine:    vnextCRCCopyEngineCPU,
+				})
+			},
+		},
+		{
+			name: "mm-template-canonical-mismatch",
+			code: vnextOwnerServicePayloadMismatch,
+			mutate: func(t *testing.T, fixture *vnextExternalSealTestFixture, records []vnextExternalContentPageCRC) []vnextExternalContentPageCRC {
+				payload, err := cxlcheckpoint.CanonicalMMTemplateBytes(fixture.publication.MMTemplate)
+				if err != nil {
+					t.Fatalf("encode MMTemplate for corruption: %v", err)
+				}
+				payload[0] ^= 1
+				crc := vnextWriteExternalLogicalPage(t, fixture, 4, payload)
+				vnextSetExternalContentRecordCRC(t, records, 4, crc)
+				return records
+			},
+		},
+		{
+			name: "page-map-canonical-mismatch",
+			code: vnextOwnerServicePayloadMismatch,
+			mutate: func(t *testing.T, fixture *vnextExternalSealTestFixture, records []vnextExternalContentPageCRC) []vnextExternalContentPageCRC {
+				payload, err := cxlcheckpoint.CanonicalPageMapBytes(fixture.publication.PageMap)
+				if err != nil {
+					t.Fatalf("encode PageMap for corruption: %v", err)
+				}
+				payload[0] ^= 1
+				crc := vnextWriteExternalLogicalPage(t, fixture, 5, payload)
+				vnextSetExternalContentRecordCRC(t, records, 5, crc)
+				return records
+			},
+		},
+		{
+			name: "non-zero-tail",
+			code: vnextOwnerServicePayloadMismatch,
+			mutate: func(t *testing.T, fixture *vnextExternalSealTestFixture, records []vnextExternalContentPageCRC) []vnextExternalContentPageCRC {
+				payload, err := cxlcheckpoint.CanonicalMMTemplateBytes(fixture.publication.MMTemplate)
+				if err != nil {
+					t.Fatalf("encode MMTemplate for tail corruption: %v", err)
+				}
+				payload = append(payload, 0x7f)
+				crc := vnextWriteExternalLogicalPage(t, fixture, 4, payload)
+				vnextSetExternalContentRecordCRC(t, records, 4, crc)
+				return records
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newVNextExternalSealTestFixture(t, vnextCRCCopyEngineCPU)
+			service, err := newVNextOwnerService(fixture.owner.group, fixture.directory)
+			if err != nil {
+				t.Fatalf("build complete external Owner service: %v", err)
+			}
+			records := vnextCloneExternalContentCRCs(
+				vnextPrepareCompleteExternalContent(t, fixture))
+			records = test.mutate(t, fixture, records)
+			envelope, err := cxlcheckpoint.Encode(fixture.publication)
+			if err != nil {
+				t.Fatalf("encode complete external publication: %v", err)
+			}
+			_, err = service.sealExternal(vnextOwnerExternalSealRequest{
+				Operation:               vnextOwnerServiceIdentity(fixture.grant),
+				PublicationEnvelope:     envelope,
+				CRCPageSidecars:         fixture.cloneSidecars(),
+				ExternalContentPageCRCs: records,
+			})
+			requireVNextOwnerServiceCode(t, err, test.code)
+			// This assertion includes every memory descriptor. The unified
+			// phase-one validation must therefore never partially seal memory
+			// before discovering a later external-content failure.
+			fixture.assertAllocationDescriptorState(t, vnextDescriptorReserved)
+		})
+	}
+}
+
+func TestVNextExternalSealRejectsNonZeroZeroLengthCapacityPage(t *testing.T) {
+	owner := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "zero-length-capacity-device",
+		Size: 256 << 10,
+	}})
+	grant, err := owner.group.reserve(vnextCheckpointAllocationRequest{
+		RequestID:    "zero-length-capacity-request",
+		CheckpointID: "zero-length-capacity-checkpoint",
+		ProducerID:   "zero-length-capacity-producer",
+		OwnerID:      "owner-0",
+		OwnerEpoch:   7,
+		Contents: []vnextContentRequest{
+			{Kind: vnextContentPageMap, ObjectID: 1, ByteLength: 0, PageCount: 1},
+			{
+				Kind:       vnextContentPublication,
+				ObjectID:   2,
+				ByteLength: vnextContentPageSize,
+				PageCount:  1,
+			},
+		},
+		MaxExtents: 1,
+	})
+	if err != nil {
+		t.Fatalf("reserve zero-length capacity page: %v", err)
+	}
+	pageID := vnextExternalSealTestPageID(t, grant, 0)
+	device := owner.group.devices[pageID.DeviceUUID]
+	contentOffset, err := device.superblock.Geometry.contentOffset(pageID.DataPageIndex)
+	if err != nil {
+		t.Fatalf("resolve zero-length capacity page: %v", err)
+	}
+	nonZero := bytes.Repeat([]byte{0x9e}, int(vnextContentPageSize))
+	if err := vnextWriteAtFull(device.file, nonZero, contentOffset); err != nil {
+		t.Fatalf("write zero-length capacity page: %v", err)
+	}
+	if err := device.file.Sync(); err != nil {
+		t.Fatalf("sync zero-length capacity page: %v", err)
+	}
+	fragmentGrant := grant.fragmentGrants[pageID.DeviceUUID]
+	device.mu.Lock()
+	_, err = device.prepareExternallyWrittenPageLocked(
+		fragmentGrant,
+		0,
+		0,
+		pageID.DataPageIndex,
+		crc32.Checksum(nonZero, vnextCRCTable),
+		vnextCRCCopyEngineCPU)
+	device.mu.Unlock()
+	if !errors.Is(err, errVNextCorrupt) {
+		t.Fatalf("prepare non-zero zero-length capacity page error = %v, want corruption", err)
+	}
+	for _, extent := range grant.Extents {
+		attached := owner.group.devices[extent.DeviceUUID]
+		attached.mu.Lock()
+		for page := uint64(0); page < extent.PageCount; page++ {
+			descriptor, readErr := attached.readDescriptorLocked(extent.StartDataPageIndex + page)
+			if readErr != nil || descriptor.State != vnextDescriptorReserved {
+				attached.mu.Unlock()
+				t.Fatalf("descriptor %s/%d = %#v, err=%v; want RESERVED",
+					extent.DeviceUUID, extent.StartDataPageIndex+page, descriptor, readErr)
+			}
+		}
+		attached.mu.Unlock()
+	}
+}
+
+func TestVNextExternalContentCoverageIsDerivedFromGrantKinds(t *testing.T) {
+	grant := vnextOwnerWriteGrant{Contents: []vnextContentSegment{
+		{Kind: vnextContentMemory, ObjectID: 1, ByteLength: 2 * vnextContentPageSize, LogicalPageStart: 0, PageCount: 2},
+		{Kind: vnextContentArtifact, ObjectID: 2, ByteLength: vnextContentPageSize + 7, LogicalPageStart: 2, PageCount: 2},
+		{Kind: vnextContentMMTemplate, ObjectID: 3, ByteLength: 100, LogicalPageStart: 4, PageCount: 1},
+		{Kind: vnextContentPageMap, ObjectID: 4, ByteLength: 0, LogicalPageStart: 5, PageCount: 1},
+		{Kind: vnextContentRestoreBlob, ObjectID: 5, ByteLength: 17, LogicalPageStart: 6, PageCount: 1},
+		{Kind: vnextContentPublication, ObjectID: 6, ByteLength: vnextContentPageSize, LogicalPageStart: 7, PageCount: 1},
+	}}
+	expected, err := vnextExpectedExternalContentPages(grant)
+	if err != nil {
+		t.Fatalf("derive complete external content coverage: %v", err)
+	}
+	want := []vnextExpectedExternalContentPage{
+		{LogicalPage: 2, ContentObjectID: 2, ContentKind: vnextContentArtifact, PayloadLength: uint32(vnextContentPageSize)},
+		{LogicalPage: 3, ContentObjectID: 2, ContentKind: vnextContentArtifact, PayloadLength: 7},
+		{LogicalPage: 4, ContentObjectID: 3, ContentKind: vnextContentMMTemplate, PayloadLength: 100},
+		{LogicalPage: 5, ContentObjectID: 4, ContentKind: vnextContentPageMap, PayloadLength: uint32(vnextContentPageSize)},
+		{LogicalPage: 6, ContentObjectID: 5, ContentKind: vnextContentRestoreBlob, PayloadLength: 17},
+	}
+	if !bytes.Equal(mustMarshalJSON(t, expected), mustMarshalJSON(t, want)) {
+		t.Fatalf("derived external coverage = %#v, want %#v", expected, want)
 	}
 }
