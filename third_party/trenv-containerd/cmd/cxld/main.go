@@ -362,7 +362,8 @@ func writeDaemonResponse(conn net.Conn, payload []byte) {
 }
 
 func runCommand(req daemonRequest) execResponse {
-	return runCommandWithVNextOwnerRPC(req, activeVNextOwnerRPC)
+	return runCommandWithVNextOwnerGateway(
+		req, activeVNextOwnerRPC, activeVNextOwnerGateway)
 }
 
 func runCommandWithVNextOwnerRPC(
@@ -2215,7 +2216,23 @@ func validateVNextOwnerExclusiveLegacyConfig(config daemonConfig) error {
 }
 
 func serveConn(conn net.Conn) {
-	serveConnWithVNextOwnerRPC(conn, activeVNextOwnerRPC)
+	serveConnWithVNextOwnerGateway(
+		conn, activeVNextOwnerRPC, activeVNextOwnerGateway)
+}
+
+func serveConnWithVNextOwnerGateway(
+	conn net.Conn,
+	vnextOwnerRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
+) {
+	serveConnWithVNextOwnerGatewayLimits(
+		conn,
+		vnextOwnerRPC,
+		gateway,
+		daemonRequestAdmission,
+		daemonLargeAdmission,
+		daemonFrameReadTimeout,
+		daemonFrameWriteTimeout)
 }
 
 func serveConnWithVNextOwnerRPC(conn net.Conn, vnextOwnerRPC *vnextOwnerRPC) {
@@ -2236,6 +2253,20 @@ func serveConnWithVNextOwnerRPCLimits(
 	readTimeout time.Duration,
 	writeTimeout time.Duration,
 ) {
+	serveConnWithVNextOwnerGatewayLimits(
+		conn, vnextOwnerRPC, nil, requestAdmission, largeAdmission,
+		readTimeout, writeTimeout)
+}
+
+func serveConnWithVNextOwnerGatewayLimits(
+	conn net.Conn,
+	vnextOwnerRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
+	requestAdmission chan struct{},
+	largeAdmission chan struct{},
+	readTimeout time.Duration,
+	writeTimeout time.Duration,
+) {
 	if tryAcquireDaemonRequestAdmission(requestAdmission) {
 		defer func() { <-requestAdmission }()
 	} else {
@@ -2245,13 +2276,25 @@ func serveConnWithVNextOwnerRPCLimits(
 		_ = conn.Close()
 		return
 	}
-	serveAdmittedConnWithVNextOwnerRPCLimits(
-		conn, vnextOwnerRPC, largeAdmission, readTimeout, writeTimeout)
+	serveAdmittedConnWithVNextOwnerGatewayLimits(
+		conn, vnextOwnerRPC, gateway, largeAdmission, readTimeout, writeTimeout)
 }
 
 func serveAdmittedConnWithVNextOwnerRPCLimits(
 	conn net.Conn,
 	vnextOwnerRPC *vnextOwnerRPC,
+	largeAdmission chan struct{},
+	readTimeout time.Duration,
+	writeTimeout time.Duration,
+) {
+	serveAdmittedConnWithVNextOwnerGatewayLimits(
+		conn, vnextOwnerRPC, nil, largeAdmission, readTimeout, writeTimeout)
+}
+
+func serveAdmittedConnWithVNextOwnerGatewayLimits(
+	conn net.Conn,
+	vnextOwnerRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
 	largeAdmission chan struct{},
 	readTimeout time.Duration,
 	writeTimeout time.Duration,
@@ -2282,7 +2325,8 @@ func serveAdmittedConnWithVNextOwnerRPCLimits(
 		return
 	}
 
-	respBody, _ := json.Marshal(runCommandWithVNextOwnerRPC(req, vnextOwnerRPC))
+	respBody, _ := json.Marshal(runCommandWithVNextOwnerGateway(
+		req, vnextOwnerRPC, gateway))
 	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	writeDaemonResponse(conn, respBody)
 }
@@ -2348,6 +2392,22 @@ func main() {
 		"vnext-owner-tls-allowed-client-uri-sans",
 		envDefault("CXLD_VNEXT_OWNER_TLS_ALLOWED_CLIENT_URI_SANS", ""),
 		"comma-separated exact URI SAN identities allowed to call the strict VNext Owner mTLS listener")
+	vnextOwnerGatewayRoutes := flag.String(
+		"vnext-owner-gateway-routes",
+		envDefault("CXLD_VNEXT_OWNER_GATEWAY_ROUTES", ""),
+		"strict bounded VNext Owner gateway route-file v1")
+	vnextOwnerGatewayClientCertificate := flag.String(
+		"vnext-owner-gateway-client-cert",
+		envDefault("CXLD_VNEXT_OWNER_GATEWAY_CLIENT_CERT", ""),
+		"shared PEM client certificate for outbound VNext Owner gateway mTLS")
+	vnextOwnerGatewayClientPrivateKey := flag.String(
+		"vnext-owner-gateway-client-key",
+		envDefault("CXLD_VNEXT_OWNER_GATEWAY_CLIENT_KEY", ""),
+		"shared PEM client private key for outbound VNext Owner gateway mTLS")
+	vnextOwnerGatewayServerCA := flag.String(
+		"vnext-owner-gateway-server-ca",
+		envDefault("CXLD_VNEXT_OWNER_GATEWAY_SERVER_CA", ""),
+		"PEM CA used to authenticate outbound VNext Owner gateway servers")
 	flag.Parse()
 	if *publicationSchemaVersion != uint64(trenvpub.Version) {
 		fmt.Fprintf(
@@ -2466,6 +2526,21 @@ func main() {
 		}()
 		activeVNextOwnerRPC = newVNextOwnerRPC(vnextOwnerRuntime.service)
 	}
+	activeVNextOwnerGateway, err = openVNextOwnerGateway(
+		vnextOwnerGatewayConfig{
+			RouteFilePath:         *vnextOwnerGatewayRoutes,
+			ClientCertificatePath: *vnextOwnerGatewayClientCertificate,
+			ClientPrivateKeyPath:  *vnextOwnerGatewayClientPrivateKey,
+			ServerCAPath:          *vnextOwnerGatewayServerCA,
+		},
+		activeVNextOwnerRPC)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to open VNext Owner gateway: %v\n", err)
+		os.Exit(1)
+	}
+	if activeVNextOwnerGateway != nil {
+		defer activeVNextOwnerGateway.Close()
+	}
 	allowedVNextOwnerClientURISANs, err := parseVNextOwnerURIAllowlist(
 		*vnextOwnerTLSAllowedClientURISANs)
 	if err != nil {
@@ -2574,9 +2649,10 @@ func main() {
 		go func(admittedConn net.Conn) {
 			defer requestWG.Done()
 			defer func() { <-daemonRequestAdmission }()
-			serveAdmittedConnWithVNextOwnerRPCLimits(
+			serveAdmittedConnWithVNextOwnerGatewayLimits(
 				admittedConn,
 				activeVNextOwnerRPC,
+				activeVNextOwnerGateway,
 				daemonLargeAdmission,
 				daemonFrameReadTimeout,
 				daemonFrameWriteTimeout)

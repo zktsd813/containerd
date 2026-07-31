@@ -10,6 +10,7 @@ import (
 	"math"
 	"reflect"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -602,37 +603,18 @@ func vnextOwnerRPCPayload(operation string, request daemonRequest) (json.RawMess
 }
 
 func (rpc *vnextOwnerRPC) inventory(raw json.RawMessage) execResponse {
-	var wire vnextOwnerRPCInventoryRequest
-	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
-		return vnextOwnerRPCErrorResponse(err)
-	}
-	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
-		return vnextOwnerRPCErrorResponse(err)
-	}
-	if err := validateVNextOwnerClientText("inventory request ID", wire.RequestID); err != nil {
-		return vnextOwnerRPCErrorResponse(err)
-	}
-	if err := validateVNextOwnerClientText(
-		"expected Owner ID", wire.ExpectedOwnerID); err != nil {
-		return vnextOwnerRPCErrorResponse(err)
-	}
-	if wire.ExpectedOwnerEpoch == 0 ||
-		wire.ExpectedOwnerEpoch > uint64(math.MaxInt64) {
-		return vnextOwnerRPCErrorResponse(errors.New(
-			"expected Owner epoch is outside the signed ABI"))
-	}
-
-	response, err := rpc.service.inventory(vnextOwnerInventoryRequest{
-		RequestID:  wire.RequestID,
-		OwnerID:    wire.ExpectedOwnerID,
-		OwnerEpoch: wire.ExpectedOwnerEpoch,
-	})
+	request, err := decodeVNextOwnerRPCInventoryRequest(raw)
 	if err != nil {
 		return vnextOwnerRPCErrorResponse(err)
 	}
-	if response.RequestID != wire.RequestID ||
-		response.OwnerID != wire.ExpectedOwnerID ||
-		response.OwnerEpoch != wire.ExpectedOwnerEpoch ||
+
+	response, err := rpc.service.inventory(request)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	if response.RequestID != request.RequestID ||
+		response.OwnerID != request.OwnerID ||
+		response.OwnerEpoch != request.OwnerEpoch ||
 		response.SnapshotSequence == 0 ||
 		response.SnapshotSequence > uint64(math.MaxInt64) ||
 		len(response.Devices) == 0 ||
@@ -690,51 +672,39 @@ func (rpc *vnextOwnerRPC) inventory(raw json.RawMessage) execResponse {
 	return marshalVNextOwnerRPCResponse(wireResponse)
 }
 
-func (rpc *vnextOwnerRPC) reserve(raw json.RawMessage) execResponse {
-	var wire vnextOwnerRPCReserveRequest
+func decodeVNextOwnerRPCInventoryRequest(
+	raw json.RawMessage,
+) (vnextOwnerInventoryRequest, error) {
+	var wire vnextOwnerRPCInventoryRequest
 	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
-		return vnextOwnerRPCErrorResponse(err)
+		return vnextOwnerInventoryRequest{}, err
 	}
 	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
+		return vnextOwnerInventoryRequest{}, err
+	}
+	if err := validateVNextOwnerClientText("inventory request ID", wire.RequestID); err != nil {
+		return vnextOwnerInventoryRequest{}, err
+	}
+	if err := validateVNextOwnerClientText(
+		"expected Owner ID", wire.ExpectedOwnerID); err != nil {
+		return vnextOwnerInventoryRequest{}, err
+	}
+	if wire.ExpectedOwnerEpoch == 0 ||
+		wire.ExpectedOwnerEpoch > uint64(math.MaxInt64) {
+		return vnextOwnerInventoryRequest{}, errors.New(
+			"expected Owner epoch is outside the signed ABI")
+	}
+	return vnextOwnerInventoryRequest{
+		RequestID:  wire.RequestID,
+		OwnerID:    wire.ExpectedOwnerID,
+		OwnerEpoch: wire.ExpectedOwnerEpoch,
+	}, nil
+}
+
+func (rpc *vnextOwnerRPC) reserve(raw json.RawMessage) execResponse {
+	request, err := decodeVNextOwnerRPCReserveRequest(raw)
+	if err != nil {
 		return vnextOwnerRPCErrorResponse(err)
-	}
-	if wire.MaxExtents == 0 || wire.MaxExtents > vnextOwnerRPCMaxExtents {
-		return vnextOwnerRPCErrorResponse(fmt.Errorf(
-			"maxExtents %d is outside the RPC response-safe range 1..%d",
-			wire.MaxExtents, vnextOwnerRPCMaxExtents))
-	}
-	request := vnextOwnerReserveRequest{
-		RequestID:    wire.RequestID,
-		CheckpointID: wire.CheckpointID,
-		ProducerID:   wire.ProducerID,
-		OwnerID:      wire.OwnerID,
-		OwnerEpoch:   wire.OwnerEpoch,
-		Contents:     make([]vnextOwnerReserveContent, len(wire.Contents)),
-		MaxExtents:   wire.MaxExtents,
-	}
-	var externalContentPages uint64
-	for index, content := range wire.Contents {
-		kind, ok := vnextOwnerRPCContentKind(content.Kind)
-		if !ok {
-			return vnextOwnerRPCErrorResponse(fmt.Errorf(
-				"content %d has unsupported kind %q", index, content.Kind))
-		}
-		request.Contents[index] = vnextOwnerReserveContent{
-			Kind:          kind,
-			ObjectID:      content.ObjectID,
-			ByteLength:    content.ByteLength,
-			CapacityPages: content.CapacityPages,
-		}
-		if kind != vnextOwnerServiceContentMemory &&
-			kind != vnextOwnerServiceContentPublication {
-			if content.CapacityPages >
-				uint64(vnextOwnerRPCMaxExternalContentPageCRCs)-externalContentPages {
-				return vnextOwnerRPCErrorResponse(fmt.Errorf(
-					"producer-written non-memory content exceeds the RPC seal limit of %d pages",
-					vnextOwnerRPCMaxExternalContentPageCRCs))
-			}
-			externalContentPages += content.CapacityPages
-		}
 	}
 	response, err := rpc.service.reserve(request)
 	if err != nil {
@@ -784,82 +754,80 @@ func (rpc *vnextOwnerRPC) reserve(raw json.RawMessage) execResponse {
 	return marshalVNextOwnerRPCResponse(wireResponse)
 }
 
-func (rpc *vnextOwnerRPC) seal(raw json.RawMessage) execResponse {
-	var wire vnextOwnerRPCSealRequest
+func decodeVNextOwnerRPCReserveRequest(
+	raw json.RawMessage,
+) (vnextOwnerReserveRequest, error) {
+	var wire vnextOwnerRPCReserveRequest
 	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
-		return vnextOwnerRPCErrorResponse(err)
+		return vnextOwnerReserveRequest{}, err
 	}
 	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
+		return vnextOwnerReserveRequest{}, err
+	}
+	if wire.MaxExtents == 0 || wire.MaxExtents > vnextOwnerRPCMaxExtents {
+		return vnextOwnerReserveRequest{}, fmt.Errorf(
+			"maxExtents %d is outside the RPC response-safe range 1..%d",
+			wire.MaxExtents, vnextOwnerRPCMaxExtents)
+	}
+	request := vnextOwnerReserveRequest{
+		RequestID:    wire.RequestID,
+		CheckpointID: wire.CheckpointID,
+		ProducerID:   wire.ProducerID,
+		OwnerID:      wire.OwnerID,
+		OwnerEpoch:   wire.OwnerEpoch,
+		Contents:     make([]vnextOwnerReserveContent, len(wire.Contents)),
+		MaxExtents:   wire.MaxExtents,
+	}
+	var externalContentPages uint64
+	for index, content := range wire.Contents {
+		kind, ok := vnextOwnerRPCContentKind(content.Kind)
+		if !ok {
+			return vnextOwnerReserveRequest{}, fmt.Errorf(
+				"content %d has unsupported kind %q", index, content.Kind)
+		}
+		request.Contents[index] = vnextOwnerReserveContent{
+			Kind:          kind,
+			ObjectID:      content.ObjectID,
+			ByteLength:    content.ByteLength,
+			CapacityPages: content.CapacityPages,
+		}
+		if kind != vnextOwnerServiceContentMemory &&
+			kind != vnextOwnerServiceContentPublication {
+			if content.CapacityPages >
+				uint64(vnextOwnerRPCMaxExternalContentPageCRCs)-externalContentPages {
+				return vnextOwnerReserveRequest{}, fmt.Errorf(
+					"producer-written non-memory content exceeds the RPC seal limit of %d pages",
+					vnextOwnerRPCMaxExternalContentPageCRCs)
+			}
+			externalContentPages += content.CapacityPages
+		}
+	}
+	for _, identity := range []struct {
+		name  string
+		value string
+	}{
+		{"request ID", wire.RequestID},
+		{"checkpoint ID", wire.CheckpointID},
+		{"producer ID", wire.ProducerID},
+		{"Owner ID", wire.OwnerID},
+	} {
+		if err := validateVNextOwnerClientText(identity.name, identity.value); err != nil {
+			return vnextOwnerReserveRequest{}, err
+		}
+	}
+	if _, err := request.internal(); err != nil {
+		return vnextOwnerReserveRequest{}, fmt.Errorf(
+			"validate VNext reserve request: %w", err)
+	}
+	return request, nil
+}
+
+func (rpc *vnextOwnerRPC) seal(raw json.RawMessage) execResponse {
+	request, err := decodeVNextOwnerRPCSealRequest(raw)
+	if err != nil {
 		return vnextOwnerRPCErrorResponse(err)
 	}
-	if len(wire.PublicationEnvelope) == 0 ||
-		len(wire.PublicationEnvelope) > vnextOwnerRPCMaxPublicationBytes {
-		return vnextOwnerRPCErrorResponse(fmt.Errorf(
-			"publication envelope is %d bytes, allowed range is 1..%d",
-			len(wire.PublicationEnvelope), vnextOwnerRPCMaxPublicationBytes))
-	}
-	if len(wire.CRCPageSidecars) > vnextOwnerRPCMaxSidecars {
-		return vnextOwnerRPCErrorResponse(fmt.Errorf(
-			"CRC sidecar count %d exceeds %d",
-			len(wire.CRCPageSidecars), vnextOwnerRPCMaxSidecars))
-	}
-	sidecars := make(map[uint32][]byte, len(wire.CRCPageSidecars))
-	totalSidecarBytes := 0
-	for index, sidecar := range wire.CRCPageSidecars {
-		if sidecar.PagesImageID == 0 || len(sidecar.Bytes) == 0 {
-			return vnextOwnerRPCErrorResponse(fmt.Errorf(
-				"CRC sidecar %d has a zero pages-image ID or empty bytes", index))
-		}
-		if _, duplicate := sidecars[sidecar.PagesImageID]; duplicate {
-			return vnextOwnerRPCErrorResponse(fmt.Errorf(
-				"CRC sidecar pages-image ID %d is duplicated", sidecar.PagesImageID))
-		}
-		if len(sidecar.Bytes) > vnextOwnerRPCMaxSidecarBytes-totalSidecarBytes {
-			return vnextOwnerRPCErrorResponse(fmt.Errorf(
-				"CRC sidecar bytes exceed transport limit %d", vnextOwnerRPCMaxSidecarBytes))
-		}
-		totalSidecarBytes += len(sidecar.Bytes)
-		sidecars[sidecar.PagesImageID] = sidecar.Bytes
-	}
-	if len(wire.ExternalContentPageCRCs) > vnextOwnerRPCMaxExternalContentPageCRCs {
-		return vnextOwnerRPCErrorResponse(fmt.Errorf(
-			"external content CRC count %d exceeds %d",
-			len(wire.ExternalContentPageCRCs),
-			vnextOwnerRPCMaxExternalContentPageCRCs))
-	}
-	externalContentPageCRCs := make(
-		[]vnextExternalContentPageCRC, len(wire.ExternalContentPageCRCs))
-	seenLogicalPages := make(map[uint64]struct{}, len(wire.ExternalContentPageCRCs))
-	for index, record := range wire.ExternalContentPageCRCs {
-		if record.LogicalPage > uint64(math.MaxInt64) {
-			return vnextOwnerRPCErrorResponse(fmt.Errorf(
-				"external content CRC %d logical page %d exceeds the signed ABI",
-				index, record.LogicalPage))
-		}
-		engine := vnextCRCCopyEngine(record.CopyEngine)
-		if !engine.valid() {
-			return vnextOwnerRPCErrorResponse(fmt.Errorf(
-				"external content CRC %d has unsupported copy engine %d",
-				index, record.CopyEngine))
-		}
-		if _, duplicate := seenLogicalPages[record.LogicalPage]; duplicate {
-			return vnextOwnerRPCErrorResponse(fmt.Errorf(
-				"external content logical page %d is duplicated",
-				record.LogicalPage))
-		}
-		seenLogicalPages[record.LogicalPage] = struct{}{}
-		externalContentPageCRCs[index] = vnextExternalContentPageCRC{
-			LogicalPage:   record.LogicalPage,
-			ContentCRC32C: record.ContentCRC32C,
-			CopyEngine:    engine,
-		}
-	}
-	response, err := rpc.service.sealExternal(vnextOwnerExternalSealRequest{
-		Operation:               wire.Identity.internal(),
-		PublicationEnvelope:     wire.PublicationEnvelope,
-		CRCPageSidecars:         sidecars,
-		ExternalContentPageCRCs: externalContentPageCRCs,
-	})
+	response, err := rpc.service.sealExternal(request)
 	if err != nil {
 		return vnextOwnerRPCErrorResponse(err)
 	}
@@ -898,6 +866,90 @@ func (rpc *vnextOwnerRPC) seal(raw json.RawMessage) execResponse {
 	return marshalVNextOwnerRPCResponse(wireResponse)
 }
 
+func decodeVNextOwnerRPCSealRequest(
+	raw json.RawMessage,
+) (vnextOwnerExternalSealRequest, error) {
+	var wire vnextOwnerRPCSealRequest
+	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
+		return vnextOwnerExternalSealRequest{}, err
+	}
+	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
+		return vnextOwnerExternalSealRequest{}, err
+	}
+	if len(wire.PublicationEnvelope) == 0 ||
+		len(wire.PublicationEnvelope) > vnextOwnerRPCMaxPublicationBytes {
+		return vnextOwnerExternalSealRequest{}, fmt.Errorf(
+			"publication envelope is %d bytes, allowed range is 1..%d",
+			len(wire.PublicationEnvelope), vnextOwnerRPCMaxPublicationBytes)
+	}
+	if len(wire.CRCPageSidecars) > vnextOwnerRPCMaxSidecars {
+		return vnextOwnerExternalSealRequest{}, fmt.Errorf(
+			"CRC sidecar count %d exceeds %d",
+			len(wire.CRCPageSidecars), vnextOwnerRPCMaxSidecars)
+	}
+	sidecars := make(map[uint32][]byte, len(wire.CRCPageSidecars))
+	totalSidecarBytes := 0
+	for index, sidecar := range wire.CRCPageSidecars {
+		if sidecar.PagesImageID == 0 || len(sidecar.Bytes) == 0 {
+			return vnextOwnerExternalSealRequest{}, fmt.Errorf(
+				"CRC sidecar %d has a zero pages-image ID or empty bytes", index)
+		}
+		if _, duplicate := sidecars[sidecar.PagesImageID]; duplicate {
+			return vnextOwnerExternalSealRequest{}, fmt.Errorf(
+				"CRC sidecar pages-image ID %d is duplicated", sidecar.PagesImageID)
+		}
+		if len(sidecar.Bytes) > vnextOwnerRPCMaxSidecarBytes-totalSidecarBytes {
+			return vnextOwnerExternalSealRequest{}, fmt.Errorf(
+				"CRC sidecar bytes exceed transport limit %d", vnextOwnerRPCMaxSidecarBytes)
+		}
+		totalSidecarBytes += len(sidecar.Bytes)
+		sidecars[sidecar.PagesImageID] = sidecar.Bytes
+	}
+	if len(wire.ExternalContentPageCRCs) > vnextOwnerRPCMaxExternalContentPageCRCs {
+		return vnextOwnerExternalSealRequest{}, fmt.Errorf(
+			"external content CRC count %d exceeds %d",
+			len(wire.ExternalContentPageCRCs),
+			vnextOwnerRPCMaxExternalContentPageCRCs)
+	}
+	externalContentPageCRCs := make(
+		[]vnextExternalContentPageCRC, len(wire.ExternalContentPageCRCs))
+	seenLogicalPages := make(map[uint64]struct{}, len(wire.ExternalContentPageCRCs))
+	for index, record := range wire.ExternalContentPageCRCs {
+		if record.LogicalPage > uint64(math.MaxInt64) {
+			return vnextOwnerExternalSealRequest{}, fmt.Errorf(
+				"external content CRC %d logical page %d exceeds the signed ABI",
+				index, record.LogicalPage)
+		}
+		engine := vnextCRCCopyEngine(record.CopyEngine)
+		if !engine.valid() {
+			return vnextOwnerExternalSealRequest{}, fmt.Errorf(
+				"external content CRC %d has unsupported copy engine %d",
+				index, record.CopyEngine)
+		}
+		if _, duplicate := seenLogicalPages[record.LogicalPage]; duplicate {
+			return vnextOwnerExternalSealRequest{}, fmt.Errorf(
+				"external content logical page %d is duplicated",
+				record.LogicalPage)
+		}
+		seenLogicalPages[record.LogicalPage] = struct{}{}
+		externalContentPageCRCs[index] = vnextExternalContentPageCRC{
+			LogicalPage:   record.LogicalPage,
+			ContentCRC32C: record.ContentCRC32C,
+			CopyEngine:    engine,
+		}
+	}
+	request := vnextOwnerExternalSealRequest{
+		Operation:               wire.Identity.internal(),
+		PublicationEnvelope:     wire.PublicationEnvelope,
+		CRCPageSidecars:         sidecars,
+		ExternalContentPageCRCs: externalContentPageCRCs,
+	}
+	if err := validateVNextOwnerClientOperationIdentity(request.Operation); err != nil {
+		return vnextOwnerExternalSealRequest{}, err
+	}
+	return request, nil
+}
+
 func (rpc *vnextOwnerRPC) commit(raw json.RawMessage) execResponse {
 	return rpc.lifecycle(raw, vnextOwnerRPCOperationCommit, "COMMITTED", rpc.service.commit)
 }
@@ -912,14 +964,11 @@ func (rpc *vnextOwnerRPC) lifecycle(
 	state string,
 	apply func(vnextOwnerOperationIdentity) error,
 ) execResponse {
-	var wire vnextOwnerRPCLifecycleRequest
-	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
+	identity, err := decodeVNextOwnerRPCLifecycleRequest(raw)
+	if err != nil {
 		return vnextOwnerRPCErrorResponse(err)
 	}
-	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
-		return vnextOwnerRPCErrorResponse(err)
-	}
-	if err := apply(wire.Identity.internal()); err != nil {
+	if err := apply(identity); err != nil {
 		return vnextOwnerRPCErrorResponse(err)
 	}
 	return marshalVNextOwnerRPCResponse(vnextOwnerRPCLifecycleResponse{
@@ -929,7 +978,27 @@ func (rpc *vnextOwnerRPC) lifecycle(
 	})
 }
 
+func decodeVNextOwnerRPCLifecycleRequest(
+	raw json.RawMessage,
+) (vnextOwnerOperationIdentity, error) {
+	var wire vnextOwnerRPCLifecycleRequest
+	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
+		return vnextOwnerOperationIdentity{}, err
+	}
+	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
+		return vnextOwnerOperationIdentity{}, err
+	}
+	identity := wire.Identity.internal()
+	if err := validateVNextOwnerClientOperationIdentity(identity); err != nil {
+		return vnextOwnerOperationIdentity{}, err
+	}
+	return identity, nil
+}
+
 func decodeStrictVNextOwnerRPC(raw []byte, target interface{}) error {
+	if !utf8.Valid(raw) {
+		return fmt.Errorf("decode %s request: JSON is not valid UTF-8", vnextOwnerRPCProtocol)
+	}
 	if err := validateVNextOwnerRPCJSONShape(raw, target); err != nil {
 		return fmt.Errorf("decode %s request: %w", vnextOwnerRPCProtocol, err)
 	}
@@ -1069,6 +1138,8 @@ func validateVNextOwnerRPCJSONValue(
 			limit = vnextOwnerRPCMaxExternalContentPageCRCs
 		case reflect.TypeOf(vnextOwnerRPCInventoryDevices{}):
 			limit = vnextOwnerRPCMaxInventoryDevices
+		case reflect.TypeOf(vnextOwnerGatewayRouteWires{}):
+			limit = vnextOwnerGatewayMaxRoutes
 		}
 		count := 0
 		for decoder.More() {

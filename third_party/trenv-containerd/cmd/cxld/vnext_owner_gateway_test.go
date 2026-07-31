@@ -1,0 +1,581 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type vnextOwnerGatewayTestTransport struct {
+	roundTrip func(context.Context, daemonRequest) (execResponse, error)
+}
+
+func (transport *vnextOwnerGatewayTestTransport) RoundTrip(
+	ctx context.Context,
+	request daemonRequest,
+) (execResponse, error) {
+	return transport.roundTrip(ctx, request)
+}
+
+func vnextOwnerGatewayTestRouteFile(
+	ownerID string,
+	ownerEpoch uint64,
+	endpoint string,
+) []byte {
+	return []byte(fmt.Sprintf(
+		`{"protocol":%q,"routes":[{"ownerId":%q,"ownerEpoch":%d,"endpoint":%q,"serverName":"owner.test","serverUriSan":"spiffe://trenv.test/owner/owner-0"}]}`,
+		vnextOwnerGatewayProtocol, ownerID, ownerEpoch, endpoint))
+}
+
+func vnextOwnerGatewayTestConfig(routePath string) vnextOwnerGatewayConfig {
+	return vnextOwnerGatewayConfig{
+		RouteFilePath:         routePath,
+		ClientCertificatePath: "/test/client.pem",
+		ClientPrivateKeyPath:  "/test/client-key.pem",
+		ServerCAPath:          "/test/ca.pem",
+	}
+}
+
+func openVNextOwnerGatewayForTest(
+	t *testing.T,
+	raw []byte,
+	localRPC *vnextOwnerRPC,
+	transport vnextOwnerClientRoundTripper,
+) *vnextOwnerGateway {
+	t.Helper()
+	gateway, err := openVNextOwnerGatewayWithDependencies(
+		vnextOwnerGatewayTestConfig("/test/routes.json"),
+		localRPC,
+		vnextOwnerGatewayDependencies{
+			loadRouteFile: func(string) ([]byte, error) {
+				return append([]byte(nil), raw...), nil
+			},
+			newTransport: func(vnextOwnerTLSClientConfig) (vnextOwnerClientRoundTripper, error) {
+				return transport, nil
+			},
+		})
+	if err != nil {
+		t.Fatalf("open test VNext Owner gateway: %v", err)
+	}
+	t.Cleanup(func() { _ = gateway.Close() })
+	return gateway
+}
+
+func vnextOwnerGatewayTestInventoryDaemonRequest(
+	t *testing.T,
+	ownerID string,
+	ownerEpoch uint64,
+	requestID string,
+) daemonRequest {
+	t.Helper()
+	raw, err := json.Marshal(vnextOwnerRPCInventoryRequest{
+		Protocol:           vnextOwnerRPCProtocol,
+		RequestID:          requestID,
+		ExpectedOwnerID:    ownerID,
+		ExpectedOwnerEpoch: ownerEpoch,
+	})
+	if err != nil {
+		t.Fatalf("marshal inventory request: %v", err)
+	}
+	return daemonRequest{
+		CommandLabel:        "scheduler-gateway-test",
+		Operation:           vnextOwnerRPCOperationInventory,
+		VNextOwnerInventory: raw,
+	}
+}
+
+func vnextOwnerGatewayTestReserveDaemonRequest(
+	t *testing.T,
+	wire vnextOwnerRPCReserveRequest,
+) daemonRequest {
+	t.Helper()
+	raw, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("marshal gateway Reserve request: %v", err)
+	}
+	return daemonRequest{
+		CommandLabel:      "scheduler-gateway-test",
+		Operation:         vnextOwnerRPCOperationReserve,
+		VNextOwnerReserve: raw,
+	}
+}
+
+func vnextOwnerGatewayTestInventoryTransport(
+	calls *int64,
+	entered chan<- struct{},
+	release <-chan struct{},
+) *vnextOwnerGatewayTestTransport {
+	return &vnextOwnerGatewayTestTransport{roundTrip: func(
+		ctx context.Context,
+		request daemonRequest,
+	) (execResponse, error) {
+		if calls != nil {
+			atomic.AddInt64(calls, 1)
+		}
+		if entered != nil {
+			select {
+			case entered <- struct{}{}:
+			case <-ctx.Done():
+				return execResponse{}, ctx.Err()
+			}
+		}
+		if release != nil {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return execResponse{}, ctx.Err()
+			}
+		}
+		decoded, err := decodeVNextOwnerRPCInventoryRequest(request.VNextOwnerInventory)
+		if err != nil {
+			return execResponse{}, err
+		}
+		response := vnextOwnerRPCInventoryResponse{
+			Protocol:         vnextOwnerRPCProtocol,
+			Operation:        vnextOwnerRPCOperationInventory,
+			RequestID:        decoded.RequestID,
+			OwnerID:          decoded.OwnerID,
+			OwnerEpoch:       decoded.OwnerEpoch,
+			SnapshotSequence: 1,
+			Devices: vnextOwnerRPCInventoryDevices{{
+				DeviceUUID: "gateway-test-device", TotalDataPages: 16, FreeDataPages: 16,
+			}},
+		}
+		outer := marshalVNextOwnerRPCResponse(response)
+		outer.Operation = vnextOwnerRPCOperationInventory
+		outer.DurationMicros = 1
+		return outer, nil
+	}}
+}
+
+func vnextOwnerGatewayUnixRoundTrip(
+	t *testing.T,
+	localRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
+	request daemonRequest,
+) execResponse {
+	t.Helper()
+	server, client := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		serveConnWithVNextOwnerGatewayLimits(
+			server, localRPC, gateway, make(chan struct{}, 4),
+			make(chan struct{}, 1), time.Second, time.Second)
+		close(done)
+	}()
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal gateway daemon request: %v", err)
+	}
+	if err := writeFrame(client, body); err != nil {
+		_ = client.Close()
+		t.Fatalf("write gateway daemon request: %v", err)
+	}
+	responseBody, err := readFrame(client)
+	if err != nil {
+		_ = client.Close()
+		t.Fatalf("read gateway daemon response: %v", err)
+	}
+	_ = client.Close()
+	<-done
+	var response execResponse
+	if err := json.Unmarshal(responseBody, &response); err != nil {
+		t.Fatalf("decode gateway daemon response: %v", err)
+	}
+	return response
+}
+
+func TestVNextOwnerGatewayConfigurationIsAllOrNothing(t *testing.T) {
+	if gateway, err := openVNextOwnerGateway(vnextOwnerGatewayConfig{}, nil); err != nil || gateway != nil {
+		t.Fatalf("empty gateway config = %#v, %v; want nil, nil", gateway, err)
+	}
+	_, err := openVNextOwnerGateway(vnextOwnerGatewayConfig{
+		RouteFilePath: "/test/routes.json",
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "requires route file") {
+		t.Fatalf("partial gateway config error = %v", err)
+	}
+}
+
+func TestVNextOwnerGatewayRejectsNonCanonicalRouteFiles(t *testing.T) {
+	validRoute := `{"ownerId":"owner-0","ownerEpoch":7,"endpoint":"127.0.0.1:1","serverName":"owner.test","serverUriSan":"spiffe://trenv.test/owner/owner-0"}`
+	tests := map[string]string{
+		"unknown field":         `{"protocol":"cxld.vnext-owner-gateway.v1","routes":[],"extra":1}`,
+		"trailing JSON":         `{"protocol":"cxld.vnext-owner-gateway.v1","routes":[]}{}`,
+		"duplicate field":       `{"protocol":"cxld.vnext-owner-gateway.v1","protocol":"cxld.vnext-owner-gateway.v1","routes":[]}`,
+		"empty routes":          `{"protocol":"cxld.vnext-owner-gateway.v1","routes":[]}`,
+		"signed epoch overflow": `{"protocol":"cxld.vnext-owner-gateway.v1","routes":[{"ownerId":"owner-0","ownerEpoch":9223372036854775808,"endpoint":"127.0.0.1:1","serverName":"owner.test","serverUriSan":"spiffe://trenv.test/owner/owner-0"}]}`,
+		"server name control":   `{"protocol":"cxld.vnext-owner-gateway.v1","routes":[{"ownerId":"owner-0","ownerEpoch":7,"endpoint":"127.0.0.1:1","serverName":"owner\u0000.test","serverUriSan":"spiffe://trenv.test/owner/owner-0"}]}`,
+		"duplicate incarnation": `{"protocol":"cxld.vnext-owner-gateway.v1","routes":[` + validRoute + `,` + strings.Replace(validRoute, "127.0.0.1:1", "127.0.0.1:2", 1) + `]}`,
+		"duplicate route":       `{"protocol":"cxld.vnext-owner-gateway.v1","routes":[` + validRoute + `,` + strings.Replace(validRoute, "owner-0", "owner-1", 1) + `]}`,
+	}
+	transport := vnextOwnerGatewayTestInventoryTransport(nil, nil, nil)
+	for name, raw := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := openVNextOwnerGatewayWithDependencies(
+				vnextOwnerGatewayTestConfig("/test/routes.json"), nil,
+				vnextOwnerGatewayDependencies{
+					loadRouteFile: func(string) ([]byte, error) { return []byte(raw), nil },
+					newTransport: func(vnextOwnerTLSClientConfig) (vnextOwnerClientRoundTripper, error) {
+						return transport, nil
+					},
+				})
+			if err == nil {
+				t.Fatal("non-canonical gateway route file was accepted")
+			}
+		})
+	}
+}
+
+func TestVNextOwnerGatewayRouteCardinalityIsBoundedDuringStrictDecode(t *testing.T) {
+	routes := make([]string, vnextOwnerGatewayMaxRoutes+1)
+	for index := range routes {
+		routes[index] = fmt.Sprintf(
+			`{"ownerId":"owner-%d","ownerEpoch":7,"endpoint":"127.0.0.1:%d","serverName":"owner.test","serverUriSan":"spiffe://trenv.test/owner/%d"}`,
+			index, index+1, index)
+	}
+	raw := []byte(`{"protocol":"cxld.vnext-owner-gateway.v1","routes":[` +
+		strings.Join(routes, ",") + `]}`)
+	var decoded vnextOwnerGatewayRouteFile
+	err := decodeStrictVNextOwnerRPC(raw, &decoded)
+	if err == nil || !strings.Contains(err.Error(), "more than 4096") {
+		t.Fatalf("oversized route-array error = %v", err)
+	}
+}
+
+func TestVNextOwnerGatewaySecureRouteFileRejectsUnsafeFiles(t *testing.T) {
+	directory := t.TempDir()
+	regular := filepath.Join(directory, "routes.json")
+	if err := os.WriteFile(regular, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symlink := filepath.Join(directory, "routes-link.json")
+	if err := os.Symlink(regular, symlink); err != nil {
+		t.Fatal(err)
+	}
+	worldWritable := filepath.Join(directory, "routes-world.json")
+	if err := os.WriteFile(worldWritable, []byte("{}"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(worldWritable, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	oversized := filepath.Join(directory, "routes-large.json")
+	file, err := os.OpenFile(oversized, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(vnextOwnerGatewayMaxRouteFileBytes + 1); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{directory, symlink, worldWritable, oversized} {
+		if _, err := readSecureVNextOwnerGatewayRouteFile(path); err == nil {
+			t.Fatalf("unsafe route file %q was accepted", path)
+		}
+	}
+}
+
+func TestVNextOwnerGatewayRouteFileOwnerMustMatchEffectiveUID(t *testing.T) {
+	effectiveUID := os.Geteuid()
+	if err := validateVNextOwnerGatewayRouteFileOwner(
+		uint32(effectiveUID), effectiveUID); err != nil {
+		t.Fatalf("matching route-file owner was rejected: %v", err)
+	}
+	foreignUID := uint32(0)
+	if effectiveUID == 0 {
+		foreignUID = 1
+	}
+	if err := validateVNextOwnerGatewayRouteFileOwner(
+		foreignUID, effectiveUID); err == nil {
+		t.Fatal("foreign route-file owner UID was accepted")
+	}
+}
+
+func TestVNextOwnerGatewayRouteFileStabilityDetectsInPlaceRewrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.json")
+	if err := os.WriteFile(path, []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("other"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changedTime := before.ModTime().Add(2 * time.Second)
+	if err := os.Chtimes(path, changedTime, changedTime); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) || before.Size() != after.Size() ||
+		before.Mode() != after.Mode() {
+		t.Fatalf("test setup changed identity, size, or mode: before=%#v after=%#v", before, after)
+	}
+	if err := validateVNextOwnerGatewayRouteFileStable(before, after); err == nil {
+		t.Fatal("same-size in-place route-file rewrite was accepted as stable")
+	}
+}
+
+func TestVNextOwnerGatewayUnknownAndStaleOwnersFailBeforeNetwork(t *testing.T) {
+	var calls int64
+	gateway := openVNextOwnerGatewayForTest(
+		t, vnextOwnerGatewayTestRouteFile("owner-0", 7, "127.0.0.1:1"), nil,
+		vnextOwnerGatewayTestInventoryTransport(&calls, nil, nil))
+	for _, request := range []daemonRequest{
+		vnextOwnerGatewayTestInventoryDaemonRequest(t, "unknown", 7, "unknown"),
+		vnextOwnerGatewayTestInventoryDaemonRequest(t, "owner-0", 6, "stale"),
+	} {
+		response := gateway.dispatch(request)
+		if response.Ok || response.ErrorCode != string(vnextOwnerServiceIdentityMismatch) ||
+			response.Operation != vnextOwnerRPCOperationInventory || response.DurationMicros < 0 {
+			t.Fatalf("unexpected exact-route rejection: %#v", response)
+		}
+	}
+	if got := atomic.LoadInt64(&calls); got != 0 {
+		t.Fatalf("network calls = %d, want 0", got)
+	}
+}
+
+func TestVNextOwnerGatewayForwardsAuthenticatedBoundedRemoteFailureUnchanged(t *testing.T) {
+	want := execResponse{
+		Ok:             false,
+		Stderr:         "remote diagnostic",
+		ExitCode:       23,
+		Error:          "remote Owner rejected the exact request",
+		ErrorCode:      string(vnextOwnerServiceIdentityMismatch),
+		Operation:      vnextOwnerRPCOperationInventory,
+		DurationMicros: 987,
+	}
+	transport := &vnextOwnerGatewayTestTransport{roundTrip: func(
+		context.Context,
+		daemonRequest,
+	) (execResponse, error) {
+		return want, nil
+	}}
+	gateway := openVNextOwnerGatewayForTest(
+		t, vnextOwnerGatewayTestRouteFile("owner-0", 7, "127.0.0.1:1"),
+		nil, transport)
+	got := gateway.dispatch(vnextOwnerGatewayTestInventoryDaemonRequest(
+		t, "owner-0", 7, "remote-failure"))
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("forwarded remote failure = %#v, want %#v", got, want)
+	}
+}
+
+func TestVNextOwnerGatewayUsesExactLocalOwnerWithoutNetwork(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "gateway-local-device", Size: 256 << 10,
+	}})
+	localRPC := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+	var calls int64
+	gateway := openVNextOwnerGatewayForTest(
+		t, vnextOwnerGatewayTestRouteFile("remote-owner", 9, "127.0.0.1:1"),
+		localRPC, vnextOwnerGatewayTestInventoryTransport(&calls, nil, nil))
+	response := vnextOwnerGatewayUnixRoundTrip(
+		t, localRPC, gateway,
+		vnextOwnerGatewayTestInventoryDaemonRequest(t, "owner-0", 7, "local"))
+	if !response.Ok || response.Operation != vnextOwnerRPCOperationInventory ||
+		response.DurationMicros < 0 {
+		t.Fatalf("unexpected local gateway response: %#v", response)
+	}
+	if got := atomic.LoadInt64(&calls); got != 0 {
+		t.Fatalf("network calls = %d, want 0", got)
+	}
+}
+
+func TestVNextOwnerGatewayRejectsMalformedReserveIdentityBeforeLocalAllocation(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "gateway-local-reserve-device", Size: 256 << 10,
+	}})
+	localRPC := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+	var calls int64
+	gateway := openVNextOwnerGatewayForTest(
+		t, vnextOwnerGatewayTestRouteFile("remote-owner", 9, "127.0.0.1:1"),
+		localRPC, vnextOwnerGatewayTestInventoryTransport(&calls, nil, nil))
+	tests := map[string]func(*vnextOwnerRPCReserveRequest){
+		"request whitespace": func(request *vnextOwnerRPCReserveRequest) {
+			request.RequestID = " reserve-request"
+		},
+		"checkpoint control": func(request *vnextOwnerRPCReserveRequest) {
+			request.CheckpointID = "reserve\ncheckpoint"
+		},
+		"producer whitespace": func(request *vnextOwnerRPCReserveRequest) {
+			request.ProducerID = "reserve-producer "
+		},
+		"Owner whitespace": func(request *vnextOwnerRPCReserveRequest) {
+			request.OwnerID = "owner-0 "
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			wire := vnextOwnerRPCTestReserveRequest("owner-0")
+			mutate(&wire)
+			response := vnextOwnerGatewayUnixRoundTrip(
+				t, localRPC, gateway,
+				vnextOwnerGatewayTestReserveDaemonRequest(t, wire))
+			if response.Ok ||
+				response.ErrorCode != string(vnextOwnerServiceInvalidRequest) ||
+				response.Operation != vnextOwnerRPCOperationReserve ||
+				response.DurationMicros < 0 {
+				t.Fatalf("malformed local Reserve response: %#v", response)
+			}
+		})
+	}
+	if count := vnextOwnerTLSTestTransactionCount(fixture); count != 0 {
+		t.Fatalf("local Owner transactions = %d, want 0", count)
+	}
+	if got := atomic.LoadInt64(&calls); got != 0 {
+		t.Fatalf("network calls = %d, want 0", got)
+	}
+}
+
+func TestVNextOwnerGatewayRejectsMalformedReserveIdentityBeforeRemoteNetwork(t *testing.T) {
+	var calls int64
+	gateway := openVNextOwnerGatewayForTest(
+		t, vnextOwnerGatewayTestRouteFile("owner-0", 7, "127.0.0.1:1"), nil,
+		vnextOwnerGatewayTestInventoryTransport(&calls, nil, nil))
+	wire := vnextOwnerRPCTestReserveRequest("owner-0")
+	wire.ProducerID = "remote-producer\x00"
+	response := gateway.dispatch(vnextOwnerGatewayTestReserveDaemonRequest(t, wire))
+	if response.Ok || response.ErrorCode != string(vnextOwnerServiceInvalidRequest) {
+		t.Fatalf("malformed remote Reserve response: %#v", response)
+	}
+	validRaw, err := json.Marshal(vnextOwnerRPCTestReserveRequest("owner-0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidRaw := bytes.Replace(
+		validRaw, []byte("rpc-reserve-producer"), []byte{0xff}, 1)
+	response = gateway.dispatch(daemonRequest{
+		CommandLabel:      "scheduler-gateway-test",
+		Operation:         vnextOwnerRPCOperationReserve,
+		VNextOwnerReserve: invalidRaw,
+	})
+	if response.Ok || response.ErrorCode != string(vnextOwnerServiceInvalidRequest) {
+		t.Fatalf("invalid-UTF-8 remote Reserve response: %#v", response)
+	}
+	if got := atomic.LoadInt64(&calls); got != 0 {
+		t.Fatalf("network calls = %d, want 0", got)
+	}
+}
+
+func TestVNextOwnerGatewaySchedulerOnlyInventoryAndReserveUseRealMutualTLS(t *testing.T) {
+	material := newVNextOwnerTLSTestMaterial(t)
+	server, fixture, _ := startVNextOwnerTLSTestServer(t, material, nil)
+	directory := t.TempDir()
+	routePath := filepath.Join(directory, "routes.json")
+	if err := os.WriteFile(routePath, vnextOwnerGatewayTestRouteFile(
+		"owner-0", 7, server.Addr().String()), 0o600); err != nil {
+		t.Fatalf("write gateway route file: %v", err)
+	}
+	gateway, err := openVNextOwnerGateway(vnextOwnerGatewayConfig{
+		RouteFilePath:         routePath,
+		ClientCertificatePath: material.clientCertificatePath,
+		ClientPrivateKeyPath:  material.clientPrivateKeyPath,
+		ServerCAPath:          material.caPath,
+	}, nil)
+	if err != nil {
+		t.Fatalf("open Scheduler-only VNext Owner gateway: %v", err)
+	}
+	t.Cleanup(func() { _ = gateway.Close() })
+
+	inventory := vnextOwnerGatewayUnixRoundTrip(
+		t, nil, gateway,
+		vnextOwnerGatewayTestInventoryDaemonRequest(t, "owner-0", 7, "tls-inventory"))
+	if !inventory.Ok || inventory.Operation != vnextOwnerRPCOperationInventory ||
+		inventory.DurationMicros < 0 {
+		t.Fatalf("gateway Inventory over mTLS failed: %#v", inventory)
+	}
+	reserve := vnextOwnerGatewayUnixRoundTrip(
+		t, nil, gateway, vnextOwnerTLSTestDaemonRequest(t, "gateway"))
+	if !reserve.Ok || reserve.Operation != vnextOwnerRPCOperationReserve ||
+		reserve.DurationMicros < 0 {
+		t.Fatalf("gateway Reserve over mTLS failed: %#v", reserve)
+	}
+	if count := vnextOwnerTLSTestTransactionCount(fixture); count != 1 {
+		t.Fatalf("remote Owner transactions = %d, want 1", count)
+	}
+}
+
+func TestVNextOwnerRemoteListenerNeverRoutesThroughGateway(t *testing.T) {
+	material := newVNextOwnerTLSTestMaterial(t)
+	server, _, _ := startVNextOwnerTLSTestServer(t, material, nil)
+	transport, err := newVNextOwnerTLSRoundTripper(
+		vnextOwnerTLSTestClientConfig(material, server.Addr().String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := newVNextOwnerClient(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Inventory(context.Background(), vnextOwnerInventoryRequest{
+		RequestID: "wrong-owner", OwnerID: "remote-owner", OwnerEpoch: 9,
+	})
+	var remoteError *vnextOwnerClientRemoteError
+	if !errors.As(err, &remoteError) ||
+		remoteError.ErrorCode != string(vnextOwnerServiceIdentityMismatch) {
+		t.Fatalf("remote listener wrong-owner error = %v", err)
+	}
+}
+
+func TestVNextOwnerGatewayRemoteConcurrencyIsBounded(t *testing.T) {
+	var calls int64
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	gateway := openVNextOwnerGatewayForTest(
+		t, vnextOwnerGatewayTestRouteFile("owner-0", 7, "127.0.0.1:1"), nil,
+		vnextOwnerGatewayTestInventoryTransport(&calls, entered, release))
+	gateway.remoteAdmission = make(chan struct{}, 2)
+	request := vnextOwnerGatewayTestInventoryDaemonRequest(t, "owner-0", 7, "bounded")
+	responses := make(chan execResponse, 2)
+	var workers sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			responses <- gateway.dispatch(request)
+		}()
+	}
+	for index := 0; index < 2; index++ {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for admitted remote gateway request")
+		}
+	}
+	overflow := gateway.dispatch(request)
+	if overflow.Ok || overflow.ErrorCode != string(vnextOwnerServiceUnavailable) {
+		t.Fatalf("unexpected concurrency overflow response: %#v", overflow)
+	}
+	if got := atomic.LoadInt64(&calls); got != 2 {
+		t.Fatalf("remote calls after overflow = %d, want 2", got)
+	}
+	close(release)
+	workers.Wait()
+	close(responses)
+	for response := range responses {
+		if !response.Ok {
+			t.Fatalf("admitted remote gateway request failed: %#v", response)
+		}
+	}
+}
