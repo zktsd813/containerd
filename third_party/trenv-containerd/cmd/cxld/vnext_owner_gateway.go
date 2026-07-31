@@ -355,13 +355,37 @@ func decodeVNextOwnerGatewayCall(
 	}
 	if request.TimeoutMillis != 0 {
 		return vnextOwnerGatewayCall{}, errors.New(
-			"VNext Owner protocol v1 does not support timeoutMillis; it must be zero")
+			"VNext Owner protocol v2 does not support timeoutMillis; it must be zero")
 	}
 	raw, err := vnextOwnerRPCPayload(operation, request)
 	if err != nil {
 		return vnextOwnerGatewayCall{}, err
 	}
 	switch operation {
+	case vnextOwnerRPCOperationAdmissionStatus:
+		decoded, err := decodeVNextOwnerRPCAdmissionStatusRequest(raw)
+		if err != nil {
+			return vnextOwnerGatewayCall{}, err
+		}
+		return vnextOwnerGatewayCall{
+			key: vnextOwnerGatewayRouteKey{decoded.OwnerID, decoded.OwnerEpoch},
+			invoke: func(ctx context.Context, client *vnextOwnerClient) error {
+				_, err := client.AdmissionStatus(ctx, decoded)
+				return err
+			},
+		}, nil
+	case vnextOwnerRPCOperationSetAdmission:
+		decoded, err := decodeVNextOwnerRPCSetAdmissionRequest(raw)
+		if err != nil {
+			return vnextOwnerGatewayCall{}, err
+		}
+		return vnextOwnerGatewayCall{
+			key: vnextOwnerGatewayRouteKey{decoded.OwnerID, decoded.OwnerEpoch},
+			invoke: func(ctx context.Context, client *vnextOwnerClient) error {
+				_, err := client.SetAdmission(ctx, decoded)
+				return err
+			},
+		}, nil
 	case vnextOwnerRPCOperationInventory:
 		decoded, err := decodeVNextOwnerRPCInventoryRequest(raw)
 		if err != nil {

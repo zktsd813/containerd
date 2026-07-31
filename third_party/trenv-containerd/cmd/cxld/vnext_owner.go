@@ -212,7 +212,10 @@ func (group *vnextOwnerGroup) reserve(
 		}
 		switch transaction.State {
 		case vnextOwnerGranted:
-			return group.buildGrantLocked(transaction)
+			// Reserve replay is placement recovery, not capability issuance.
+			// Writer tokens may be reconstructed only by the exact internal
+			// lifecycle operation that consumes them.
+			return group.buildGrantGeometryLocked(transaction), nil
 		case vnextOwnerRejectedNoSpace:
 			return vnextOwnerWriteGrant{}, fmt.Errorf(
 				"Owner allocation %d durably rejected the exact request: %w",
@@ -222,6 +225,13 @@ func (group *vnextOwnerGroup) reserve(
 				"Owner allocation %d is state %d, not writable: %w",
 				allocationID, transaction.State, errVNextInvalidState)
 		}
+	}
+	// Exact durable outcomes are resolved above even after admission closes.
+	// Only an unseen request reaches this point, and it must be ordered with a
+	// close/fence transition under this same Owner-group mutex before any
+	// checkpoint-index, allocator, descriptor, or journal request mutation.
+	if err := group.requireNewAllocationAdmissionLocked("reserve"); err != nil {
+		return vnextOwnerWriteGrant{}, err
 	}
 	if allocationID, exists := group.journal.CheckpointIndex[request.CheckpointID]; exists {
 		return vnextOwnerWriteGrant{}, fmt.Errorf(
@@ -525,6 +535,12 @@ func (group *vnextOwnerGroup) abort(grant vnextOwnerWriteGrant) error {
 		return fmt.Errorf("cannot abort Owner allocation in state %d: %w",
 			transaction.State, errVNextInvalidState)
 	}
+	// A journal-only FENCED state does not prove that stale direct DAX access
+	// has been physically revoked. Exact terminal replay above is read-only,
+	// but the live GRANTED path must not free or reuse an extent.
+	if err := group.requireReclaimSafetyLocked("abort"); err != nil {
+		return err
+	}
 	if err := group.abortTransactionLocked(transaction); err != nil {
 		return group.poisonLocked(err)
 	}
@@ -550,6 +566,11 @@ func (group *vnextOwnerGroup) reclaimCheckpoint(
 	if transaction.State != vnextOwnerCommitted {
 		return fmt.Errorf("cannot reclaim Owner allocation in state %d: %w",
 			transaction.State, errVNextInvalidState)
+	}
+	// A terminal RECLAIMED replay changes no allocator or journal state. Only
+	// the live COMMITTED path reaches the physical-reuse safety gate.
+	if err := group.requireReclaimSafetyLocked("reclaim"); err != nil {
+		return err
 	}
 	for _, fragment := range transaction.Fragments {
 		if err := group.devices[fragment.DeviceUUID].validateOwnerFragmentReclaimable(
@@ -956,6 +977,11 @@ func (group *vnextOwnerGroup) validateGrantLocked(
 	grant vnextOwnerWriteGrant,
 	expectedState vnextOwnerTransactionState,
 ) (*vnextOwnerTransaction, error) {
+	if expectedState == vnextOwnerGranted {
+		if err := group.requireProducerMutationAllowedLocked("producer-mutation"); err != nil {
+			return nil, err
+		}
+	}
 	transaction := group.journal.Transactions[grant.AllocationRecordID]
 	if transaction == nil || transaction.RequestID != grant.RequestID ||
 		transaction.CheckpointID != grant.CheckpointID || transaction.ProducerID != grant.ProducerID ||
@@ -1038,6 +1064,12 @@ func (group *vnextOwnerGroup) recoverTransactionsLocked() error {
 		transaction := group.journal.Transactions[allocationID]
 		switch transaction.State {
 		case vnextOwnerPreparing, vnextOwnerAborting:
+			if err := group.requireReclaimSafetyLocked("restart-abort"); err != nil {
+				return fmt.Errorf(
+					"Owner allocation %d cannot be freed during fenced recovery: %w",
+					allocationID,
+					err)
+			}
 			if err := group.abortTransactionLocked(transaction); err != nil {
 				return fmt.Errorf("recover Owner abort %d: %w", allocationID, err)
 			}
@@ -1051,6 +1083,12 @@ func (group *vnextOwnerGroup) recoverTransactionsLocked() error {
 				return err
 			}
 		case vnextOwnerReclaiming:
+			if err := group.requireReclaimSafetyLocked("restart-reclaim"); err != nil {
+				return fmt.Errorf(
+					"Owner allocation %d cannot be reused during fenced recovery: %w",
+					allocationID,
+					err)
+			}
 			if err := group.completeReclaimLocked(transaction); err != nil {
 				return fmt.Errorf("recover Owner reclaim %d: %w", allocationID, err)
 			}

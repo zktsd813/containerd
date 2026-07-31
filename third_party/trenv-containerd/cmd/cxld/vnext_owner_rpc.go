@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	vnextOwnerRPCProtocol = "cxld.vnext-owner.v1"
+	vnextOwnerRPCProtocol = "cxld.vnext-owner.v2"
 
 	vnextOwnerRPCOperationReserve           = "vnextOwnerReserve"
 	vnextOwnerRPCOperationSeal              = "vnextOwnerSeal"
@@ -22,11 +22,13 @@ const (
 	vnextOwnerRPCOperationAbort             = "vnextOwnerAbort"
 	vnextOwnerRPCOperationInventory         = "vnextOwnerInventory"
 	vnextOwnerRPCOperationReservationStatus = "vnextOwnerReservationStatus"
+	vnextOwnerRPCOperationSetAdmission      = "vnextOwnerSetAdmission"
+	vnextOwnerRPCOperationAdmissionStatus   = "vnextOwnerAdmissionStatus"
 
 	// JSON/base64 is intentionally limited below the 64 MiB publication codec
 	// ceiling. At 40 bytes per record, eight MiB of TRCRC006 describes roughly
 	// 0.8 GiB of 4 KiB pages. Larger metadata requires a future streaming or
-	// SCM_RIGHTS protocol, not a larger single allocation in this v1 adapter.
+	// SCM_RIGHTS protocol, not a larger single allocation in this v2 adapter.
 	vnextOwnerRPCMaxPublicationBytes = 8 << 20
 	vnextOwnerRPCMaxSidecarBytes     = 8 << 20
 	vnextOwnerRPCMaxSidecars         = 4096
@@ -43,7 +45,7 @@ const (
 	// byte needs HTML-safe JSON escaping, this count keeps both the inner
 	// inventory JSON and its escaped outer execResponse below 32 MiB.
 	vnextOwnerRPCMaxInventoryDevices = 1024
-	// The complete daemon envelope currently defines sixteen fields. Keep a
+	// The complete daemon envelope currently defines eighteen fields. Keep a
 	// little legacy headroom, but reject an attacker-controlled number of
 	// unknown or duplicate members before retaining RawMessage entries.
 	vnextOwnerRPCMaxDaemonFields = 32
@@ -132,15 +134,17 @@ type vnextOwnerRPCReserveResponse struct {
 // keeps every field mandatory: no-grant states use hasGrant=false, zero
 // placement counts, and canonical empty arrays rather than null or omission.
 type vnextOwnerRPCReservationStatusResponse struct {
-	Protocol   string                         `json:"protocol"`
-	Operation  string                         `json:"operation"`
-	State      string                         `json:"state"`
-	HasGrant   bool                           `json:"hasGrant"`
-	Identity   vnextOwnerRPCOperationIdentity `json:"identity"`
-	TotalPages uint64                         `json:"totalPages"`
-	Contents   vnextOwnerRPCPortableContents  `json:"contents"`
-	Extents    vnextOwnerRPCPortableExtents   `json:"extents"`
-	Devices    vnextOwnerRPCPortableDevices   `json:"devices"`
+	Protocol          string                         `json:"protocol"`
+	Operation         string                         `json:"operation"`
+	State             string                         `json:"state"`
+	AdmissionState    string                         `json:"admissionState"`
+	AdmissionSequence uint64                         `json:"admissionSequence"`
+	HasGrant          bool                           `json:"hasGrant"`
+	Identity          vnextOwnerRPCOperationIdentity `json:"identity"`
+	TotalPages        uint64                         `json:"totalPages"`
+	Contents          vnextOwnerRPCPortableContents  `json:"contents"`
+	Extents           vnextOwnerRPCPortableExtents   `json:"extents"`
+	Devices           vnextOwnerRPCPortableDevices   `json:"devices"`
 }
 
 type vnextOwnerRPCSidecar struct {
@@ -235,6 +239,55 @@ type vnextOwnerRPCInventoryResponse struct {
 	OwnerEpoch       uint64                        `json:"ownerEpoch"`
 	SnapshotSequence uint64                        `json:"snapshotSequence"`
 	Devices          vnextOwnerRPCInventoryDevices `json:"devices"`
+}
+
+type vnextOwnerRPCAdmissionStatusRequest struct {
+	Protocol           string `json:"protocol"`
+	RequestID          string `json:"requestId"`
+	ExpectedOwnerID    string `json:"expectedOwnerId"`
+	ExpectedOwnerEpoch uint64 `json:"expectedOwnerEpoch"`
+}
+
+type vnextOwnerRPCAdmissionStatusResponse struct {
+	Protocol                                string `json:"protocol"`
+	Operation                               string `json:"operation"`
+	RequestID                               string `json:"requestId"`
+	OwnerID                                 string `json:"ownerId"`
+	OwnerEpoch                              uint64 `json:"ownerEpoch"`
+	State                                   string `json:"state"`
+	AdmissionSequence                       uint64 `json:"admissionSequence"`
+	SnapshotSequence                        uint64 `json:"snapshotSequence"`
+	HasLastTransition                       bool   `json:"hasLastTransition"`
+	LastTransitionRequestID                 string `json:"lastTransitionRequestId"`
+	LastTransitionRequestDigest             string `json:"lastTransitionRequestDigest"`
+	LastTransitionFromState                 string `json:"lastTransitionFromState"`
+	LastTransitionTargetState               string `json:"lastTransitionTargetState"`
+	LastTransitionExpectedAdmissionSequence uint64 `json:"lastTransitionExpectedAdmissionSequence"`
+	LastTransitionResultAdmissionSequence   uint64 `json:"lastTransitionResultAdmissionSequence"`
+}
+
+type vnextOwnerRPCSetAdmissionRequest struct {
+	Protocol                  string `json:"protocol"`
+	RequestID                 string `json:"requestId"`
+	ExpectedOwnerID           string `json:"expectedOwnerId"`
+	ExpectedOwnerEpoch        uint64 `json:"expectedOwnerEpoch"`
+	FromState                 string `json:"fromState"`
+	TargetState               string `json:"targetState"`
+	ExpectedAdmissionSequence uint64 `json:"expectedAdmissionSequence"`
+}
+
+type vnextOwnerRPCSetAdmissionResponse struct {
+	Protocol                  string `json:"protocol"`
+	Operation                 string `json:"operation"`
+	RequestID                 string `json:"requestId"`
+	RequestDigest             string `json:"requestDigest"`
+	OwnerID                   string `json:"ownerId"`
+	OwnerEpoch                uint64 `json:"ownerEpoch"`
+	FromState                 string `json:"fromState"`
+	TargetState               string `json:"targetState"`
+	ExpectedAdmissionSequence uint64 `json:"expectedAdmissionSequence"`
+	ResultAdmissionSequence   uint64 `json:"resultAdmissionSequence"`
+	Replayed                  bool   `json:"replayed"`
 }
 
 func (contents *vnextOwnerRPCReserveContents) UnmarshalJSON(raw []byte) error {
@@ -358,12 +411,12 @@ func runVNextOwnerRPC(
 	rpc *vnextOwnerRPC,
 ) execResponse {
 	// VNext Owner mutations include persistence barriers that must not be
-	// cancelled halfway through. The v1 transport therefore does not pretend
+	// cancelled halfway through. The v2 transport therefore does not pretend
 	// that the legacy command timeout applies to these operations. A future
 	// protocol may add a deadline for admission before a mutation starts.
 	if request.TimeoutMillis != 0 {
 		return vnextOwnerRPCErrorResponse(errors.New(
-			"VNext Owner protocol v1 does not support timeoutMillis; it must be zero"))
+			"VNext Owner protocol v2 does not support timeoutMillis; it must be zero"))
 	}
 	raw, err := vnextOwnerRPCPayload(operation, request)
 	if err != nil {
@@ -390,6 +443,10 @@ func runVNextOwnerRPC(
 		return rpc.inventory(raw)
 	case vnextOwnerRPCOperationReservationStatus:
 		return rpc.reservationStatus(raw)
+	case vnextOwnerRPCOperationSetAdmission:
+		return rpc.setAdmission(raw)
+	case vnextOwnerRPCOperationAdmissionStatus:
+		return rpc.admissionStatus(raw)
 	default:
 		return vnextOwnerRPCErrorResponse(fmt.Errorf("unsupported VNext Owner operation %q", operation))
 	}
@@ -402,7 +459,9 @@ func isVNextOwnerRPCOperation(operation string) bool {
 		vnextOwnerRPCOperationCommit,
 		vnextOwnerRPCOperationAbort,
 		vnextOwnerRPCOperationInventory,
-		vnextOwnerRPCOperationReservationStatus:
+		vnextOwnerRPCOperationReservationStatus,
+		vnextOwnerRPCOperationSetAdmission,
+		vnextOwnerRPCOperationAdmissionStatus:
 		return true
 	default:
 		return false
@@ -431,6 +490,8 @@ var vnextOwnerRPCDaemonFields = map[string]struct{}{
 	"vnextOwnerAbort":             {},
 	"vnextOwnerInventory":         {},
 	"vnextOwnerReservationStatus": {},
+	"vnextOwnerSetAdmission":      {},
+	"vnextOwnerAdmissionStatus":   {},
 }
 
 var vnextOwnerRPCLegacyPayloadFields = map[string]struct{}{
@@ -569,6 +630,10 @@ func decodeVNextOwnerRPCDaemonEnvelope(
 			request.VNextOwnerInventory = append(json.RawMessage(nil), field.raw...)
 		case "vnextOwnerReservationStatus":
 			request.VNextOwnerReservationStatus = append(json.RawMessage(nil), field.raw...)
+		case "vnextOwnerSetAdmission":
+			request.VNextOwnerSetAdmission = append(json.RawMessage(nil), field.raw...)
+		case "vnextOwnerAdmissionStatus":
+			request.VNextOwnerAdmissionStatus = append(json.RawMessage(nil), field.raw...)
 		}
 	}
 	if !isVNextOwnerRPCOperation(strings.TrimSpace(request.Operation)) {
@@ -607,6 +672,8 @@ func vnextOwnerRPCPayload(operation string, request daemonRequest) (json.RawMess
 		{vnextOwnerRPCOperationAbort, request.VNextOwnerAbort},
 		{vnextOwnerRPCOperationInventory, request.VNextOwnerInventory},
 		{vnextOwnerRPCOperationReservationStatus, request.VNextOwnerReservationStatus},
+		{vnextOwnerRPCOperationSetAdmission, request.VNextOwnerSetAdmission},
+		{vnextOwnerRPCOperationAdmissionStatus, request.VNextOwnerAdmissionStatus},
 	}
 	present := 0
 	var selected json.RawMessage
@@ -728,6 +795,176 @@ func decodeVNextOwnerRPCInventoryRequest(
 	}, nil
 }
 
+func (rpc *vnextOwnerRPC) admissionStatus(raw json.RawMessage) execResponse {
+	request, err := decodeVNextOwnerRPCAdmissionStatusRequest(raw)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	response, err := rpc.service.admissionStatus(request)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	proofErr := validateVNextOwnerAdmissionHeadProof(
+		response.OwnerID,
+		response.OwnerEpoch,
+		response.State,
+		response.AdmissionSequence,
+		response.HasLastTransition,
+		response.LastTransition)
+	if response.RequestID != request.RequestID || response.OwnerID != request.OwnerID ||
+		response.OwnerEpoch != request.OwnerEpoch || !response.State.valid() ||
+		response.AdmissionSequence == 0 ||
+		response.AdmissionSequence > uint64(math.MaxInt64) ||
+		response.SnapshotSequence == 0 ||
+		response.SnapshotSequence > uint64(math.MaxInt64) || proofErr != nil {
+		return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+			"admission-status",
+			vnextOwnerServiceUnavailable,
+			"Owner admission status cannot be represented by the signed RPC contract",
+			errVNextCorrupt))
+	}
+	wire := vnextOwnerRPCAdmissionStatusResponse{
+		Protocol:          vnextOwnerRPCProtocol,
+		Operation:         vnextOwnerRPCOperationAdmissionStatus,
+		RequestID:         response.RequestID,
+		OwnerID:           response.OwnerID,
+		OwnerEpoch:        response.OwnerEpoch,
+		State:             response.State.String(),
+		AdmissionSequence: response.AdmissionSequence,
+		SnapshotSequence:  response.SnapshotSequence,
+		HasLastTransition: response.HasLastTransition,
+	}
+	if response.HasLastTransition {
+		record := response.LastTransition
+		wire.LastTransitionRequestID = record.RequestID
+		wire.LastTransitionRequestDigest = hex.EncodeToString(record.RequestDigest[:])
+		wire.LastTransitionFromState = record.From.String()
+		wire.LastTransitionTargetState = record.Target.String()
+		wire.LastTransitionExpectedAdmissionSequence = record.ExpectedSequence
+		wire.LastTransitionResultAdmissionSequence = record.ResultSequence
+	}
+	return marshalVNextOwnerRPCResponse(wire)
+}
+
+func decodeVNextOwnerRPCAdmissionStatusRequest(
+	raw json.RawMessage,
+) (vnextOwnerAdmissionStatusRequest, error) {
+	var wire vnextOwnerRPCAdmissionStatusRequest
+	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
+		return vnextOwnerAdmissionStatusRequest{}, err
+	}
+	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
+		return vnextOwnerAdmissionStatusRequest{}, err
+	}
+	if err := validateVNextOwnerClientText("admission status request ID", wire.RequestID); err != nil {
+		return vnextOwnerAdmissionStatusRequest{}, err
+	}
+	if err := validateVNextOwnerClientText("expected Owner ID", wire.ExpectedOwnerID); err != nil {
+		return vnextOwnerAdmissionStatusRequest{}, err
+	}
+	if wire.ExpectedOwnerEpoch == 0 || wire.ExpectedOwnerEpoch > uint64(math.MaxInt64) {
+		return vnextOwnerAdmissionStatusRequest{}, errors.New(
+			"expected Owner epoch is outside the signed ABI")
+	}
+	return vnextOwnerAdmissionStatusRequest{
+		RequestID:  wire.RequestID,
+		OwnerID:    wire.ExpectedOwnerID,
+		OwnerEpoch: wire.ExpectedOwnerEpoch,
+	}, nil
+}
+
+func (rpc *vnextOwnerRPC) setAdmission(raw json.RawMessage) execResponse {
+	request, err := decodeVNextOwnerRPCSetAdmissionRequest(raw)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	response, err := rpc.service.setAdmission(request)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	internal := vnextOwnerAdmissionTransitionRequest{
+		RequestID:        request.RequestID,
+		OwnerID:          request.OwnerID,
+		OwnerEpoch:       request.OwnerEpoch,
+		From:             request.From,
+		Target:           request.Target,
+		ExpectedSequence: request.ExpectedSequence,
+	}
+	if response.RequestID != request.RequestID || response.OwnerID != request.OwnerID ||
+		response.OwnerEpoch != request.OwnerEpoch || response.From != request.From ||
+		response.Target != request.Target ||
+		response.ExpectedSequence != request.ExpectedSequence ||
+		response.ResultSequence != request.ExpectedSequence+1 ||
+		response.RequestDigest != vnextOwnerAdmissionRequestDigest(internal) {
+		return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+			"set-admission",
+			vnextOwnerServiceUnavailable,
+			"Owner admission transition proof cannot be represented",
+			errVNextCorrupt))
+	}
+	return marshalVNextOwnerRPCResponse(vnextOwnerRPCSetAdmissionResponse{
+		Protocol:                  vnextOwnerRPCProtocol,
+		Operation:                 vnextOwnerRPCOperationSetAdmission,
+		RequestID:                 response.RequestID,
+		RequestDigest:             hex.EncodeToString(response.RequestDigest[:]),
+		OwnerID:                   response.OwnerID,
+		OwnerEpoch:                response.OwnerEpoch,
+		FromState:                 response.From.String(),
+		TargetState:               response.Target.String(),
+		ExpectedAdmissionSequence: response.ExpectedSequence,
+		ResultAdmissionSequence:   response.ResultSequence,
+		Replayed:                  response.Replayed,
+	})
+}
+
+func decodeVNextOwnerRPCSetAdmissionRequest(
+	raw json.RawMessage,
+) (vnextOwnerSetAdmissionRequest, error) {
+	var wire vnextOwnerRPCSetAdmissionRequest
+	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
+		return vnextOwnerSetAdmissionRequest{}, err
+	}
+	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
+		return vnextOwnerSetAdmissionRequest{}, err
+	}
+	if err := validateVNextOwnerClientText("admission transition request ID", wire.RequestID); err != nil {
+		return vnextOwnerSetAdmissionRequest{}, err
+	}
+	if err := validateVNextOwnerClientText("expected Owner ID", wire.ExpectedOwnerID); err != nil {
+		return vnextOwnerSetAdmissionRequest{}, err
+	}
+	from, ok := vnextOwnerRPCAdmissionState(wire.FromState)
+	if !ok {
+		return vnextOwnerSetAdmissionRequest{}, fmt.Errorf(
+			"fromState %q is not a VNext Owner admission state", wire.FromState)
+	}
+	target, ok := vnextOwnerRPCAdmissionState(wire.TargetState)
+	if !ok {
+		return vnextOwnerSetAdmissionRequest{}, fmt.Errorf(
+			"targetState %q is not a VNext Owner admission state", wire.TargetState)
+	}
+	request := vnextOwnerSetAdmissionRequest{
+		RequestID:        wire.RequestID,
+		OwnerID:          wire.ExpectedOwnerID,
+		OwnerEpoch:       wire.ExpectedOwnerEpoch,
+		From:             from,
+		Target:           target,
+		ExpectedSequence: wire.ExpectedAdmissionSequence,
+	}
+	if err := validateVNextOwnerAdmissionTransitionRequest(
+		vnextOwnerAdmissionTransitionRequest{
+			RequestID:        request.RequestID,
+			OwnerID:          request.OwnerID,
+			OwnerEpoch:       request.OwnerEpoch,
+			From:             request.From,
+			Target:           request.Target,
+			ExpectedSequence: request.ExpectedSequence,
+		}); err != nil {
+		return vnextOwnerSetAdmissionRequest{}, err
+	}
+	return request, nil
+}
+
 func (rpc *vnextOwnerRPC) reserve(raw json.RawMessage) execResponse {
 	request, err := decodeVNextOwnerRPCReserveRequest(raw)
 	if err != nil {
@@ -801,7 +1038,9 @@ func (rpc *vnextOwnerRPC) reservationStatus(raw json.RawMessage) execResponse {
 	if err != nil {
 		return vnextOwnerRPCErrorResponse(err)
 	}
-	if !response.State.valid() ||
+	admissionErr := validateVNextOwnerAdmissionHeadPair(
+		response.AdmissionState, response.AdmissionSequence)
+	if !response.State.valid() || admissionErr != nil ||
 		response.Identity.RequestID != request.RequestID ||
 		response.Identity.CheckpointID != request.CheckpointID ||
 		response.Identity.ProducerID != request.ProducerID ||
@@ -817,13 +1056,15 @@ func (rpc *vnextOwnerRPC) reservationStatus(raw json.RawMessage) execResponse {
 			errVNextCorrupt))
 	}
 	wire := vnextOwnerRPCReservationStatusResponse{
-		Protocol:  vnextOwnerRPCProtocol,
-		Operation: vnextOwnerRPCOperationReservationStatus,
-		State:     string(response.State),
-		Identity:  vnextOwnerRPCIdentityFromInternal(response.Identity),
-		Contents:  make(vnextOwnerRPCPortableContents, 0),
-		Extents:   make(vnextOwnerRPCPortableExtents, 0),
-		Devices:   make(vnextOwnerRPCPortableDevices, 0),
+		Protocol:          vnextOwnerRPCProtocol,
+		Operation:         vnextOwnerRPCOperationReservationStatus,
+		State:             string(response.State),
+		AdmissionState:    response.AdmissionState.String(),
+		AdmissionSequence: response.AdmissionSequence,
+		Identity:          vnextOwnerRPCIdentityFromInternal(response.Identity),
+		Contents:          make(vnextOwnerRPCPortableContents, 0),
+		Extents:           make(vnextOwnerRPCPortableExtents, 0),
+		Devices:           make(vnextOwnerRPCPortableDevices, 0),
 	}
 	grantState := response.State == vnextOwnerReservationGranted ||
 		response.State == vnextOwnerReservationSealed ||
@@ -1346,6 +1587,19 @@ func vnextOwnerRPCContentKind(name string) (vnextOwnerServiceContentKind, bool) 
 		return vnextOwnerServiceContentRestoreBlob, true
 	case "publication":
 		return vnextOwnerServiceContentPublication, true
+	default:
+		return 0, false
+	}
+}
+
+func vnextOwnerRPCAdmissionState(name string) (vnextOwnerAdmissionState, bool) {
+	switch name {
+	case "ACTIVE":
+		return vnextOwnerAdmissionActive, true
+	case "READ_ONLY":
+		return vnextOwnerAdmissionReadOnly, true
+	case "FENCED":
+		return vnextOwnerAdmissionFenced, true
 	default:
 		return 0, false
 	}

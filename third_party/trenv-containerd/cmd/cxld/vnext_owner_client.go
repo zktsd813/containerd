@@ -23,7 +23,7 @@ import (
 //
 // The transport is responsible for encoding daemonRequest into the bounded
 // daemon frame and decoding its outer execResponse. This client owns the
-// cxld.vnext-owner.v1 operation payload and response contracts inside those
+// cxld.vnext-owner.v2 operation payload and response contracts inside those
 // envelopes.
 type vnextOwnerClientRoundTripper interface {
 	RoundTrip(context.Context, daemonRequest) (execResponse, error)
@@ -99,6 +99,192 @@ func (client *vnextOwnerClient) Inventory(
 		return vnextOwnerInventoryResponse{}, err
 	}
 	return convertVNextOwnerClientInventoryResponse(request, decoded)
+}
+
+func (client *vnextOwnerClient) AdmissionStatus(
+	ctx context.Context,
+	request vnextOwnerAdmissionStatusRequest,
+) (vnextOwnerAdmissionStatusResponse, error) {
+	if client == nil || client.transport == nil {
+		return vnextOwnerAdmissionStatusResponse{}, errors.New("VNext Owner client is unavailable")
+	}
+	if err := validateVNextOwnerClientText(
+		"admission status request ID", request.RequestID); err != nil {
+		return vnextOwnerAdmissionStatusResponse{}, err
+	}
+	if err := validateVNextOwnerClientText("expected Owner ID", request.OwnerID); err != nil {
+		return vnextOwnerAdmissionStatusResponse{}, err
+	}
+	if request.OwnerEpoch == 0 || request.OwnerEpoch > uint64(math.MaxInt64) {
+		return vnextOwnerAdmissionStatusResponse{}, errors.New(
+			"expected Owner epoch is outside the signed ABI")
+	}
+	wire := vnextOwnerRPCAdmissionStatusRequest{
+		Protocol:           vnextOwnerRPCProtocol,
+		RequestID:          request.RequestID,
+		ExpectedOwnerID:    request.OwnerID,
+		ExpectedOwnerEpoch: request.OwnerEpoch,
+	}
+	raw, err := marshalVNextOwnerClientPayload(wire)
+	if err != nil {
+		return vnextOwnerAdmissionStatusResponse{}, err
+	}
+	response, err := client.roundTrip(
+		ctx,
+		vnextOwnerRPCOperationAdmissionStatus,
+		daemonRequest{VNextOwnerAdmissionStatus: raw})
+	if err != nil {
+		return vnextOwnerAdmissionStatusResponse{}, err
+	}
+	var decoded vnextOwnerRPCAdmissionStatusResponse
+	if err := decodeVNextOwnerClientSuccess(
+		response, vnextOwnerRPCOperationAdmissionStatus, &decoded); err != nil {
+		return vnextOwnerAdmissionStatusResponse{}, err
+	}
+	state, ok := vnextOwnerRPCAdmissionState(decoded.State)
+	if decoded.Protocol != vnextOwnerRPCProtocol ||
+		decoded.Operation != vnextOwnerRPCOperationAdmissionStatus ||
+		decoded.RequestID != request.RequestID || decoded.OwnerID != request.OwnerID ||
+		decoded.OwnerEpoch != request.OwnerEpoch || !ok ||
+		decoded.AdmissionSequence == 0 ||
+		decoded.AdmissionSequence > uint64(math.MaxInt64) ||
+		decoded.SnapshotSequence == 0 ||
+		decoded.SnapshotSequence > uint64(math.MaxInt64) {
+		return vnextOwnerAdmissionStatusResponse{}, errors.New(
+			"admission status response identity or sequence is invalid")
+	}
+	var lastTransition vnextOwnerAdmissionTransitionRecord
+	if !decoded.HasLastTransition {
+		if decoded.LastTransitionRequestID != "" ||
+			decoded.LastTransitionRequestDigest != "" ||
+			decoded.LastTransitionFromState != "" ||
+			decoded.LastTransitionTargetState != "" ||
+			decoded.LastTransitionExpectedAdmissionSequence != 0 ||
+			decoded.LastTransitionResultAdmissionSequence != 0 {
+			return vnextOwnerAdmissionStatusResponse{}, errors.New(
+				"fresh admission status response has a non-empty last transition proof")
+		}
+	} else {
+		if err := validateVNextOwnerClientText(
+			"last admission transition request ID",
+			decoded.LastTransitionRequestID); err != nil {
+			return vnextOwnerAdmissionStatusResponse{}, err
+		}
+		digest, err := decodeCanonicalVNextOwnerClientDigest(
+			"last admission transition request digest",
+			decoded.LastTransitionRequestDigest)
+		if err != nil {
+			return vnextOwnerAdmissionStatusResponse{}, err
+		}
+		from, fromOK := vnextOwnerRPCAdmissionState(decoded.LastTransitionFromState)
+		target, targetOK := vnextOwnerRPCAdmissionState(decoded.LastTransitionTargetState)
+		if !fromOK || !targetOK {
+			return vnextOwnerAdmissionStatusResponse{}, errors.New(
+				"last admission transition state is invalid")
+		}
+		lastTransition = vnextOwnerAdmissionTransitionRecord{
+			RequestID:        decoded.LastTransitionRequestID,
+			RequestDigest:    digest,
+			From:             from,
+			Target:           target,
+			ExpectedSequence: decoded.LastTransitionExpectedAdmissionSequence,
+			ResultSequence:   decoded.LastTransitionResultAdmissionSequence,
+		}
+	}
+	if err := validateVNextOwnerAdmissionHeadProof(
+		decoded.OwnerID,
+		decoded.OwnerEpoch,
+		state,
+		decoded.AdmissionSequence,
+		decoded.HasLastTransition,
+		lastTransition); err != nil {
+		return vnextOwnerAdmissionStatusResponse{}, fmt.Errorf(
+			"admission status response does not prove the durable head: %w", err)
+	}
+	return vnextOwnerAdmissionStatusResponse{
+		RequestID:         decoded.RequestID,
+		OwnerID:           decoded.OwnerID,
+		OwnerEpoch:        decoded.OwnerEpoch,
+		State:             state,
+		AdmissionSequence: decoded.AdmissionSequence,
+		SnapshotSequence:  decoded.SnapshotSequence,
+		HasLastTransition: decoded.HasLastTransition,
+		LastTransition:    lastTransition,
+	}, nil
+}
+
+func (client *vnextOwnerClient) SetAdmission(
+	ctx context.Context,
+	request vnextOwnerSetAdmissionRequest,
+) (vnextOwnerSetAdmissionResponse, error) {
+	if client == nil || client.transport == nil {
+		return vnextOwnerSetAdmissionResponse{}, errors.New("VNext Owner client is unavailable")
+	}
+	internal := vnextOwnerAdmissionTransitionRequest{
+		RequestID:        request.RequestID,
+		OwnerID:          request.OwnerID,
+		OwnerEpoch:       request.OwnerEpoch,
+		From:             request.From,
+		Target:           request.Target,
+		ExpectedSequence: request.ExpectedSequence,
+	}
+	if err := validateVNextOwnerAdmissionTransitionRequest(internal); err != nil {
+		return vnextOwnerSetAdmissionResponse{}, err
+	}
+	wire := vnextOwnerRPCSetAdmissionRequest{
+		Protocol:                  vnextOwnerRPCProtocol,
+		RequestID:                 request.RequestID,
+		ExpectedOwnerID:           request.OwnerID,
+		ExpectedOwnerEpoch:        request.OwnerEpoch,
+		FromState:                 request.From.String(),
+		TargetState:               request.Target.String(),
+		ExpectedAdmissionSequence: request.ExpectedSequence,
+	}
+	raw, err := marshalVNextOwnerClientPayload(wire)
+	if err != nil {
+		return vnextOwnerSetAdmissionResponse{}, err
+	}
+	response, err := client.roundTrip(
+		ctx,
+		vnextOwnerRPCOperationSetAdmission,
+		daemonRequest{VNextOwnerSetAdmission: raw})
+	if err != nil {
+		return vnextOwnerSetAdmissionResponse{}, err
+	}
+	var decoded vnextOwnerRPCSetAdmissionResponse
+	if err := decodeVNextOwnerClientSuccess(
+		response, vnextOwnerRPCOperationSetAdmission, &decoded); err != nil {
+		return vnextOwnerSetAdmissionResponse{}, err
+	}
+	digest, err := decodeCanonicalVNextOwnerClientDigest(
+		"admission request digest", decoded.RequestDigest)
+	if err != nil {
+		return vnextOwnerSetAdmissionResponse{}, err
+	}
+	from, fromOK := vnextOwnerRPCAdmissionState(decoded.FromState)
+	target, targetOK := vnextOwnerRPCAdmissionState(decoded.TargetState)
+	if decoded.Protocol != vnextOwnerRPCProtocol ||
+		decoded.Operation != vnextOwnerRPCOperationSetAdmission ||
+		decoded.RequestID != request.RequestID || decoded.OwnerID != request.OwnerID ||
+		decoded.OwnerEpoch != request.OwnerEpoch || !fromOK || !targetOK ||
+		from != request.From || target != request.Target ||
+		decoded.ExpectedAdmissionSequence != request.ExpectedSequence ||
+		decoded.ResultAdmissionSequence != request.ExpectedSequence+1 ||
+		digest != vnextOwnerAdmissionRequestDigest(internal) {
+		return vnextOwnerSetAdmissionResponse{}, errors.New(
+			"set-admission response does not prove the exact transition request")
+	}
+	return vnextOwnerSetAdmissionResponse{
+		RequestID:        decoded.RequestID,
+		RequestDigest:    digest,
+		OwnerID:          decoded.OwnerID,
+		OwnerEpoch:       decoded.OwnerEpoch,
+		From:             from,
+		Target:           target,
+		ExpectedSequence: decoded.ExpectedAdmissionSequence,
+		ResultSequence:   decoded.ResultAdmissionSequence,
+		Replayed:         decoded.Replayed,
+	}, nil
 }
 
 func (err *vnextOwnerClientRemoteError) Error() string {
@@ -247,6 +433,16 @@ func (client *vnextOwnerClient) ReservationStatus(
 		return vnextOwnerReservationStatusResponse{}, fmt.Errorf(
 			"reservation status has unknown state %q", decoded.State)
 	}
+	admissionState, ok := vnextOwnerRPCAdmissionState(decoded.AdmissionState)
+	if !ok {
+		return vnextOwnerReservationStatusResponse{}, errors.New(
+			"reservation status has invalid admission evidence")
+	}
+	if err := validateVNextOwnerAdmissionHeadPair(
+		admissionState, decoded.AdmissionSequence); err != nil {
+		return vnextOwnerReservationStatusResponse{}, fmt.Errorf(
+			"reservation status has invalid admission evidence: %w", err)
+	}
 	identity := decoded.Identity.internal()
 	if identity.RequestID != request.RequestID ||
 		identity.CheckpointID != request.CheckpointID ||
@@ -266,7 +462,12 @@ func (client *vnextOwnerClient) ReservationStatus(
 		return vnextOwnerReservationStatusResponse{}, errors.New(
 			"reservation status grant presence or allocation identity is inconsistent")
 	}
-	result := vnextOwnerReservationStatusResponse{State: state, Identity: identity}
+	result := vnextOwnerReservationStatusResponse{
+		State:             state,
+		AdmissionState:    admissionState,
+		AdmissionSequence: decoded.AdmissionSequence,
+		Identity:          identity,
+	}
 	if !decoded.HasGrant {
 		if decoded.TotalPages != 0 || len(decoded.Contents) != 0 ||
 			len(decoded.Extents) != 0 || len(decoded.Devices) != 0 {

@@ -63,6 +63,8 @@ type daemonRequest struct {
 	VNextOwnerAbort             json.RawMessage           `json:"vnextOwnerAbort,omitempty"`
 	VNextOwnerInventory         json.RawMessage           `json:"vnextOwnerInventory,omitempty"`
 	VNextOwnerReservationStatus json.RawMessage           `json:"vnextOwnerReservationStatus,omitempty"`
+	VNextOwnerSetAdmission      json.RawMessage           `json:"vnextOwnerSetAdmission,omitempty"`
+	VNextOwnerAdmissionStatus   json.RawMessage           `json:"vnextOwnerAdmissionStatus,omitempty"`
 }
 
 // A structured checkpoint request is preferred over allowing the invoker to
@@ -446,7 +448,9 @@ func runCommandWithVNextOwnerRPC(
 		vnextOwnerRPCOperationCommit,
 		vnextOwnerRPCOperationAbort,
 		vnextOwnerRPCOperationInventory,
-		vnextOwnerRPCOperationReservationStatus:
+		vnextOwnerRPCOperationReservationStatus,
+		vnextOwnerRPCOperationSetAdmission,
+		vnextOwnerRPCOperationAdmissionStatus:
 		return runVNextOwnerRPC(operation, req, vnextOwnerRPC)
 	case "":
 		return execResponse{Ok: false, Error: "operation is empty"}

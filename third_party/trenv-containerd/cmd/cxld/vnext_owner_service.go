@@ -28,18 +28,21 @@ type vnextOwnerService struct {
 type vnextOwnerServiceErrorCode string
 
 const (
-	vnextOwnerServiceInvalidRequest          vnextOwnerServiceErrorCode = "invalid_request"
-	vnextOwnerServiceIdentityMismatch        vnextOwnerServiceErrorCode = "identity_mismatch"
-	vnextOwnerServiceTransactionNotFound     vnextOwnerServiceErrorCode = "transaction_not_found"
-	vnextOwnerServiceTransactionState        vnextOwnerServiceErrorCode = "transaction_state_mismatch"
-	vnextOwnerServiceConflict                vnextOwnerServiceErrorCode = "identity_conflict"
-	vnextOwnerServiceNoSpace                 vnextOwnerServiceErrorCode = "content_space_exhausted"
-	vnextOwnerServicePublicationIncompatible vnextOwnerServiceErrorCode = "publication_incompatible"
-	vnextOwnerServicePublicationInvalid      vnextOwnerServiceErrorCode = "publication_invalid"
-	vnextOwnerServiceSidecarMissing          vnextOwnerServiceErrorCode = "crc_sidecar_missing"
-	vnextOwnerServiceSidecarInvalid          vnextOwnerServiceErrorCode = "crc_sidecar_invalid"
-	vnextOwnerServicePayloadMismatch         vnextOwnerServiceErrorCode = "payload_crc_mismatch"
-	vnextOwnerServiceUnavailable             vnextOwnerServiceErrorCode = "owner_unavailable"
+	vnextOwnerServiceInvalidRequest            vnextOwnerServiceErrorCode = "invalid_request"
+	vnextOwnerServiceIdentityMismatch          vnextOwnerServiceErrorCode = "identity_mismatch"
+	vnextOwnerServiceTransactionNotFound       vnextOwnerServiceErrorCode = "transaction_not_found"
+	vnextOwnerServiceTransactionState          vnextOwnerServiceErrorCode = "transaction_state_mismatch"
+	vnextOwnerServiceConflict                  vnextOwnerServiceErrorCode = "identity_conflict"
+	vnextOwnerServiceNoSpace                   vnextOwnerServiceErrorCode = "content_space_exhausted"
+	vnextOwnerServiceAdmissionClosed           vnextOwnerServiceErrorCode = "allocation_admission_closed"
+	vnextOwnerServiceAdmissionRequestConflict  vnextOwnerServiceErrorCode = "admission_request_conflict"
+	vnextOwnerServiceAdmissionSequenceConflict vnextOwnerServiceErrorCode = "admission_sequence_conflict"
+	vnextOwnerServicePublicationIncompatible   vnextOwnerServiceErrorCode = "publication_incompatible"
+	vnextOwnerServicePublicationInvalid        vnextOwnerServiceErrorCode = "publication_invalid"
+	vnextOwnerServiceSidecarMissing            vnextOwnerServiceErrorCode = "crc_sidecar_missing"
+	vnextOwnerServiceSidecarInvalid            vnextOwnerServiceErrorCode = "crc_sidecar_invalid"
+	vnextOwnerServicePayloadMismatch           vnextOwnerServiceErrorCode = "payload_crc_mismatch"
+	vnextOwnerServiceUnavailable               vnextOwnerServiceErrorCode = "owner_unavailable"
 )
 
 // vnextOwnerServiceError is safe for a transport adapter to convert into a
@@ -215,6 +218,49 @@ type vnextOwnerInventoryResponse struct {
 	Devices          []vnextOwnerInventoryDevice
 }
 
+// Admission status is an atomic read of one exact Owner incarnation. RequestID
+// is correlation only and is not persisted in the Owner journal.
+type vnextOwnerAdmissionStatusRequest struct {
+	RequestID  string
+	OwnerID    string
+	OwnerEpoch uint64
+}
+
+type vnextOwnerAdmissionStatusResponse struct {
+	RequestID         string
+	OwnerID           string
+	OwnerEpoch        uint64
+	State             vnextOwnerAdmissionState
+	AdmissionSequence uint64
+	SnapshotSequence  uint64
+	HasLastTransition bool
+	LastTransition    vnextOwnerAdmissionTransitionRecord
+}
+
+// SetAdmission is an idempotent, persist-before-ack transition for one exact
+// Owner epoch. The Owner computes RequestDigest from this complete request and
+// persists it with the transition proof.
+type vnextOwnerSetAdmissionRequest struct {
+	RequestID        string
+	OwnerID          string
+	OwnerEpoch       uint64
+	From             vnextOwnerAdmissionState
+	Target           vnextOwnerAdmissionState
+	ExpectedSequence uint64
+}
+
+type vnextOwnerSetAdmissionResponse struct {
+	RequestID        string
+	RequestDigest    [32]byte
+	OwnerID          string
+	OwnerEpoch       uint64
+	From             vnextOwnerAdmissionState
+	Target           vnextOwnerAdmissionState
+	ExpectedSequence uint64
+	ResultSequence   uint64
+	Replayed         bool
+}
+
 type vnextOwnerReservationState string
 
 const (
@@ -247,9 +293,11 @@ func (state vnextOwnerReservationState) valid() bool {
 // AllocationRecordID is zero only for NOT_FOUND. Grant is present only when
 // the complete immutable placement is safe to replay.
 type vnextOwnerReservationStatusResponse struct {
-	State    vnextOwnerReservationState
-	Identity vnextOwnerOperationIdentity
-	Grant    *vnextOwnerReserveResponse
+	State             vnextOwnerReservationState
+	AdmissionState    vnextOwnerAdmissionState
+	AdmissionSequence uint64
+	Identity          vnextOwnerOperationIdentity
+	Grant             *vnextOwnerReserveResponse
 }
 
 // vnextOwnerExternalSealRequest is the complete producer seal request. The
@@ -386,6 +434,85 @@ func (service *vnextOwnerService) inventory(
 	}, nil
 }
 
+func (service *vnextOwnerService) admissionStatus(
+	request vnextOwnerAdmissionStatusRequest,
+) (vnextOwnerAdmissionStatusResponse, error) {
+	const operation = "admission-status"
+	if service == nil || service.group == nil {
+		return vnextOwnerAdmissionStatusResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable, "Owner group is not configured", nil)
+	}
+	if request.RequestID == "" || len(request.RequestID) > vnextMaxIdentityBytes ||
+		request.OwnerID == "" || len(request.OwnerID) > vnextMaxIdentityBytes ||
+		request.OwnerEpoch == 0 || request.OwnerEpoch > uint64(math.MaxInt64) {
+		return vnextOwnerAdmissionStatusResponse{}, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceInvalidRequest,
+			"admission status identity is incomplete or outside the signed ABI",
+			nil)
+	}
+	snapshot, err := service.group.admissionStatus(request.OwnerID, request.OwnerEpoch)
+	if err != nil {
+		if errors.Is(err, errVNextAuthority) {
+			return vnextOwnerAdmissionStatusResponse{}, vnextOwnerServiceFailure(
+				operation,
+				vnextOwnerServiceIdentityMismatch,
+				"requested Owner identity is not the live Owner incarnation",
+				err)
+		}
+		return vnextOwnerAdmissionStatusResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable, "Owner admission status is unavailable", err)
+	}
+	return vnextOwnerAdmissionStatusResponse{
+		RequestID:         request.RequestID,
+		OwnerID:           snapshot.OwnerID,
+		OwnerEpoch:        snapshot.OwnerEpoch,
+		State:             snapshot.State,
+		AdmissionSequence: snapshot.AdmissionSequence,
+		SnapshotSequence:  snapshot.SnapshotSequence,
+		HasLastTransition: snapshot.HasLastTransition,
+		LastTransition:    snapshot.LastTransition,
+	}, nil
+}
+
+func (service *vnextOwnerService) setAdmission(
+	request vnextOwnerSetAdmissionRequest,
+) (vnextOwnerSetAdmissionResponse, error) {
+	const operation = "set-admission"
+	if service == nil || service.group == nil {
+		return vnextOwnerSetAdmissionResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable, "Owner group is not configured", nil)
+	}
+	internal := vnextOwnerAdmissionTransitionRequest{
+		RequestID:        request.RequestID,
+		OwnerID:          request.OwnerID,
+		OwnerEpoch:       request.OwnerEpoch,
+		From:             request.From,
+		Target:           request.Target,
+		ExpectedSequence: request.ExpectedSequence,
+	}
+	if err := validateVNextOwnerAdmissionTransitionRequest(internal); err != nil {
+		return vnextOwnerSetAdmissionResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceInvalidRequest, err.Error(), err)
+	}
+	result, err := service.group.setAdmission(internal)
+	if err != nil {
+		return vnextOwnerSetAdmissionResponse{}, vnextOwnerServiceWrap(operation, err)
+	}
+	record := result.Record
+	return vnextOwnerSetAdmissionResponse{
+		RequestID:        record.RequestID,
+		RequestDigest:    record.RequestDigest,
+		OwnerID:          request.OwnerID,
+		OwnerEpoch:       request.OwnerEpoch,
+		From:             record.From,
+		Target:           record.Target,
+		ExpectedSequence: record.ExpectedSequence,
+		ResultSequence:   record.ResultSequence,
+		Replayed:         result.Replayed,
+	}, nil
+}
+
 // reservationStatus does not take service.mu because group.mu is the atomic
 // Owner authority boundary. It never persists a journal or allocator
 // snapshot, advances a sequence, repairs a descriptor, or allocates a page.
@@ -421,6 +548,20 @@ func (service *vnextOwnerService) reservationStatus(
 		OwnerID:      request.OwnerID,
 		OwnerEpoch:   request.OwnerEpoch,
 	}
+	admission := group.admissionSnapshotLocked()
+	if err := validateVNextOwnerAdmissionHeadPair(
+		admission.State, admission.AdmissionSequence); err != nil {
+		return vnextOwnerReservationStatusResponse{}, vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceUnavailable,
+			"Owner admission evidence is not canonical",
+			err)
+	}
+	response := vnextOwnerReservationStatusResponse{
+		AdmissionState:    admission.State,
+		AdmissionSequence: admission.AdmissionSequence,
+		Identity:          identity,
+	}
 	allocationRecordID, found := group.journal.RequestIndex[request.RequestID]
 	if !found {
 		if conflictingID, conflict := group.journal.CheckpointIndex[request.CheckpointID]; conflict {
@@ -430,9 +571,8 @@ func (service *vnextOwnerService) reservationStatus(
 				fmt.Sprintf("checkpoint identity belongs to allocation %d", conflictingID),
 				errVNextAlreadyExists)
 		}
-		return vnextOwnerReservationStatusResponse{
-			State: vnextOwnerReservationNotFound, Identity: identity,
-		}, nil
+		response.State = vnextOwnerReservationNotFound
+		return response, nil
 	}
 	transaction := group.journal.Transactions[allocationRecordID]
 	if transaction == nil {
@@ -453,7 +593,7 @@ func (service *vnextOwnerService) reservationStatus(
 			errVNextAlreadyExists)
 	}
 	identity.AllocationRecordID = transaction.AllocationRecordID
-	response := vnextOwnerReservationStatusResponse{Identity: identity}
+	response.Identity = identity
 	switch transaction.State {
 	case vnextOwnerPreparing:
 		response.State = vnextOwnerReservationPreparing
@@ -927,6 +1067,17 @@ func (service *vnextOwnerService) resolveOperation(
 			fmt.Sprintf("durable transaction is in state %d", transaction.State),
 			errVNextInvalidState)
 	}
+	if transaction.State == requiredState &&
+		(operation == "seal" || operation == "commit") {
+		if err := group.requireProducerMutationAllowedLocked(operation); err != nil {
+			return vnextOwnerWriteGrant{}, transaction.State, vnextOwnerServiceWrap(operation, err)
+		}
+	}
+	if operation == "abort" && transaction.State == requiredState {
+		if err := group.requireReclaimSafetyLocked(operation); err != nil {
+			return vnextOwnerWriteGrant{}, transaction.State, vnextOwnerServiceWrap(operation, err)
+		}
+	}
 	grant := vnextOwnerWriteGrant{
 		AllocationRecordID: transaction.AllocationRecordID,
 		RequestID:          transaction.RequestID,
@@ -961,6 +1112,36 @@ func vnextOwnerServiceWrap(operation string, err error) error {
 	var typed *vnextOwnerServiceError
 	if errors.As(err, &typed) {
 		return err
+	}
+	var admissionClosed *vnextOwnerAdmissionClosedError
+	if errors.As(err, &admissionClosed) {
+		return vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceAdmissionClosed,
+			fmt.Sprintf("admission state=%s sequence=%d", admissionClosed.State, admissionClosed.Sequence),
+			err)
+	}
+	var requestConflict *vnextOwnerAdmissionRequestConflictError
+	if errors.As(err, &requestConflict) {
+		return vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceAdmissionRequestConflict,
+			fmt.Sprintf("admission requestId=%q conflicts with its durable digest",
+				requestConflict.RequestID),
+			err)
+	}
+	var sequenceConflict *vnextOwnerAdmissionSequenceConflictError
+	if errors.As(err, &sequenceConflict) {
+		return vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceAdmissionSequenceConflict,
+			fmt.Sprintf(
+				"admission state=%s sequence=%d, expected state=%s sequence=%d",
+				sequenceConflict.CurrentState,
+				sequenceConflict.CurrentSequence,
+				sequenceConflict.RequestedFrom,
+				sequenceConflict.ExpectedSequence),
+			err)
 	}
 	switch {
 	case errors.Is(err, errVNextAuthority):

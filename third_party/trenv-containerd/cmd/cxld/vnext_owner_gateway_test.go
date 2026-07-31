@@ -434,6 +434,87 @@ func TestVNextOwnerGatewayUsesExactLocalOwnerWithoutNetwork(t *testing.T) {
 	}
 }
 
+func TestVNextOwnerGatewayRoutesAdmissionStatusAndTransitionByExactIncarnation(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "gateway-local-admission", Size: 256 << 10,
+	}})
+	localRPC := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+	var calls int64
+	gateway := openVNextOwnerGatewayForTest(
+		t,
+		vnextOwnerGatewayTestRouteFile("remote-owner", 9, "127.0.0.1:1"),
+		localRPC,
+		vnextOwnerGatewayTestInventoryTransport(&calls, nil, nil))
+	setRaw, err := json.Marshal(vnextOwnerRPCSetAdmissionRequest{
+		Protocol:                  vnextOwnerRPCProtocol,
+		RequestID:                 "gateway-admission-close",
+		ExpectedOwnerID:           "owner-0",
+		ExpectedOwnerEpoch:        7,
+		FromState:                 "ACTIVE",
+		TargetState:               "READ_ONLY",
+		ExpectedAdmissionSequence: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := vnextOwnerGatewayUnixRoundTrip(t, localRPC, gateway, daemonRequest{
+		CommandLabel:           "scheduler-gateway-test",
+		Operation:              vnextOwnerRPCOperationSetAdmission,
+		VNextOwnerSetAdmission: setRaw,
+	})
+	if !set.Ok || set.Operation != vnextOwnerRPCOperationSetAdmission {
+		t.Fatalf("local gateway set admission failed: %#v", set)
+	}
+	statusRaw, err := json.Marshal(vnextOwnerRPCAdmissionStatusRequest{
+		Protocol:           vnextOwnerRPCProtocol,
+		RequestID:          "gateway-admission-status",
+		ExpectedOwnerID:    "owner-0",
+		ExpectedOwnerEpoch: 7,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := vnextOwnerGatewayUnixRoundTrip(t, localRPC, gateway, daemonRequest{
+		CommandLabel:              "scheduler-gateway-test",
+		Operation:                 vnextOwnerRPCOperationAdmissionStatus,
+		VNextOwnerAdmissionStatus: statusRaw,
+	})
+	if !status.Ok || status.Operation != vnextOwnerRPCOperationAdmissionStatus {
+		t.Fatalf("local gateway admission status failed: %#v", status)
+	}
+	var wire vnextOwnerRPCAdmissionStatusResponse
+	if err := decodeStrictVNextOwnerRPC([]byte(status.Stdout), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.State != "READ_ONLY" || wire.AdmissionSequence != 2 {
+		t.Fatalf("gateway admission status changed proof: %#v", wire)
+	}
+	if got := atomic.LoadInt64(&calls); got != 0 {
+		t.Fatalf("exact local admission route made %d network calls", got)
+	}
+
+	unknownRaw, err := json.Marshal(vnextOwnerRPCAdmissionStatusRequest{
+		Protocol:           vnextOwnerRPCProtocol,
+		RequestID:          "gateway-admission-unknown",
+		ExpectedOwnerID:    "unknown-owner",
+		ExpectedOwnerEpoch: 7,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown := gateway.dispatch(daemonRequest{
+		CommandLabel:              "scheduler-gateway-test",
+		Operation:                 vnextOwnerRPCOperationAdmissionStatus,
+		VNextOwnerAdmissionStatus: unknownRaw,
+	})
+	if unknown.Ok || unknown.ErrorCode != string(vnextOwnerServiceIdentityMismatch) {
+		t.Fatalf("unknown admission route was not rejected: %#v", unknown)
+	}
+	if got := atomic.LoadInt64(&calls); got != 0 {
+		t.Fatalf("unknown admission route made %d network calls", got)
+	}
+}
+
 func TestVNextOwnerGatewayRejectsMalformedReserveIdentityBeforeLocalAllocation(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
 		UUID: "gateway-local-reserve-device", Size: 256 << 10,

@@ -88,6 +88,19 @@ func TestVNextOwnerClientReserveSealCommitThroughDaemonRoundTrip(t *testing.T) {
 		len(reserved.Extents) != 2 {
 		t.Fatalf("unexpected client reserve response: %#v", reserved)
 	}
+	// Close admission after GRANTED is durable. The already-started producer
+	// must still be able to finish its external seal and commit under READ_ONLY.
+	if _, err := environment.ownerFixture.group.setAdmission(
+		vnextOwnerAdmissionTransitionRequest{
+			RequestID:        "owner-client-read-only-drain",
+			OwnerID:          reserved.Operation.OwnerID,
+			OwnerEpoch:       reserved.Operation.OwnerEpoch,
+			From:             vnextOwnerAdmissionActive,
+			Target:           vnextOwnerAdmissionReadOnly,
+			ExpectedSequence: 1,
+		}); err != nil {
+		t.Fatalf("close admission before producer drain: %v", err)
+	}
 
 	publication, sidecars := vnextOwnerClientPublicationForReserve(
 		t, environment, reserved)
@@ -201,6 +214,256 @@ func TestVNextOwnerClientInventoryRoundTripsExactReadOnlyRequest(t *testing.T) {
 	}
 }
 
+func TestVNextOwnerClientAdmissionV2RoundTripsExactStatusAndTransition(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "client-admission", Size: 256 << 10,
+	}})
+	transport := &vnextOwnerClientRecordingTransport{
+		rpc: newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture)),
+	}
+	client, err := newVNextOwnerClient(transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusRequest := vnextOwnerAdmissionStatusRequest{
+		RequestID:  "client-admission-status",
+		OwnerID:    "owner-0",
+		OwnerEpoch: 7,
+	}
+	initial, err := client.AdmissionStatus(context.Background(), statusRequest)
+	if err != nil {
+		t.Fatalf("client admission status: %v", err)
+	}
+	if initial.State != vnextOwnerAdmissionActive || initial.AdmissionSequence != 1 ||
+		initial.SnapshotSequence == 0 || initial.HasLastTransition ||
+		initial.LastTransition != (vnextOwnerAdmissionTransitionRecord{}) {
+		t.Fatalf("unexpected client admission status: %#v", initial)
+	}
+	transition := vnextOwnerSetAdmissionRequest{
+		RequestID:        "client-admission-close",
+		OwnerID:          "owner-0",
+		OwnerEpoch:       7,
+		From:             vnextOwnerAdmissionActive,
+		Target:           vnextOwnerAdmissionReadOnly,
+		ExpectedSequence: 1,
+	}
+	closed, err := client.SetAdmission(context.Background(), transition)
+	if err != nil {
+		t.Fatalf("client set admission: %v", err)
+	}
+	if closed.Replayed || closed.ResultSequence != 2 ||
+		closed.RequestDigest != vnextOwnerAdmissionRequestDigest(
+			vnextOwnerAdmissionTransitionRequest{
+				RequestID:        transition.RequestID,
+				OwnerID:          transition.OwnerID,
+				OwnerEpoch:       transition.OwnerEpoch,
+				From:             transition.From,
+				Target:           transition.Target,
+				ExpectedSequence: transition.ExpectedSequence,
+			}) {
+		t.Fatalf("unexpected client transition proof: %#v", closed)
+	}
+	replayed, err := client.SetAdmission(context.Background(), transition)
+	if err != nil || !replayed.Replayed || replayed.RequestDigest != closed.RequestDigest {
+		t.Fatalf("client transition replay: %#v / %v", replayed, err)
+	}
+	final, err := client.AdmissionStatus(context.Background(), statusRequest)
+	if err != nil || final.State != vnextOwnerAdmissionReadOnly ||
+		final.AdmissionSequence != 2 || final.SnapshotSequence <= initial.SnapshotSequence ||
+		!final.HasLastTransition ||
+		final.LastTransition.RequestID != transition.RequestID ||
+		final.LastTransition.RequestDigest != closed.RequestDigest ||
+		final.LastTransition.From != transition.From ||
+		final.LastTransition.Target != transition.Target ||
+		final.LastTransition.ExpectedSequence != transition.ExpectedSequence ||
+		final.LastTransition.ResultSequence != closed.ResultSequence {
+		t.Fatalf("client final admission status: %#v / %v", final, err)
+	}
+	if len(transport.requests) != 4 ||
+		transport.requests[0].Operation != vnextOwnerRPCOperationAdmissionStatus ||
+		len(transport.requests[0].VNextOwnerAdmissionStatus) == 0 ||
+		transport.requests[1].Operation != vnextOwnerRPCOperationSetAdmission ||
+		len(transport.requests[1].VNextOwnerSetAdmission) == 0 ||
+		transport.requests[2].Operation != vnextOwnerRPCOperationSetAdmission ||
+		transport.requests[3].Operation != vnextOwnerRPCOperationAdmissionStatus {
+		t.Fatalf("unexpected client admission envelopes: %#v", transport.requests)
+	}
+}
+
+func TestVNextOwnerClientAdmissionRejectsMalformedProofs(t *testing.T) {
+	statusRequest := vnextOwnerAdmissionStatusRequest{
+		RequestID:  "client-admission-malformed-status",
+		OwnerID:    "owner-0",
+		OwnerEpoch: 7,
+	}
+	validStatus := vnextOwnerRPCAdmissionStatusResponse{
+		Protocol:          vnextOwnerRPCProtocol,
+		Operation:         vnextOwnerRPCOperationAdmissionStatus,
+		RequestID:         statusRequest.RequestID,
+		OwnerID:           statusRequest.OwnerID,
+		OwnerEpoch:        statusRequest.OwnerEpoch,
+		State:             "ACTIVE",
+		AdmissionSequence: 1,
+		SnapshotSequence:  2,
+	}
+	impossibleRequest := vnextOwnerAdmissionTransitionRequest{
+		RequestID:        "client-impossible-last-transition",
+		OwnerID:          statusRequest.OwnerID,
+		OwnerEpoch:       statusRequest.OwnerEpoch,
+		From:             vnextOwnerAdmissionActive,
+		Target:           vnextOwnerAdmissionFenced,
+		ExpectedSequence: 2,
+	}
+	impossibleDigest := vnextOwnerAdmissionRequestDigest(impossibleRequest)
+	for _, test := range []struct {
+		name   string
+		mutate func(vnextOwnerRPCAdmissionStatusResponse) vnextOwnerRPCAdmissionStatusResponse
+	}{
+		{
+			name: "unknown-head-state",
+			mutate: func(invalid vnextOwnerRPCAdmissionStatusResponse) vnextOwnerRPCAdmissionStatusResponse {
+				invalid.State = "UNKNOWN"
+				return invalid
+			},
+		},
+		{
+			name: "fresh-with-nonempty-proof",
+			mutate: func(invalid vnextOwnerRPCAdmissionStatusResponse) vnextOwnerRPCAdmissionStatusResponse {
+				invalid.LastTransitionRequestID = "unexpected"
+				return invalid
+			},
+		},
+		{
+			name: "transition-flag-with-empty-proof",
+			mutate: func(invalid vnextOwnerRPCAdmissionStatusResponse) vnextOwnerRPCAdmissionStatusResponse {
+				invalid.HasLastTransition = true
+				return invalid
+			},
+		},
+		{
+			name: "impossible-state-sequence-proof",
+			mutate: func(invalid vnextOwnerRPCAdmissionStatusResponse) vnextOwnerRPCAdmissionStatusResponse {
+				invalid.State = "FENCED"
+				invalid.AdmissionSequence = 3
+				invalid.HasLastTransition = true
+				invalid.LastTransitionRequestID = impossibleRequest.RequestID
+				invalid.LastTransitionRequestDigest = hex.EncodeToString(impossibleDigest[:])
+				invalid.LastTransitionFromState = "ACTIVE"
+				invalid.LastTransitionTargetState = "FENCED"
+				invalid.LastTransitionExpectedAdmissionSequence = 2
+				invalid.LastTransitionResultAdmissionSequence = 3
+				return invalid
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			statusClient, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+				func(context.Context, daemonRequest) (execResponse, error) {
+					return execResponse{
+						Ok:        true,
+						Operation: vnextOwnerRPCOperationAdmissionStatus,
+						Stdout: string(vnextOwnerClientMarshalJSON(
+							t, test.mutate(validStatus))),
+					}, nil
+				}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := statusClient.AdmissionStatus(
+				context.Background(), statusRequest); err == nil {
+				t.Fatal("client accepted a malformed admission status proof")
+			}
+		})
+	}
+
+	transition := vnextOwnerSetAdmissionRequest{
+		RequestID:        "client-admission-malformed-transition",
+		OwnerID:          "owner-0",
+		OwnerEpoch:       7,
+		From:             vnextOwnerAdmissionActive,
+		Target:           vnextOwnerAdmissionReadOnly,
+		ExpectedSequence: 1,
+	}
+	internal := vnextOwnerAdmissionTransitionRequest{
+		RequestID:        transition.RequestID,
+		OwnerID:          transition.OwnerID,
+		OwnerEpoch:       transition.OwnerEpoch,
+		From:             transition.From,
+		Target:           transition.Target,
+		ExpectedSequence: transition.ExpectedSequence,
+	}
+	digest := vnextOwnerAdmissionRequestDigest(internal)
+	validSet := vnextOwnerRPCSetAdmissionResponse{
+		Protocol:                  vnextOwnerRPCProtocol,
+		Operation:                 vnextOwnerRPCOperationSetAdmission,
+		RequestID:                 transition.RequestID,
+		RequestDigest:             hex.EncodeToString(digest[:]),
+		OwnerID:                   transition.OwnerID,
+		OwnerEpoch:                transition.OwnerEpoch,
+		FromState:                 "ACTIVE",
+		TargetState:               "READ_ONLY",
+		ExpectedAdmissionSequence: 1,
+		ResultAdmissionSequence:   2,
+		Replayed:                  false,
+	}
+	setClient, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+		func(context.Context, daemonRequest) (execResponse, error) {
+			invalid := validSet
+			invalid.RequestDigest = strings.Repeat("0", 64)
+			return execResponse{
+				Ok:        true,
+				Operation: vnextOwnerRPCOperationSetAdmission,
+				Stdout:    string(vnextOwnerClientMarshalJSON(t, invalid)),
+			}, nil
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setClient.SetAdmission(context.Background(), transition); err == nil {
+		t.Fatal("client accepted a mismatched admission transition digest")
+	}
+}
+
+func TestVNextOwnerClientAdmissionPreservesConflictCodes(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "client-admission-conflicts", Size: 256 << 10,
+	}})
+	client, err := newVNextOwnerClient(&vnextOwnerClientRecordingTransport{
+		rpc: newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition := vnextOwnerSetAdmissionRequest{
+		RequestID:        "client-admission-conflict-base",
+		OwnerID:          "owner-0",
+		OwnerEpoch:       7,
+		From:             vnextOwnerAdmissionActive,
+		Target:           vnextOwnerAdmissionReadOnly,
+		ExpectedSequence: 1,
+	}
+	if _, err := client.SetAdmission(context.Background(), transition); err != nil {
+		t.Fatal(err)
+	}
+	requestConflict := transition
+	requestConflict.Target = vnextOwnerAdmissionFenced
+	_, err = client.SetAdmission(context.Background(), requestConflict)
+	var remote *vnextOwnerClientRemoteError
+	if !errors.As(err, &remote) ||
+		remote.ErrorCode != string(vnextOwnerServiceAdmissionRequestConflict) {
+		t.Fatalf("client request conflict returned %#v / %v", remote, err)
+	}
+	stale := transition
+	stale.RequestID = "client-admission-sequence-conflict"
+	stale.Target = vnextOwnerAdmissionFenced
+	_, err = client.SetAdmission(context.Background(), stale)
+	remote = nil
+	if !errors.As(err, &remote) ||
+		remote.ErrorCode != string(vnextOwnerServiceAdmissionSequenceConflict) {
+		t.Fatalf("client sequence conflict returned %#v / %v", remote, err)
+	}
+}
+
 func TestVNextOwnerClientReservationStatusRecoversExactLostGrant(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
 		UUID: "client-status-device", Size: 256 << 10,
@@ -269,10 +532,12 @@ func TestVNextOwnerClientReservationStatusAcceptsDurableNoSpace(t *testing.T) {
 func TestVNextOwnerClientReservationStatusRejectsMalformedStrictResponse(t *testing.T) {
 	request := vnextOwnerStatusTestRequest("client-malformed", 1)
 	valid := vnextOwnerRPCReservationStatusResponse{
-		Protocol:  vnextOwnerRPCProtocol,
-		Operation: vnextOwnerRPCOperationReservationStatus,
-		State:     string(vnextOwnerReservationNotFound),
-		HasGrant:  false,
+		Protocol:          vnextOwnerRPCProtocol,
+		Operation:         vnextOwnerRPCOperationReservationStatus,
+		State:             string(vnextOwnerReservationNotFound),
+		AdmissionState:    vnextOwnerAdmissionActive.String(),
+		AdmissionSequence: 1,
+		HasGrant:          false,
 		Identity: vnextOwnerRPCOperationIdentity{
 			RequestID: request.RequestID, CheckpointID: request.CheckpointID,
 			ProducerID: request.ProducerID, OwnerID: request.OwnerID,
@@ -292,6 +557,33 @@ func TestVNextOwnerClientReservationStatusRejectsMalformedStrictResponse(t *test
 		"grant flag mismatch": func(raw []byte) []byte {
 			object := vnextOwnerClientJSONMap(t, raw)
 			object["hasGrant"] = true
+			return vnextOwnerClientMarshalJSON(t, object)
+		},
+		"active sequence 2": func(raw []byte) []byte {
+			object := vnextOwnerClientJSONMap(t, raw)
+			object["admissionSequence"] = 2
+			return vnextOwnerClientMarshalJSON(t, object)
+		},
+		"read-only sequence 1": func(raw []byte) []byte {
+			object := vnextOwnerClientJSONMap(t, raw)
+			object["admissionState"] = "READ_ONLY"
+			return vnextOwnerClientMarshalJSON(t, object)
+		},
+		"read-only sequence 3": func(raw []byte) []byte {
+			object := vnextOwnerClientJSONMap(t, raw)
+			object["admissionState"] = "READ_ONLY"
+			object["admissionSequence"] = 3
+			return vnextOwnerClientMarshalJSON(t, object)
+		},
+		"fenced sequence 1": func(raw []byte) []byte {
+			object := vnextOwnerClientJSONMap(t, raw)
+			object["admissionState"] = "FENCED"
+			return vnextOwnerClientMarshalJSON(t, object)
+		},
+		"fenced sequence 4": func(raw []byte) []byte {
+			object := vnextOwnerClientJSONMap(t, raw)
+			object["admissionState"] = "FENCED"
+			object["admissionSequence"] = 4
 			return vnextOwnerClientMarshalJSON(t, object)
 		},
 		"null contents": func(raw []byte) []byte {
@@ -556,7 +848,7 @@ func TestVNextOwnerClientRejectsNonCanonicalResponses(t *testing.T) {
 		{
 			name: "duplicate-field",
 			mutate: func(raw []byte) []byte {
-				prefix := []byte(`{"protocol":"cxld.vnext-owner.v1",`)
+				prefix := []byte(`{"protocol":"cxld.vnext-owner.v2",`)
 				return append(prefix, raw[1:]...)
 			},
 		},

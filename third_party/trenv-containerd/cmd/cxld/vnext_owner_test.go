@@ -944,7 +944,8 @@ func TestVNextOwnerRejectsZeroFragmentNonTombstone(t *testing.T) {
 		t.Fatalf("extract valid no-space journal payload: %v", err)
 	}
 	payload = append([]byte(nil), payload...)
-	stateOffset := 8 + 4 + len(fixture.group.ownerID) + 8 + 8 + 4 + 8
+	stateOffset := 8 + 4 + len(fixture.group.ownerID) + 8 +
+		8 + 8 + 4 + 4 + 8 + 4 + 8
 	payload[stateOffset] = byte(vnextOwnerGranted)
 	malformed, err := vnextMarshalEnvelope(vnextOwnerJournalMagic, payload)
 	if err != nil {
@@ -1183,7 +1184,7 @@ func TestVNextOwnerGrantedRetryAfterRestartIsIdempotent(t *testing.T) {
 	}
 	if retried.AllocationRecordID != grant.AllocationRecordID ||
 		!reflect.DeepEqual(retried.Extents, grant.Extents) ||
-		len(retried.fragmentGrants) != len(grant.fragmentGrants) {
+		len(retried.fragmentGrants) != 0 {
 		t.Fatalf("GRANTED retry changed grant:\nold=%#v\nnew=%#v", grant, retried)
 	}
 	if reopened.journal.SnapshotSequence != beforeSequence ||

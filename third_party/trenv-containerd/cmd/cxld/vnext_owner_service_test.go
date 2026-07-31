@@ -68,6 +68,231 @@ func requireVNextOwnerServiceCode(
 	return serviceError
 }
 
+func TestVNextOwnerServiceAdmissionStatusTransitionAndClosedReserveEvidence(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "service-admission", Size: 256 << 10,
+	}})
+	service := newVNextOwnerServiceForFixture(t, fixture)
+	statusRequest := vnextOwnerAdmissionStatusRequest{
+		RequestID:  "service-admission-status",
+		OwnerID:    "owner-0",
+		OwnerEpoch: 7,
+	}
+	initial, err := service.admissionStatus(statusRequest)
+	if err != nil {
+		t.Fatalf("read initial service admission status: %v", err)
+	}
+	if initial.RequestID != statusRequest.RequestID ||
+		initial.State != vnextOwnerAdmissionActive || initial.AdmissionSequence != 1 ||
+		initial.SnapshotSequence == 0 || initial.HasLastTransition ||
+		initial.LastTransition != (vnextOwnerAdmissionTransitionRecord{}) {
+		t.Fatalf("unexpected initial service admission status: %#v", initial)
+	}
+
+	existingRequest := vnextOwnerStatusTestRequest("admission-existing", 1)
+	existing, err := service.reserve(existingRequest)
+	if err != nil {
+		t.Fatalf("reserve before admission close: %v", err)
+	}
+	transition := vnextOwnerSetAdmissionRequest{
+		RequestID:        "service-admission-close",
+		OwnerID:          "owner-0",
+		OwnerEpoch:       7,
+		From:             vnextOwnerAdmissionActive,
+		Target:           vnextOwnerAdmissionReadOnly,
+		ExpectedSequence: 1,
+	}
+	closed, err := service.setAdmission(transition)
+	if err != nil {
+		t.Fatalf("set service READ_ONLY admission: %v", err)
+	}
+	if closed.Replayed || closed.ResultSequence != 2 ||
+		closed.RequestDigest != vnextOwnerAdmissionRequestDigest(
+			vnextOwnerAdmissionTransitionRequest{
+				RequestID:        transition.RequestID,
+				OwnerID:          transition.OwnerID,
+				OwnerEpoch:       transition.OwnerEpoch,
+				From:             transition.From,
+				Target:           transition.Target,
+				ExpectedSequence: transition.ExpectedSequence,
+			}) {
+		t.Fatalf("unexpected service admission proof: %#v", closed)
+	}
+	replayed, err := service.setAdmission(transition)
+	if err != nil || !replayed.Replayed || replayed.RequestDigest != closed.RequestDigest ||
+		replayed.ResultSequence != closed.ResultSequence {
+		t.Fatalf("service admission replay changed proof: %#v / %v", replayed, err)
+	}
+	afterClose, err := service.admissionStatus(statusRequest)
+	if err != nil || !afterClose.HasLastTransition ||
+		afterClose.State != vnextOwnerAdmissionReadOnly ||
+		afterClose.AdmissionSequence != 2 ||
+		afterClose.LastTransition.RequestID != transition.RequestID ||
+		afterClose.LastTransition.RequestDigest != closed.RequestDigest ||
+		afterClose.LastTransition.From != transition.From ||
+		afterClose.LastTransition.Target != transition.Target ||
+		afterClose.LastTransition.ExpectedSequence != transition.ExpectedSequence ||
+		afterClose.LastTransition.ResultSequence != closed.ResultSequence {
+		t.Fatalf("service status lacks the last durable transition: %#v / %v", afterClose, err)
+	}
+
+	requestConflict := transition
+	requestConflict.Target = vnextOwnerAdmissionFenced
+	_, err = service.setAdmission(requestConflict)
+	requestConflictError := requireVNextOwnerServiceCode(
+		t, err, vnextOwnerServiceAdmissionRequestConflict)
+	if !errors.Is(requestConflictError, errVNextOwnerAdmissionRequestConflict) {
+		t.Fatalf("request conflict lost its typed cause: %v", requestConflictError)
+	}
+	stale := vnextOwnerSetAdmissionRequest{
+		RequestID:        "service-admission-stale",
+		OwnerID:          "owner-0",
+		OwnerEpoch:       7,
+		From:             vnextOwnerAdmissionActive,
+		Target:           vnextOwnerAdmissionFenced,
+		ExpectedSequence: 1,
+	}
+	_, err = service.setAdmission(stale)
+	sequenceConflictError := requireVNextOwnerServiceCode(
+		t, err, vnextOwnerServiceAdmissionSequenceConflict)
+	if sequenceConflictError.Detail !=
+		"admission state=READ_ONLY sequence=2, expected state=ACTIVE sequence=1" ||
+		!errors.Is(sequenceConflictError, errVNextOwnerAdmissionSequenceConflict) {
+		t.Fatalf("sequence conflict lost stable evidence: %v", sequenceConflictError)
+	}
+
+	existingStatus, err := service.reservationStatus(existingRequest)
+	if err != nil {
+		t.Fatalf("read existing status after close: %v", err)
+	}
+	if existingStatus.State != vnextOwnerReservationGranted ||
+		existingStatus.AdmissionState != vnextOwnerAdmissionReadOnly ||
+		existingStatus.AdmissionSequence != 2 || existingStatus.Grant == nil ||
+		existingStatus.Grant.Operation != existing.Operation {
+		t.Fatalf("existing reservation status lacks atomic close evidence: %#v", existingStatus)
+	}
+
+	unseen := vnextOwnerStatusTestRequest("admission-unseen", 1)
+	missing, err := service.reservationStatus(unseen)
+	if err != nil {
+		t.Fatalf("read unseen status after close: %v", err)
+	}
+	if missing.State != vnextOwnerReservationNotFound ||
+		missing.AdmissionState != vnextOwnerAdmissionReadOnly ||
+		missing.AdmissionSequence != 2 || missing.Grant != nil {
+		t.Fatalf("NOT_FOUND is missing definitive closed-admission evidence: %#v", missing)
+	}
+	beforeSequence := fixture.group.journal.SnapshotSequence
+	beforeHighWater := fixture.group.journal.NextAllocationRecordID
+	beforeFree := fixture.devices[0].allocator.freePages()
+	_, err = service.reserve(unseen)
+	serviceError := requireVNextOwnerServiceCode(t, err, vnextOwnerServiceAdmissionClosed)
+	if serviceError.Detail != "admission state=READ_ONLY sequence=2" {
+		t.Fatalf("closed reserve detail is not stable: %q", serviceError.Detail)
+	}
+	if fixture.group.journal.SnapshotSequence != beforeSequence ||
+		fixture.group.journal.NextAllocationRecordID != beforeHighWater ||
+		fixture.devices[0].allocator.freePages() != beforeFree {
+		t.Fatal("closed service reserve mutated durable allocation state")
+	}
+}
+
+func TestVNextOwnerServiceFencedRejectsCommitAndAbortButKeepsStatusReadable(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "service-admission-fenced", Size: 256 << 10,
+	}})
+	service := newVNextOwnerServiceForFixture(t, fixture)
+	request := vnextOwnerStatusTestRequest("service-fenced", 1)
+	reserved, err := service.reserve(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.setAdmission(vnextOwnerSetAdmissionRequest{
+		RequestID:        "service-fence",
+		OwnerID:          "owner-0",
+		OwnerEpoch:       7,
+		From:             vnextOwnerAdmissionActive,
+		Target:           vnextOwnerAdmissionFenced,
+		ExpectedSequence: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	beforeFree := fixture.devices[0].allocator.freePages()
+	for name, operation := range map[string]func() error{
+		"seal": func() error {
+			_, err := service.sealExternal(vnextOwnerExternalSealRequest{
+				Operation: reserved.Operation,
+			})
+			return err
+		},
+		"commit": func() error { return service.commit(reserved.Operation) },
+		"abort":  func() error { return service.abort(reserved.Operation) },
+	} {
+		err := operation()
+		serviceError := requireVNextOwnerServiceCode(t, err, vnextOwnerServiceAdmissionClosed)
+		if serviceError.Detail != "admission state=FENCED sequence=2" {
+			t.Fatalf("FENCED %s detail=%q", name, serviceError.Detail)
+		}
+	}
+	if fixture.devices[0].allocator.freePages() != beforeFree ||
+		fixture.group.journal.Transactions[reserved.Operation.AllocationRecordID].State != vnextOwnerGranted {
+		t.Fatal("FENCED service mutation freed or changed the allocation")
+	}
+	status, err := service.reservationStatus(request)
+	if err != nil || status.State != vnextOwnerReservationGranted ||
+		status.AdmissionState != vnextOwnerAdmissionFenced || status.AdmissionSequence != 2 {
+		t.Fatalf("FENCED reservation status is not readable: %#v / %v", status, err)
+	}
+}
+
+func TestVNextOwnerServiceFencedAbortRetryDistinguishesTerminalFromLive(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "service-fenced-abort-replay", Size: 256 << 10,
+	}})
+	service := newVNextOwnerServiceForFixture(t, fixture)
+	terminal, err := service.reserve(vnextOwnerStatusTestRequest("fenced-aborted", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.abort(terminal.Operation); err != nil {
+		t.Fatalf("complete abort before response loss: %v", err)
+	}
+	live, err := service.reserve(vnextOwnerStatusTestRequest("fenced-granted", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.setAdmission(vnextOwnerSetAdmissionRequest{
+		RequestID:        "service-fence-abort-replay",
+		OwnerID:          "owner-0",
+		OwnerEpoch:       7,
+		From:             vnextOwnerAdmissionActive,
+		Target:           vnextOwnerAdmissionFenced,
+		ExpectedSequence: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	beforeSequence := fixture.group.journal.SnapshotSequence
+	beforeFree := vnextOwnerStatusTestFreePages(fixture.group)
+	beforeImage := vnextOwnerStatusTestPersistentImage(t, fixture.group)
+
+	if err := service.abort(terminal.Operation); err != nil {
+		t.Fatalf("FENCED ABORTED response-loss retry failed: %v", err)
+	}
+	serviceError := requireVNextOwnerServiceCode(
+		t, service.abort(live.Operation), vnextOwnerServiceAdmissionClosed)
+	if serviceError.Detail != "admission state=FENCED sequence=2" {
+		t.Fatalf("FENCED live abort detail=%q", serviceError.Detail)
+	}
+	if fixture.group.journal.SnapshotSequence != beforeSequence ||
+		vnextOwnerStatusTestFreePages(fixture.group) != beforeFree {
+		t.Fatal("service terminal replay or blocked live abort changed Owner counters")
+	}
+	if afterImage := vnextOwnerStatusTestPersistentImage(t, fixture.group); !bytes.Equal(
+		afterImage, beforeImage) {
+		t.Fatal("service terminal replay or blocked live abort changed durable state")
+	}
+}
+
 func TestVNextOwnerServiceInventoryEchoesIdentityWithoutAdvancingJournal(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
 		{UUID: "service-inventory-z", Size: 256 << 10},

@@ -69,7 +69,7 @@ func vnextOwnerRPCTestSealJSON(
 	externalContentPageCRCs string,
 ) []byte {
 	return []byte(`{
-		"protocol":"cxld.vnext-owner.v1",
+		"protocol":"cxld.vnext-owner.v2",
 		"identity":{
 			"requestId":"request-a",
 			"checkpointId":"checkpoint-a",
@@ -213,6 +213,241 @@ func TestVNextOwnerRPCInventoryUsesStrictDaemonFrameAndMinimalResponse(t *testin
 	}
 }
 
+func TestVNextOwnerRPCV2AdmissionStatusAndPersistedTransitionAreStrict(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "rpc-admission", Size: 256 << 10,
+	}})
+	rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+	statusRequest := vnextOwnerRPCAdmissionStatusRequest{
+		Protocol:           vnextOwnerRPCProtocol,
+		RequestID:          "rpc-admission-status",
+		ExpectedOwnerID:    "owner-0",
+		ExpectedOwnerEpoch: 7,
+	}
+	status := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
+		CommandLabel:              "rpc-admission-test",
+		Operation:                 vnextOwnerRPCOperationAdmissionStatus,
+		VNextOwnerAdmissionStatus: marshalVNextOwnerRPCTestPayload(t, statusRequest),
+	})
+	if !status.Ok || status.Operation != vnextOwnerRPCOperationAdmissionStatus {
+		t.Fatalf("initial admission status RPC failed: %#v", status)
+	}
+	requireVNextOwnerRPCJSONFields(
+		t,
+		[]byte(status.Stdout),
+		"protocol", "operation", "requestId", "ownerId", "ownerEpoch",
+		"state", "admissionSequence", "snapshotSequence", "hasLastTransition",
+		"lastTransitionRequestId", "lastTransitionRequestDigest",
+		"lastTransitionFromState", "lastTransitionTargetState",
+		"lastTransitionExpectedAdmissionSequence",
+		"lastTransitionResultAdmissionSequence")
+	var statusWire vnextOwnerRPCAdmissionStatusResponse
+	if err := decodeStrictVNextOwnerRPC([]byte(status.Stdout), &statusWire); err != nil {
+		t.Fatal(err)
+	}
+	if statusWire.Protocol != vnextOwnerRPCProtocol ||
+		statusWire.State != vnextOwnerAdmissionActive.String() ||
+		statusWire.AdmissionSequence != 1 || statusWire.SnapshotSequence == 0 ||
+		statusWire.HasLastTransition || statusWire.LastTransitionRequestID != "" ||
+		statusWire.LastTransitionRequestDigest != "" ||
+		statusWire.LastTransitionFromState != "" ||
+		statusWire.LastTransitionTargetState != "" ||
+		statusWire.LastTransitionExpectedAdmissionSequence != 0 ||
+		statusWire.LastTransitionResultAdmissionSequence != 0 {
+		t.Fatalf("unexpected initial admission status: %#v", statusWire)
+	}
+
+	setRequest := vnextOwnerRPCSetAdmissionRequest{
+		Protocol:                  vnextOwnerRPCProtocol,
+		RequestID:                 "rpc-admission-close",
+		ExpectedOwnerID:           "owner-0",
+		ExpectedOwnerEpoch:        7,
+		FromState:                 vnextOwnerAdmissionActive.String(),
+		TargetState:               vnextOwnerAdmissionReadOnly.String(),
+		ExpectedAdmissionSequence: 1,
+	}
+	setDaemon := daemonRequest{
+		CommandLabel:           "rpc-admission-test",
+		Operation:              vnextOwnerRPCOperationSetAdmission,
+		VNextOwnerSetAdmission: marshalVNextOwnerRPCTestPayload(t, setRequest),
+	}
+	set := vnextOwnerRPCTestRoundTrip(t, rpc, setDaemon)
+	if !set.Ok || set.Operation != vnextOwnerRPCOperationSetAdmission {
+		t.Fatalf("set admission RPC failed: %#v", set)
+	}
+	requireVNextOwnerRPCJSONFields(
+		t,
+		[]byte(set.Stdout),
+		"protocol", "operation", "requestId", "requestDigest", "ownerId", "ownerEpoch",
+		"fromState", "targetState", "expectedAdmissionSequence",
+		"resultAdmissionSequence", "replayed")
+	var setWire vnextOwnerRPCSetAdmissionResponse
+	if err := decodeStrictVNextOwnerRPC([]byte(set.Stdout), &setWire); err != nil {
+		t.Fatal(err)
+	}
+	digest := vnextOwnerAdmissionRequestDigest(vnextOwnerAdmissionTransitionRequest{
+		RequestID:        setRequest.RequestID,
+		OwnerID:          setRequest.ExpectedOwnerID,
+		OwnerEpoch:       setRequest.ExpectedOwnerEpoch,
+		From:             vnextOwnerAdmissionActive,
+		Target:           vnextOwnerAdmissionReadOnly,
+		ExpectedSequence: setRequest.ExpectedAdmissionSequence,
+	})
+	if setWire.Protocol != vnextOwnerRPCProtocol || setWire.Replayed ||
+		setWire.RequestDigest != hex.EncodeToString(digest[:]) ||
+		setWire.ResultAdmissionSequence != 2 {
+		t.Fatalf("unexpected set-admission proof: %#v", setWire)
+	}
+	transitionSequence := fixture.group.journal.SnapshotSequence
+	replay := vnextOwnerRPCTestRoundTrip(t, rpc, setDaemon)
+	if !replay.Ok {
+		t.Fatalf("replay set admission RPC: %#v", replay)
+	}
+	var replayWire vnextOwnerRPCSetAdmissionResponse
+	if err := decodeStrictVNextOwnerRPC([]byte(replay.Stdout), &replayWire); err != nil {
+		t.Fatal(err)
+	}
+	if !replayWire.Replayed || replayWire.RequestDigest != setWire.RequestDigest ||
+		replayWire.ResultAdmissionSequence != setWire.ResultAdmissionSequence ||
+		fixture.group.journal.SnapshotSequence != transitionSequence {
+		t.Fatalf("set-admission replay changed durable proof: %#v", replayWire)
+	}
+	status = vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
+		CommandLabel:              "rpc-admission-test",
+		Operation:                 vnextOwnerRPCOperationAdmissionStatus,
+		VNextOwnerAdmissionStatus: marshalVNextOwnerRPCTestPayload(t, statusRequest),
+	})
+	if !status.Ok {
+		t.Fatalf("post-transition admission status RPC failed: %#v", status)
+	}
+	if err := decodeStrictVNextOwnerRPC([]byte(status.Stdout), &statusWire); err != nil {
+		t.Fatal(err)
+	}
+	if statusWire.State != "READ_ONLY" || statusWire.AdmissionSequence != 2 ||
+		!statusWire.HasLastTransition ||
+		statusWire.LastTransitionRequestID != setRequest.RequestID ||
+		statusWire.LastTransitionRequestDigest != hex.EncodeToString(digest[:]) ||
+		statusWire.LastTransitionFromState != "ACTIVE" ||
+		statusWire.LastTransitionTargetState != "READ_ONLY" ||
+		statusWire.LastTransitionExpectedAdmissionSequence != 1 ||
+		statusWire.LastTransitionResultAdmissionSequence != 2 {
+		t.Fatalf("status lacks the last durable transition proof: %#v", statusWire)
+	}
+
+	requestConflict := setRequest
+	requestConflict.TargetState = "FENCED"
+	conflict := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
+		Operation:              vnextOwnerRPCOperationSetAdmission,
+		VNextOwnerSetAdmission: marshalVNextOwnerRPCTestPayload(t, requestConflict),
+	})
+	if conflict.Ok ||
+		conflict.ErrorCode != string(vnextOwnerServiceAdmissionRequestConflict) {
+		t.Fatalf("RPC request-id conflict lacks its stable code: %#v", conflict)
+	}
+	stale := setRequest
+	stale.RequestID = "rpc-admission-stale"
+	stale.TargetState = "FENCED"
+	sequenceConflict := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
+		Operation:              vnextOwnerRPCOperationSetAdmission,
+		VNextOwnerSetAdmission: marshalVNextOwnerRPCTestPayload(t, stale),
+	})
+	if sequenceConflict.Ok ||
+		sequenceConflict.ErrorCode != string(vnextOwnerServiceAdmissionSequenceConflict) {
+		t.Fatalf("RPC stale-head conflict lacks its stable code: %#v", sequenceConflict)
+	}
+}
+
+func TestVNextOwnerRPCReservationNotFoundCarriesAtomicClosedAdmissionEvidence(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "rpc-admission-closed", Size: 256 << 10,
+	}})
+	rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+	set := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
+		Operation: vnextOwnerRPCOperationSetAdmission,
+		VNextOwnerSetAdmission: marshalVNextOwnerRPCTestPayload(t,
+			vnextOwnerRPCSetAdmissionRequest{
+				Protocol:                  vnextOwnerRPCProtocol,
+				RequestID:                 "rpc-close-for-status",
+				ExpectedOwnerID:           "owner-0",
+				ExpectedOwnerEpoch:        7,
+				FromState:                 "ACTIVE",
+				TargetState:               "READ_ONLY",
+				ExpectedAdmissionSequence: 1,
+			}),
+	})
+	if !set.Ok {
+		t.Fatalf("close admission: %#v", set)
+	}
+	reserveRequest := vnextOwnerRPCTestReserveRequest("owner-0")
+	raw := marshalVNextOwnerRPCTestPayload(t, reserveRequest)
+	status := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
+		Operation:                   vnextOwnerRPCOperationReservationStatus,
+		VNextOwnerReservationStatus: raw,
+	})
+	if !status.Ok {
+		t.Fatalf("closed NOT_FOUND status: %#v", status)
+	}
+	var wire vnextOwnerRPCReservationStatusResponse
+	if err := decodeStrictVNextOwnerRPC([]byte(status.Stdout), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if wire.State != string(vnextOwnerReservationNotFound) || wire.HasGrant ||
+		wire.AdmissionState != "READ_ONLY" || wire.AdmissionSequence != 2 {
+		t.Fatalf("NOT_FOUND lacks closed admission evidence: %#v", wire)
+	}
+	beforeSequence := fixture.group.journal.SnapshotSequence
+	beforeHighWater := fixture.group.journal.NextAllocationRecordID
+	reserve := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
+		Operation:         vnextOwnerRPCOperationReserve,
+		VNextOwnerReserve: raw,
+	})
+	if reserve.Ok || reserve.ErrorCode != string(vnextOwnerServiceAdmissionClosed) ||
+		!strings.Contains(reserve.Error, "admission state=READ_ONLY sequence=2") {
+		t.Fatalf("closed reserve did not expose stable rejection evidence: %#v", reserve)
+	}
+	if fixture.group.journal.SnapshotSequence != beforeSequence ||
+		fixture.group.journal.NextAllocationRecordID != beforeHighWater {
+		t.Fatal("closed reserve RPC mutated Owner journal")
+	}
+}
+
+func TestVNextOwnerRPCV1AndMalformedAdmissionRequestsFailClosed(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+		UUID: "rpc-admission-strict", Size: 256 << 10,
+	}})
+	rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+	base := `"requestId":"strict-admission","expectedOwnerId":"owner-0",` +
+		`"expectedOwnerEpoch":7,"fromState":"ACTIVE","targetState":"READ_ONLY",` +
+		`"expectedAdmissionSequence":1`
+	for name, raw := range map[string]string{
+		"v1":        `{"protocol":"cxld.vnext-owner.v1",` + base + `}`,
+		"unknown":   `{"protocol":"cxld.vnext-owner.v2",` + base + `,"extra":true}`,
+		"duplicate": `{"protocol":"cxld.vnext-owner.v2","requestId":"a",` + base + `}`,
+		"reopen": `{"protocol":"cxld.vnext-owner.v2","requestId":"reopen",` +
+			`"expectedOwnerId":"owner-0","expectedOwnerEpoch":7,` +
+			`"fromState":"READ_ONLY","targetState":"ACTIVE","expectedAdmissionSequence":2}`,
+		"impossible-sequence-state": `{"protocol":"cxld.vnext-owner.v2",` +
+			`"requestId":"impossible-sequence-state","expectedOwnerId":"owner-0",` +
+			`"expectedOwnerEpoch":7,"fromState":"ACTIVE","targetState":"FENCED",` +
+			`"expectedAdmissionSequence":2}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := runCommandWithVNextOwnerRPC(daemonRequest{
+				Operation:              vnextOwnerRPCOperationSetAdmission,
+				VNextOwnerSetAdmission: json.RawMessage(raw),
+			}, rpc)
+			if response.Ok || response.ErrorCode != string(vnextOwnerServiceInvalidRequest) {
+				t.Fatalf("malformed admission request was accepted: %#v", response)
+			}
+		})
+	}
+	if fixture.group.journal.AdmissionState != vnextOwnerAdmissionActive ||
+		fixture.group.journal.AdmissionSequence != 1 ||
+		len(fixture.group.journal.AdmissionTransitions) != 0 {
+		t.Fatal("rejected admission request mutated the journal")
+	}
+}
+
 func TestVNextOwnerRPCReservationStatusUsesCompleteReserveIdentityAndExactGrant(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
 		UUID: "rpc-status-device", Size: 256 << 10,
@@ -236,6 +471,8 @@ func TestVNextOwnerRPCReservationStatusUsesCompleteReserveIdentityAndExactGrant(
 	if missingWire.Protocol != vnextOwnerRPCProtocol ||
 		missingWire.Operation != vnextOwnerRPCOperationReservationStatus ||
 		missingWire.State != string(vnextOwnerReservationNotFound) ||
+		missingWire.AdmissionState != vnextOwnerAdmissionActive.String() ||
+		missingWire.AdmissionSequence != 1 ||
 		missingWire.HasGrant || missingWire.Identity.AllocationRecordID != 0 ||
 		missingWire.TotalPages != 0 || len(missingWire.Contents) != 0 ||
 		len(missingWire.Extents) != 0 || len(missingWire.Devices) != 0 {
@@ -263,6 +500,8 @@ func TestVNextOwnerRPCReservationStatusUsesCompleteReserveIdentityAndExactGrant(
 		t.Fatalf("decode GRANTED status response: %v", err)
 	}
 	if recoveredWire.State != string(vnextOwnerReservationGranted) ||
+		recoveredWire.AdmissionState != vnextOwnerAdmissionActive.String() ||
+		recoveredWire.AdmissionSequence != 1 ||
 		!recoveredWire.HasGrant || recoveredWire.Identity.AllocationRecordID == 0 ||
 		recoveredWire.TotalPages == 0 || len(recoveredWire.Contents) != len(wire.Contents) ||
 		len(recoveredWire.Extents) == 0 || len(recoveredWire.Devices) == 0 {
@@ -273,12 +512,46 @@ func TestVNextOwnerRPCReservationStatusUsesCompleteReserveIdentityAndExactGrant(
 	}
 	fields := requireVNextOwnerRPCJSONFields(
 		t, []byte(recovered.Stdout),
-		"protocol", "operation", "state", "hasGrant", "identity",
+		"protocol", "operation", "state", "admissionState", "admissionSequence",
+		"hasGrant", "identity",
 		"totalPages", "contents", "extents", "devices")
 	if bytes.Equal(bytes.TrimSpace(fields["contents"]), []byte("null")) ||
 		bytes.Equal(bytes.TrimSpace(fields["extents"]), []byte("null")) ||
 		bytes.Equal(bytes.TrimSpace(fields["devices"]), []byte("null")) {
 		t.Fatal("status response used null for a mandatory bounded array")
+	}
+}
+
+func TestVNextOwnerRPCReservationStatusRejectsImpossibleAdmissionHeadPairs(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		state    vnextOwnerAdmissionState
+		sequence uint64
+	}{
+		{name: "active-2", state: vnextOwnerAdmissionActive, sequence: 2},
+		{name: "read-only-1", state: vnextOwnerAdmissionReadOnly, sequence: 1},
+		{name: "read-only-3", state: vnextOwnerAdmissionReadOnly, sequence: 3},
+		{name: "fenced-1", state: vnextOwnerAdmissionFenced, sequence: 1},
+		{name: "fenced-4", state: vnextOwnerAdmissionFenced, sequence: 4},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+				UUID: "rpc-status-impossible-" + test.name, Size: 256 << 10,
+			}})
+			fixture.group.mu.Lock()
+			fixture.group.journal.AdmissionState = test.state
+			fixture.group.journal.AdmissionSequence = test.sequence
+			fixture.group.mu.Unlock()
+			rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+			wire := vnextOwnerRPCTestReserveRequest("owner-0")
+			response := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
+				Operation:                   vnextOwnerRPCOperationReservationStatus,
+				VNextOwnerReservationStatus: marshalVNextOwnerRPCTestPayload(t, wire),
+			})
+			if response.Ok || response.ErrorCode != string(vnextOwnerServiceUnavailable) {
+				t.Fatalf("impossible admission head was exposed: %#v", response)
+			}
+		})
 	}
 }
 
@@ -400,7 +673,7 @@ func TestVNextOwnerRPCStrictlyRejectsUnknownAndTrailingJSON(t *testing.T) {
 	unknown := runCommandWithVNextOwnerRPC(daemonRequest{
 		Operation: vnextOwnerRPCOperationReserve,
 		VNextOwnerReserve: json.RawMessage(`{
-			"protocol":"cxld.vnext-owner.v1",
+			"protocol":"cxld.vnext-owner.v2",
 			"unknownMandatoryField":true
 		}`),
 	}, rpc)
@@ -516,7 +789,7 @@ func TestVNextOwnerRPCRejectsDuplicateCaseVariantAndMixedEnvelopeBeforeTypedDeco
 	}{
 		{
 			name: "duplicate protocol",
-			raw: `{"protocol":"cxld.vnext-owner.v1","protocol":"cxld.vnext-owner.v1",` +
+			raw: `{"protocol":"cxld.vnext-owner.v2","protocol":"cxld.vnext-owner.v2",` +
 				`"requestId":"r","checkpointId":"c","producerId":"p","ownerId":"o",` +
 				`"ownerEpoch":1,"contents":[],"maxExtents":1}`,
 			target:  &vnextOwnerRPCReserveRequest{},
@@ -524,19 +797,19 @@ func TestVNextOwnerRPCRejectsDuplicateCaseVariantAndMixedEnvelopeBeforeTypedDeco
 		},
 		{
 			name:    "case variant protocol",
-			raw:     `{"Protocol":"cxld.vnext-owner.v1"}`,
+			raw:     `{"Protocol":"cxld.vnext-owner.v2"}`,
 			target:  &vnextOwnerRPCReserveRequest{},
 			contain: "unknown field",
 		},
 		{
 			name:    "repeated contents",
-			raw:     `{"protocol":"cxld.vnext-owner.v1","contents":[],"contents":[]}`,
+			raw:     `{"protocol":"cxld.vnext-owner.v2","contents":[],"contents":[]}`,
 			target:  &vnextOwnerRPCReserveRequest{},
 			contain: "duplicate field",
 		},
 		{
 			name: "duplicate nested identity",
-			raw: `{"protocol":"cxld.vnext-owner.v1","identity":{` +
+			raw: `{"protocol":"cxld.vnext-owner.v2","identity":{` +
 				`"requestId":"a","requestId":"b"}}`,
 			target:  &vnextOwnerRPCLifecycleRequest{},
 			contain: "duplicate field",
@@ -574,7 +847,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "seal external CRC array",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v1",
+				"protocol":"cxld.vnext-owner.v2",
 				"identity":{
 					"requestId":"r","checkpointId":"c","producerId":"p",
 					"ownerId":"o","ownerEpoch":1,"allocationRecordId":1
@@ -616,7 +889,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "reserve content capacity",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v1",
+				"protocol":"cxld.vnext-owner.v2",
 				"requestId":"r","checkpointId":"c","producerId":"p","ownerId":"o",
 				"ownerEpoch":1,
 				"contents":[{"kind":"memory","objectId":1,"byteLength":4096}],
@@ -628,7 +901,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "lifecycle allocation identity",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v1",
+				"protocol":"cxld.vnext-owner.v2",
 				"identity":{
 					"requestId":"r","checkpointId":"c","producerId":"p",
 					"ownerId":"o","ownerEpoch":1
@@ -640,7 +913,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "inventory expected Owner epoch",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v1",
+				"protocol":"cxld.vnext-owner.v2",
 				"requestId":"r",
 				"expectedOwnerId":"owner-a"
 			}`),
@@ -650,7 +923,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "inventory response device array",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v1",
+				"protocol":"cxld.vnext-owner.v2",
 				"operation":"vnextOwnerInventory",
 				"requestId":"r",
 				"ownerId":"owner-a",

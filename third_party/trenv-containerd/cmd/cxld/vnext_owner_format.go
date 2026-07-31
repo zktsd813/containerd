@@ -13,7 +13,7 @@ const (
 	vnextMaxOwnerTransactions                = 1 << 20
 )
 
-var vnextOwnerJournalMagic = [8]byte{'T', 'R', 'O', 'W', 'N', '0', '0', '6'}
+var vnextOwnerJournalMagic = [8]byte{'T', 'R', 'O', 'W', 'N', '0', '0', '7'}
 
 type vnextOwnerTransactionState uint8
 
@@ -67,6 +67,9 @@ type vnextOwnerTransaction struct {
 type vnextOwnerJournal struct {
 	OwnerID                string
 	OwnerEpoch             uint64
+	AdmissionState         vnextOwnerAdmissionState
+	AdmissionSequence      uint64
+	AdmissionTransitions   []vnextOwnerAdmissionTransitionRecord
 	SnapshotSequence       uint64
 	NextAllocationRecordID uint64
 	Transactions           map[uint64]*vnextOwnerTransaction
@@ -78,6 +81,8 @@ func newVNextOwnerJournal(ownerID string, ownerEpoch, nextAllocationID uint64) (
 	journal := &vnextOwnerJournal{
 		OwnerID:                ownerID,
 		OwnerEpoch:             ownerEpoch,
+		AdmissionState:         vnextOwnerAdmissionActive,
+		AdmissionSequence:      1,
 		NextAllocationRecordID: nextAllocationID,
 		Transactions:           make(map[uint64]*vnextOwnerTransaction),
 		RequestIndex:           make(map[string]uint64),
@@ -93,6 +98,9 @@ func (journal *vnextOwnerJournal) clone() *vnextOwnerJournal {
 	cloned := &vnextOwnerJournal{
 		OwnerID:                journal.OwnerID,
 		OwnerEpoch:             journal.OwnerEpoch,
+		AdmissionState:         journal.AdmissionState,
+		AdmissionSequence:      journal.AdmissionSequence,
+		AdmissionTransitions:   append([]vnextOwnerAdmissionTransitionRecord(nil), journal.AdmissionTransitions...),
 		SnapshotSequence:       journal.SnapshotSequence,
 		NextAllocationRecordID: journal.NextAllocationRecordID,
 		Transactions:           make(map[uint64]*vnextOwnerTransaction, len(journal.Transactions)),
@@ -132,6 +140,20 @@ func (journal *vnextOwnerJournal) marshalAtSequence(
 	vnextWriteU64(&payload, sequence)
 	vnextWriteString(&payload, journal.OwnerID)
 	vnextWriteU64(&payload, journal.OwnerEpoch)
+	payload.WriteByte(byte(journal.AdmissionState))
+	payload.Write(make([]byte, 7))
+	vnextWriteU64(&payload, journal.AdmissionSequence)
+	vnextWriteU32(&payload, uint32(len(journal.AdmissionTransitions)))
+	payload.Write(make([]byte, 4))
+	for _, transition := range journal.AdmissionTransitions {
+		vnextWriteString(&payload, transition.RequestID)
+		payload.Write(transition.RequestDigest[:])
+		payload.WriteByte(byte(transition.From))
+		payload.WriteByte(byte(transition.Target))
+		payload.Write(make([]byte, 6))
+		vnextWriteU64(&payload, transition.ExpectedSequence)
+		vnextWriteU64(&payload, transition.ResultSequence)
+	}
 	vnextWriteU64(&payload, journal.NextAllocationRecordID)
 	transactions := make([]*vnextOwnerTransaction, 0, len(journal.Transactions))
 	for _, transaction := range journal.Transactions {
@@ -198,6 +220,44 @@ func parseVNextOwnerJournal(
 	if err != nil {
 		return nil, err
 	}
+	admissionState, err := decoder.u8()
+	if err != nil {
+		return nil, err
+	}
+	reserved, err := decoder.bytes(7)
+	if err != nil {
+		return nil, err
+	}
+	if !vnextAllZero(reserved) {
+		return nil, fmt.Errorf("Owner admission reserved bytes are non-zero: %w", errVNextWrongFormat)
+	}
+	admissionSequence, err := decoder.u64()
+	if err != nil {
+		return nil, err
+	}
+	transitionCount, err := decoder.u32()
+	if err != nil {
+		return nil, err
+	}
+	reserved, err = decoder.bytes(4)
+	if err != nil {
+		return nil, err
+	}
+	if !vnextAllZero(reserved) {
+		return nil, fmt.Errorf("Owner admission count reserved bytes are non-zero: %w", errVNextWrongFormat)
+	}
+	if transitionCount > vnextMaxOwnerAdmissionTransitions {
+		return nil, fmt.Errorf("Owner admission transition count %d exceeds %d: %w",
+			transitionCount, vnextMaxOwnerAdmissionTransitions, errVNextCorrupt)
+	}
+	transitions := make([]vnextOwnerAdmissionTransitionRecord, 0, transitionCount)
+	for index := uint32(0); index < transitionCount; index++ {
+		transition, err := vnextParseOwnerAdmissionTransition(decoder)
+		if err != nil {
+			return nil, fmt.Errorf("parse Owner admission transition %d: %w", index, err)
+		}
+		transitions = append(transitions, transition)
+	}
 	nextAllocationID, err := decoder.u64()
 	if err != nil {
 		return nil, err
@@ -213,6 +273,9 @@ func parseVNextOwnerJournal(
 	journal := &vnextOwnerJournal{
 		OwnerID:                ownerID,
 		OwnerEpoch:             ownerEpoch,
+		AdmissionState:         vnextOwnerAdmissionState(admissionState),
+		AdmissionSequence:      admissionSequence,
+		AdmissionTransitions:   transitions,
 		SnapshotSequence:       sequence,
 		NextAllocationRecordID: nextAllocationID,
 		Transactions:           make(map[uint64]*vnextOwnerTransaction, transactionCount),
@@ -247,6 +310,46 @@ func parseVNextOwnerJournal(
 		return nil, err
 	}
 	return journal, nil
+}
+
+func vnextParseOwnerAdmissionTransition(
+	decoder *vnextDecoder,
+) (vnextOwnerAdmissionTransitionRecord, error) {
+	var transition vnextOwnerAdmissionTransitionRecord
+	var err error
+	if transition.RequestID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return vnextOwnerAdmissionTransitionRecord{}, err
+	}
+	digest, err := decoder.bytes(uint64(len(transition.RequestDigest)))
+	if err != nil {
+		return vnextOwnerAdmissionTransitionRecord{}, err
+	}
+	copy(transition.RequestDigest[:], digest)
+	from, err := decoder.u8()
+	if err != nil {
+		return vnextOwnerAdmissionTransitionRecord{}, err
+	}
+	target, err := decoder.u8()
+	if err != nil {
+		return vnextOwnerAdmissionTransitionRecord{}, err
+	}
+	transition.From = vnextOwnerAdmissionState(from)
+	transition.Target = vnextOwnerAdmissionState(target)
+	reserved, err := decoder.bytes(6)
+	if err != nil {
+		return vnextOwnerAdmissionTransitionRecord{}, err
+	}
+	if !vnextAllZero(reserved) {
+		return vnextOwnerAdmissionTransitionRecord{}, fmt.Errorf(
+			"Owner admission transition reserved bytes are non-zero: %w", errVNextWrongFormat)
+	}
+	if transition.ExpectedSequence, err = decoder.u64(); err != nil {
+		return vnextOwnerAdmissionTransitionRecord{}, err
+	}
+	if transition.ResultSequence, err = decoder.u64(); err != nil {
+		return vnextOwnerAdmissionTransitionRecord{}, err
+	}
+	return transition, nil
 }
 
 func vnextParseOwnerTransaction(decoder *vnextDecoder) (*vnextOwnerTransaction, error) {
@@ -384,6 +487,9 @@ func (journal *vnextOwnerJournal) validate(attachedDevices map[string]*vnextPers
 	if journal.OwnerEpoch == 0 || journal.OwnerEpoch > uint64(math.MaxInt64) {
 		return fmt.Errorf("Owner journal epoch %d is outside the signed ABI: %w",
 			journal.OwnerEpoch, errVNextWrongFormat)
+	}
+	if err := validateVNextOwnerAdmissionJournal(journal); err != nil {
+		return err
 	}
 	if journal.NextAllocationRecordID == 0 ||
 		journal.NextAllocationRecordID > uint64(math.MaxInt64) {
