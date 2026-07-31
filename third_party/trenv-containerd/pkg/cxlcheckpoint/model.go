@@ -805,6 +805,12 @@ func canonicalMMTemplateSize(template MMTemplate) (uint64, error) {
 	return uint64(encoder.buffer.Len()), nil
 }
 
+// CanonicalMMTemplateSize returns the exact number of bytes that a producer
+// must reserve for the portable MMTemplate object in this V6 codec.
+func CanonicalMMTemplateSize(template MMTemplate) (uint64, error) {
+	return canonicalMMTemplateSize(template)
+}
+
 func canonicalPageMapSize(pageMap PageMap) (uint64, error) {
 	encoder := newPayloadEncoder()
 	encodePageMap(encoder, pageMap)
@@ -812,6 +818,13 @@ func canonicalPageMapSize(pageMap PageMap) (uint64, error) {
 		return 0, encoder.err
 	}
 	return uint64(encoder.buffer.Len()), nil
+}
+
+// CanonicalPageMapSize returns the exact bytes used by this PageMap version.
+// The result lets a producer prove that the inactive A/B mapping slot has
+// enough reserved pages before it publishes a new root.
+func CanonicalPageMapSize(pageMap PageMap) (uint64, error) {
+	return canonicalPageMapSize(pageMap)
 }
 
 func validateRoot(p Publication, devices map[string]Device) error {
