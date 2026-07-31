@@ -211,6 +211,10 @@ func TestVNextSuperblockRejectsOwnerEpochOutsideSignedSchedulerABI(t *testing.T)
 }
 
 func TestVNextPageDescriptorCanonicalFreeAndArtifactPadding(t *testing.T) {
+	if got := crc32.Checksum([]byte("123456789"), vnextCRCTable); got != 0xe3069283 {
+		t.Fatalf("CRC-32C known-answer result is %#x, expected %#x", got, uint32(0xe3069283))
+	}
+
 	freeData, err := (vnextPageDescriptor{}).marshalBinary()
 	if err != nil {
 		t.Fatalf("marshal FREE descriptor: %v", err)
