@@ -2326,6 +2326,26 @@ func main() {
 		"vnext-owner-dax-devices",
 		envDefault("CXLD_VNEXT_OWNER_DAX_DEVICES", ""),
 		"comma-separated existing TRCXL006 devdax paths owned by this cxld")
+	vnextOwnerTLSListen := flag.String(
+		"vnext-owner-tls-listen",
+		envDefault("CXLD_VNEXT_OWNER_TLS_LISTEN", ""),
+		"optional strict VNext Owner mTLS listen address; requires the complete TLS configuration")
+	vnextOwnerTLSServerCertificate := flag.String(
+		"vnext-owner-tls-server-cert",
+		envDefault("CXLD_VNEXT_OWNER_TLS_SERVER_CERT", ""),
+		"PEM server certificate for the strict VNext Owner mTLS listener")
+	vnextOwnerTLSServerPrivateKey := flag.String(
+		"vnext-owner-tls-server-key",
+		envDefault("CXLD_VNEXT_OWNER_TLS_SERVER_KEY", ""),
+		"PEM server private key for the strict VNext Owner mTLS listener")
+	vnextOwnerTLSClientCA := flag.String(
+		"vnext-owner-tls-client-ca",
+		envDefault("CXLD_VNEXT_OWNER_TLS_CLIENT_CA", ""),
+		"PEM CA used to authenticate strict VNext Owner mTLS clients")
+	vnextOwnerTLSAllowedClientURISANs := flag.String(
+		"vnext-owner-tls-allowed-client-uri-sans",
+		envDefault("CXLD_VNEXT_OWNER_TLS_ALLOWED_CLIENT_URI_SANS", ""),
+		"comma-separated exact URI SAN identities allowed to call the strict VNext Owner mTLS listener")
 	flag.Parse()
 	if *publicationSchemaVersion != uint64(trenvpub.Version) {
 		fmt.Fprintf(
@@ -2444,6 +2464,30 @@ func main() {
 		}()
 		activeVNextOwnerRPC = newVNextOwnerRPC(vnextOwnerRuntime.service)
 	}
+	allowedVNextOwnerClientURISANs, err := parseVNextOwnerURIAllowlist(
+		*vnextOwnerTLSAllowedClientURISANs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid VNext Owner TLS client URI SAN allowlist: %v\n", err)
+		os.Exit(1)
+	}
+	vnextOwnerTLSServer, err := startVNextOwnerTLSServer(
+		vnextOwnerTLSServerConfig{
+			ListenAddress:         *vnextOwnerTLSListen,
+			ServerCertificatePath: *vnextOwnerTLSServerCertificate,
+			ServerPrivateKeyPath:  *vnextOwnerTLSServerPrivateKey,
+			ClientCAPath:          *vnextOwnerTLSClientCA,
+			AllowedClientURISANs:  allowedVNextOwnerClientURISANs,
+		},
+		activeVNextOwnerRPC,
+		daemonRequestAdmission,
+		daemonLargeAdmission)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to start VNext Owner TLS listener: %v\n", err)
+		os.Exit(1)
+	}
+	if vnextOwnerTLSServer != nil {
+		defer vnextOwnerTLSServer.Close()
+	}
 
 	metadataServer, metadataListener, err := startMetadataServer(activeConfig)
 	if err != nil {
@@ -2482,6 +2526,9 @@ func main() {
 	var requestWG sync.WaitGroup
 	go func() {
 		<-sigCh
+		if vnextOwnerTLSServer != nil {
+			_ = vnextOwnerTLSServer.Stop()
+		}
 		if metadataServer != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			_ = metadataServer.Shutdown(ctx)
@@ -2497,6 +2544,10 @@ func main() {
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				requestWG.Wait()
+				if vnextOwnerTLSServer != nil {
+					_ = vnextOwnerTLSServer.Stop()
+					vnextOwnerTLSServer.Wait()
+				}
 				return
 			}
 			if acceptRetryDelay == 0 {
