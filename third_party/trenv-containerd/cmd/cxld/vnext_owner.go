@@ -21,6 +21,7 @@ const (
 	vnextOwnerFailBeforePrepare = "before-prepare-fragment"
 	vnextOwnerFailAfterPrepare  = "after-prepare-fragment"
 	vnextOwnerFailDuringCommit  = "during-commit-fragment"
+	vnextOwnerFailDuringAbort   = "during-abort-fragment"
 	vnextOwnerFailDuringReclaim = "during-reclaim-fragment"
 )
 
@@ -370,7 +371,10 @@ func (group *vnextOwnerGroup) abort(grant vnextOwnerWriteGrant) error {
 		return fmt.Errorf("cannot abort Owner allocation in state %d: %w",
 			transaction.State, errVNextInvalidState)
 	}
-	return group.abortTransactionLocked(transaction)
+	if err := group.abortTransactionLocked(transaction); err != nil {
+		return group.poisonLocked(err)
+	}
+	return nil
 }
 
 func (group *vnextOwnerGroup) reclaimCheckpoint(
@@ -801,6 +805,9 @@ func (group *vnextOwnerGroup) abortTransactionLocked(transaction *vnextOwnerTran
 		return fmt.Errorf("persist Owner ABORTING: %w", err)
 	}
 	for _, fragment := range transaction.Fragments {
+		if err := group.callFaultHookLocked(vnextOwnerFailDuringAbort, fragment.DeviceUUID); err != nil {
+			return err
+		}
 		if err := group.devices[fragment.DeviceUUID].abortOwnerFragment(
 			transaction.CheckpointID, transaction.AllocationRecordID); err != nil {
 			return fmt.Errorf("abort fragment %q: %w", fragment.DeviceUUID, err)

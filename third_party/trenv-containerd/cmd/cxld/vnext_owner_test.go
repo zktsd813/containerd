@@ -416,6 +416,50 @@ func TestVNextOwnerRecoversMidDeviceCommit(t *testing.T) {
 	}
 }
 
+func TestVNextOwnerRecoversMidDeviceAbort(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
+		{UUID: "device-a", Size: 256 << 10},
+		{UUID: "device-b", Size: 256 << 10},
+	})
+	capacity := fixture.devices[0].superblock.Geometry.DataPageCount
+	request := vnextOwnerMemoryRequest("abort-crash", capacity+2, 2)
+	grant, err := fixture.group.reserve(request)
+	if err != nil {
+		t.Fatalf("reserve abort crash: %v", err)
+	}
+	abortCalls := 0
+	fixture.group.faultHook = func(stage, _ string) error {
+		if stage == vnextOwnerFailDuringAbort {
+			abortCalls++
+			if abortCalls == 2 {
+				return errVNextOwnerCrashInjected
+			}
+		}
+		return nil
+	}
+	if err := fixture.group.abort(grant); !errors.Is(err, errVNextOwnerCrashInjected) {
+		t.Fatalf("mid-abort fault returned %v", err)
+	}
+	if fixture.group.journal.Transactions[grant.AllocationRecordID].State != vnextOwnerAborting {
+		t.Fatal("mid-abort fault did not leave ABORTING")
+	}
+	if _, err := fixture.group.reserve(vnextOwnerMemoryRequest("poison-check", 1, 1)); !errors.Is(err, errVNextOwnerPoisoned) {
+		t.Fatalf("Owner group remained usable after partial abort: %v", err)
+	}
+
+	reopened := fixture.reopen(t)
+	transaction := reopened.journal.Transactions[grant.AllocationRecordID]
+	if transaction.State != vnextOwnerAborted {
+		t.Fatalf("mid-abort recovery ended in state %d", transaction.State)
+	}
+	for _, fragment := range transaction.Fragments {
+		record, ok := reopened.devices[fragment.DeviceUUID].allocator.lookup(request.CheckpointID)
+		if !ok || record.State != vnextAllocationAborted {
+			t.Fatalf("fragment %q after abort recovery: %#v", fragment.DeviceUUID, record)
+		}
+	}
+}
+
 func TestVNextOwnerJournalABFallbackAndMissingCommittedFragment(t *testing.T) {
 	t.Run("torn newest journal falls back", func(t *testing.T) {
 		fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{UUID: "device-only", Size: 256 << 10}})
