@@ -44,6 +44,7 @@ func validPublication(t testing.TB) Publication {
 			PageSize:               PageSize,
 			VMAs: []VMA{
 				{
+					PagesImageID:    1,
 					StartVAddr:      0x1000,
 					EndVAddr:        0x3000,
 					ProtectionFlags: ProtectionRead | ProtectionWrite,
@@ -53,6 +54,7 @@ func validPublication(t testing.TB) Publication {
 					PageMapRunCount: 1,
 				},
 				{
+					PagesImageID:    1,
 					StartVAddr:      0x4000,
 					EndVAddr:        0x5000,
 					ProtectionFlags: ProtectionRead,
@@ -70,8 +72,9 @@ func validPublication(t testing.TB) Publication {
 			PageSize:        PageSize,
 			Runs: []PageMapRun{
 				{
-					StartVAddr: 0x1000,
-					PageCount:  2,
+					PagesImageID: 1,
+					StartVAddr:   0x1000,
+					PageCount:    2,
 					FirstPage: PageID{
 						OwnerID:            "owner-a",
 						DeviceUUID:         "device-a",
@@ -80,8 +83,9 @@ func validPublication(t testing.TB) Publication {
 					},
 				},
 				{
-					StartVAddr: 0x4000,
-					PageCount:  1,
+					PagesImageID: 1,
+					StartVAddr:   0x4000,
+					PageCount:    1,
 					FirstPage: PageID{
 						OwnerID:            "owner-b",
 						DeviceUUID:         "device-c",
@@ -298,6 +302,106 @@ func TestInitialAllocationCanSpanDevicesButNotOwners(t *testing.T) {
 	requireInvalid(t, publication)
 }
 
+func TestMMTemplateCarriesSparsePresentPagesAcrossCRIUPageImages(t *testing.T) {
+	publication := validPublication(t)
+	publication.MMTemplate.VMAs = []VMA{
+		{
+			PagesImageID:    1,
+			StartVAddr:      0x1000,
+			EndVAddr:        0x5000,
+			ProtectionFlags: ProtectionRead | ProtectionWrite,
+			MappingFlags:    MappingPrivate | MappingAnonymous,
+			BackingKind:     BackingAnonymous,
+			PageMapRunStart: 0,
+			PageMapRunCount: 1,
+		},
+		{
+			// A different address space may use the same virtual addresses.
+			PagesImageID:    2,
+			StartVAddr:      0x1000,
+			EndVAddr:        0x4000,
+			ProtectionFlags: ProtectionRead | ProtectionWrite,
+			MappingFlags:    MappingPrivate | MappingAnonymous,
+			BackingKind:     BackingAnonymous,
+			PageMapRunStart: 1,
+			PageMapRunCount: 1,
+		},
+		{
+			// A VMA with no present pages still belongs in the portable
+			// template, but contributes no CRIU remap entry.
+			PagesImageID:    3,
+			StartVAddr:      0x7000,
+			EndVAddr:        0x9000,
+			ProtectionFlags: ProtectionRead,
+			MappingFlags:    MappingPrivate | MappingAnonymous,
+			BackingKind:     BackingZero,
+			PageMapRunStart: 2,
+			PageMapRunCount: 0,
+		},
+	}
+	publication.PageMap.Runs = []PageMapRun{
+		{
+			// The absent pages before and after this run are intentional.
+			PagesImageID: 1,
+			StartVAddr:   0x3000,
+			PageCount:    1,
+			FirstPage: PageID{
+				OwnerID:            "owner-a",
+				DeviceUUID:         "device-a",
+				AllocationRecordID: 42,
+				DataPageIndex:      100,
+			},
+		},
+		{
+			PagesImageID: 2,
+			StartVAddr:   0x1000,
+			PageCount:    1,
+			FirstPage: PageID{
+				OwnerID:            "owner-b",
+				DeviceUUID:         "device-c",
+				AllocationRecordID: 99,
+				DataPageIndex:      50,
+			},
+		},
+	}
+	mmSize, err := canonicalMMTemplateSize(publication.MMTemplate)
+	if err != nil {
+		t.Fatalf("canonical sparse MM template size: %v", err)
+	}
+	pageMapSize, err := canonicalPageMapSize(publication.PageMap)
+	if err != nil {
+		t.Fatalf("canonical sparse PageMap size: %v", err)
+	}
+	publication.ContentObjects[2].ByteLength = mmSize
+	publication.ContentObjects[3].ByteLength = pageMapSize
+	if err := publication.Validate(); err != nil {
+		t.Fatalf("sparse multi-address-space publication rejected: %v", err)
+	}
+	encoded, err := Encode(publication)
+	if err != nil {
+		t.Fatalf("encode sparse multi-address-space publication: %v", err)
+	}
+	decoded, err := Decode(encoded)
+	if err != nil {
+		t.Fatalf("decode sparse multi-address-space publication: %v", err)
+	}
+	if !reflect.DeepEqual(decoded.MMTemplate.VMAs, publication.MMTemplate.VMAs) ||
+		!reflect.DeepEqual(decoded.PageMap.Runs, publication.PageMap.Runs) {
+		t.Fatal("CRIU pages-image identity or sparse mapping changed in the round trip")
+	}
+
+	publication.PageMap.Runs[1].PagesImageID = 1
+	requireInvalid(t, publication)
+
+	publication = decoded
+	publication.MMTemplate.VMAs[1].PagesImageID = 1
+	requireInvalid(t, publication)
+
+	publication = decoded
+	publication.MMTemplate.VMAs[0].PagesImageID = 0
+	requireInvalid(t, publication)
+}
+
 func TestPageMapAllowsCrossOwnerCanonicalPage(t *testing.T) {
 	publication := validPublication(t)
 	remote := publication.PageMap.Runs[1].FirstPage
@@ -438,8 +542,9 @@ func TestOversizedCanonicalPageMapCannotUseOnePageSlot(t *testing.T) {
 	const runCount = 80
 	for index := uint64(0); index < runCount; index++ {
 		publication.PageMap.Runs = append(publication.PageMap.Runs, PageMapRun{
-			StartVAddr: 0x1000 + index*PageSize,
-			PageCount:  1,
+			PagesImageID: 1,
+			StartVAddr:   0x1000 + index*PageSize,
+			PageCount:    1,
 			FirstPage: PageID{
 				OwnerID:            "owner-a",
 				DeviceUUID:         "device-a",
@@ -449,6 +554,7 @@ func TestOversizedCanonicalPageMapCannotUseOnePageSlot(t *testing.T) {
 		})
 	}
 	publication.MMTemplate.VMAs = []VMA{{
+		PagesImageID:    1,
 		StartVAddr:      0x1000,
 		EndVAddr:        0x1000 + runCount*PageSize,
 		ProtectionFlags: ProtectionRead | ProtectionWrite,

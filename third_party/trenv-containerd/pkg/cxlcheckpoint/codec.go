@@ -315,6 +315,7 @@ func encodeMMTemplate(encoder *payloadEncoder, template MMTemplate) {
 	encoder.u64(template.PageSize)
 	encoder.count(len(template.VMAs))
 	for _, vma := range template.VMAs {
+		encoder.u32(vma.PagesImageID)
 		encoder.u64(vma.StartVAddr)
 		encoder.u64(vma.EndVAddr)
 		encoder.u64(vma.ProtectionFlags)
@@ -340,14 +341,18 @@ func decodeMMTemplate(decoder *payloadDecoder) (MMTemplate, error) {
 	if template.PageSize, err = decoder.u64(); err != nil {
 		return MMTemplate{}, err
 	}
-	// A VMA is six uint64 values and one uint8 backing kind.
-	count, err := decoder.count("VMAs", 49)
+	// A VMA is one uint32 pages-image identity, six uint64 values, and one
+	// uint8 backing kind.
+	count, err := decoder.count("VMAs", 53)
 	if err != nil {
 		return MMTemplate{}, err
 	}
 	template.VMAs = make([]VMA, count)
 	for index := range template.VMAs {
 		vma := &template.VMAs[index]
+		if vma.PagesImageID, err = decoder.u32(); err != nil {
+			return MMTemplate{}, err
+		}
 		if vma.StartVAddr, err = decoder.u64(); err != nil {
 			return MMTemplate{}, err
 		}
@@ -382,6 +387,7 @@ func encodePageMap(encoder *payloadEncoder, pageMap PageMap) {
 	encoder.u64(pageMap.PageSize)
 	encoder.count(len(pageMap.Runs))
 	for _, run := range pageMap.Runs {
+		encoder.u32(run.PagesImageID)
 		encoder.u64(run.StartVAddr)
 		encoder.u64(run.PageCount)
 		encoder.text(run.FirstPage.OwnerID)
@@ -406,13 +412,16 @@ func decodePageMap(decoder *payloadDecoder) (PageMap, error) {
 	if pageMap.PageSize, err = decoder.u64(); err != nil {
 		return PageMap{}, err
 	}
-	count, err := decoder.count("PageMap runs", 40)
+	count, err := decoder.count("PageMap runs", 44)
 	if err != nil {
 		return PageMap{}, err
 	}
 	pageMap.Runs = make([]PageMapRun, count)
 	for index := range pageMap.Runs {
 		run := &pageMap.Runs[index]
+		if run.PagesImageID, err = decoder.u32(); err != nil {
+			return PageMap{}, err
+		}
 		if run.StartVAddr, err = decoder.u64(); err != nil {
 			return PageMap{}, err
 		}

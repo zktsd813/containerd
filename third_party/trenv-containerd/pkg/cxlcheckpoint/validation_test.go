@@ -195,9 +195,9 @@ func TestMMTemplateAndPageMapAreCompleteAndPortable(t *testing.T) {
 			},
 		},
 		{
-			name: "VMA mapping not exactly covered",
+			name: "PageMap run extends beyond VMA",
 			mutate: func(p *Publication) {
-				p.MMTemplate.VMAs[0].EndVAddr = 0x4000
+				p.MMTemplate.VMAs[0].EndVAddr = 0x2000
 			},
 		},
 		{
@@ -210,8 +210,9 @@ func TestMMTemplateAndPageMapAreCompleteAndPortable(t *testing.T) {
 			name: "unconsumed PageMap run",
 			mutate: func(p *Publication) {
 				p.PageMap.Runs = append(p.PageMap.Runs, PageMapRun{
-					StartVAddr: 0x6000,
-					PageCount:  1,
+					PagesImageID: 1,
+					StartVAddr:   0x6000,
+					PageCount:    1,
 					FirstPage: PageID{
 						OwnerID:            "owner-b",
 						DeviceUUID:         "device-c",

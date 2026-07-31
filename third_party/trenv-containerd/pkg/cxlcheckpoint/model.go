@@ -176,8 +176,13 @@ type InitialAllocation struct {
 	Extents            []AllocationExtent
 }
 
-// VMA is a portable virtual-memory range and a complete slice of PageMap runs.
+// VMA is a portable virtual-memory range in one CRIU pages image.
+// PagesImageID is checkpoint-portable CRIU image metadata; it is not a
+// numeric pseudo-MM identifier or a kernel object. PageMapRunStart/Count name
+// the sparse present-page runs that fall inside this VMA. Gaps are valid:
+// pages absent from the CRIU pagemap must not be invented during restore.
 type VMA struct {
+	PagesImageID    uint32
 	StartVAddr      uint64
 	EndVAddr        uint64
 	ProtectionFlags uint64
@@ -197,13 +202,15 @@ type MMTemplate struct {
 	VMAs                   []VMA
 }
 
-// PageMapRun maps consecutive virtual pages to consecutive data pages under
-// one PageID base. A non-contiguous or cross-Owner map is represented by
-// multiple runs, including one-page runs when necessary.
+// PageMapRun maps consecutive present virtual pages from one CRIU pages image
+// to consecutive data pages under one PageID base. A sparse, non-contiguous,
+// cross-device, or cross-Owner map is represented by multiple runs, including
+// one-page runs when necessary.
 type PageMapRun struct {
-	StartVAddr uint64
-	PageCount  uint64
-	FirstPage  PageID
+	PagesImageID uint32
+	StartVAddr   uint64
+	PageCount    uint64
+	FirstPage    PageID
 }
 
 // PageMap is an immutable mapping version stored in one reserved mapping slot.
@@ -484,14 +491,22 @@ func validateMMTemplate(template MMTemplate, pageMap PageMap, contents map[uint6
 		return invalidf("VMA count %d is outside 1..%d", len(template.VMAs), maxCollectionElements)
 	}
 	expectedRun := uint64(0)
+	previousPagesImageID := uint32(0)
 	previousEnd := uint64(0)
 	for i, vma := range template.VMAs {
+		if vma.PagesImageID == 0 {
+			return invalidf("VMA %d has a zero CRIU pages image ID", i)
+		}
 		if err := alignedRange("VMA", vma.StartVAddr, vma.EndVAddr); err != nil {
 			return fmt.Errorf("VMA %d: %w", i, err)
 		}
-		if i > 0 && vma.StartVAddr < previousEnd {
-			return invalidf("VMAs overlap or are not ordered at index %d", i)
+		if i > 0 {
+			if vma.PagesImageID < previousPagesImageID ||
+				(vma.PagesImageID == previousPagesImageID && vma.StartVAddr < previousEnd) {
+				return invalidf("VMAs overlap or are not ordered by pages image/address at index %d", i)
+			}
 		}
+		previousPagesImageID = vma.PagesImageID
 		previousEnd = vma.EndVAddr
 		if vma.ProtectionFlags&^knownProtectionFlags != 0 {
 			return invalidf("VMA %d has unknown protection flags %#x", i, vma.ProtectionFlags)
@@ -517,30 +532,34 @@ func validateMMTemplate(template MMTemplate, pageMap PageMap, contents map[uint6
 				return invalidf("VMA %d file/blob backing has the ANONYMOUS mapping flag", i)
 			}
 		}
-		if vma.PageMapRunStart != expectedRun || vma.PageMapRunCount == 0 {
-			return invalidf("VMA %d PageMap slice is empty, overlapping, or has a gap", i)
+		if vma.PageMapRunStart != expectedRun {
+			return invalidf("VMA %d PageMap slice overlaps or has a run-table gap", i)
 		}
 		runEnd, ok := addLong(vma.PageMapRunStart, vma.PageMapRunCount)
 		if !ok || runEnd > uint64(len(pageMap.Runs)) {
 			return invalidf("VMA %d PageMap slice exceeds the run table", i)
 		}
-		expectedVAddr := vma.StartVAddr
+		previousRunEnd := vma.StartVAddr
 		for runIndex := vma.PageMapRunStart; runIndex < runEnd; runIndex++ {
 			run := pageMap.Runs[runIndex]
-			if run.StartVAddr != expectedVAddr {
-				return invalidf("VMA %d PageMap runs have a virtual-address gap or overlap", i)
+			if run.PagesImageID != vma.PagesImageID {
+				return invalidf("VMA %d PageMap run names pages image %d, expected %d",
+					i, run.PagesImageID, vma.PagesImageID)
+			}
+			if run.StartVAddr < previousRunEnd || run.StartVAddr < vma.StartVAddr {
+				return invalidf("VMA %d PageMap present-page runs overlap or are not ordered", i)
 			}
 			bytes, ok := mulLong(run.PageCount, PageSize)
 			if !ok {
 				return invalidf("VMA %d PageMap coverage overflows", i)
 			}
-			expectedVAddr, ok = addLong(expectedVAddr, bytes)
+			previousRunEnd, ok = addLong(run.StartVAddr, bytes)
 			if !ok {
 				return invalidf("VMA %d virtual coverage overflows", i)
 			}
-		}
-		if expectedVAddr != vma.EndVAddr {
-			return invalidf("VMA %d PageMap slice does not exactly cover the VMA", i)
+			if previousRunEnd > vma.EndVAddr {
+				return invalidf("VMA %d PageMap run extends beyond the VMA", i)
+			}
 		}
 		expectedRun = runEnd
 	}
@@ -580,8 +599,12 @@ func validatePageMap(
 	if len(pageMap.Runs) == 0 || len(pageMap.Runs) > maxCollectionElements {
 		return invalidf("PageMap run count %d is outside 1..%d", len(pageMap.Runs), maxCollectionElements)
 	}
+	previousPagesImageID := uint32(0)
 	previousEnd := uint64(0)
 	for i, run := range pageMap.Runs {
+		if run.PagesImageID == 0 {
+			return invalidf("PageMap run %d has a zero CRIU pages image ID", i)
+		}
 		if err := alignedAddress("PageMap virtual address", run.StartVAddr); err != nil {
 			return fmt.Errorf("PageMap run %d: %w", i, err)
 		}
@@ -596,9 +619,13 @@ func validatePageMap(
 		if !ok {
 			return invalidf("PageMap run %d virtual range overflows", i)
 		}
-		if i > 0 && run.StartVAddr < previousEnd {
-			return invalidf("PageMap runs overlap or are not ordered at index %d", i)
+		if i > 0 {
+			if run.PagesImageID < previousPagesImageID ||
+				(run.PagesImageID == previousPagesImageID && run.StartVAddr < previousEnd) {
+				return invalidf("PageMap runs overlap or are not ordered by pages image/address at index %d", i)
+			}
 		}
+		previousPagesImageID = run.PagesImageID
 		previousEnd = end
 		if err := validatePageID(run.FirstPage, initialAllocation, devices, run.PageCount); err != nil {
 			return fmt.Errorf("PageMap run %d: %w", i, err)
