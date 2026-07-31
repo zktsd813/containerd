@@ -9,6 +9,13 @@ import (
 	"testing"
 )
 
+func TestVNextCRC32CastagnoliKnownAnswer(t *testing.T) {
+	const expected uint32 = 0xe3069283
+	if got := crc32.Checksum([]byte("123456789"), vnextCRCTable); got != expected {
+		t.Fatalf("CRC-32C known answer = %#08x, want %#08x", got, expected)
+	}
+}
+
 func TestVNextDeviceGeometryHasOneDescriptorPerContentPage(t *testing.T) {
 	const (
 		deviceBytes = uint64(2 << 30)

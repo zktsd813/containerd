@@ -33,10 +33,11 @@ var (
 )
 
 // VNext uses the same explicit CPU contract for page fingerprints and small
-// metadata integrity checks: CRC-32/IEEE over exactly the supplied bytes.
+// metadata integrity checks: CRC-32C (Castagnoli/iSCSI) over exactly the
+// supplied bytes. This polynomial matches Intel DML COPY_CRC/CRC operations.
 // Content pages are always supplied as 4096 bytes after zero padding. CRC is a
 // corruption/candidate fingerprint, not an equality or authenticity proof.
-var vnextCRCTable = crc32.MakeTable(crc32.IEEE)
+var vnextCRCTable = crc32.MakeTable(crc32.Castagnoli)
 
 type vnextDeviceGeometry struct {
 	DeviceBytes           uint64

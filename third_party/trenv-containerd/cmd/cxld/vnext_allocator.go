@@ -77,6 +77,11 @@ type vnextPageExtent struct {
 	LogicalPageStart   uint64
 }
 
+type vnextFreeRun struct {
+	StartDataPageIndex uint64
+	PageCount          uint64
+}
+
 func (e vnextPageExtent) end() (uint64, bool) {
 	return vnextAdd(e.StartDataPageIndex, e.PageCount)
 }
@@ -186,6 +191,27 @@ func newVNextCheckpointAllocator(superblock vnextDeviceSuperblock) (*vnextCheckp
 }
 
 func (a *vnextCheckpointAllocator) reserve(request vnextCheckpointAllocationRequest) (vnextWriteGrant, error) {
+	return a.reserveInternal(request, 0, nil, false)
+}
+
+// reserveAtIDWithExtents is the Owner-group primitive. It permits an Owner to
+// use one global allocation identity across several device-local fragments.
+// A device may skip IDs allocated on sibling devices, but may never allocate
+// below its recovered high-water.
+func (a *vnextCheckpointAllocator) reserveAtIDWithExtents(
+	request vnextCheckpointAllocationRequest,
+	allocationRecordID uint64,
+	plannedExtents []vnextPageExtent,
+) (vnextWriteGrant, error) {
+	return a.reserveInternal(request, allocationRecordID, plannedExtents, true)
+}
+
+func (a *vnextCheckpointAllocator) reserveInternal(
+	request vnextCheckpointAllocationRequest,
+	requestedAllocationRecordID uint64,
+	plannedExtents []vnextPageExtent,
+	fixedIdentity bool,
+) (vnextWriteGrant, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -196,6 +222,16 @@ func (a *vnextCheckpointAllocator) reserve(request vnextCheckpointAllocationRequ
 	if recordID, ok := a.requestIndex[request.RequestID]; ok {
 		record := a.records[recordID]
 		if record != nil && record.State == vnextAllocationReserved && vnextRequestMatchesRecord(request, segments, record) {
+			if fixedIdentity && record.AllocationRecordID != requestedAllocationRecordID {
+				return vnextWriteGrant{}, fmt.Errorf(
+					"idempotent fragment request names allocation %d, not requested Owner ID %d: %w",
+					record.AllocationRecordID, requestedAllocationRecordID, errVNextAlreadyExists)
+			}
+			if len(plannedExtents) > 0 && !vnextPageExtentsEqual(record.Extents, plannedExtents) {
+				return vnextWriteGrant{}, fmt.Errorf(
+					"idempotent fragment request has a different physical plan: %w",
+					errVNextAlreadyExists)
+			}
 			return a.grantFromRecordLocked(record), nil
 		}
 		return vnextWriteGrant{}, fmt.Errorf(
@@ -207,7 +243,19 @@ func (a *vnextCheckpointAllocator) reserve(request vnextCheckpointAllocationRequ
 			"checkpoint %q already names allocation %d: %w",
 			request.CheckpointID, recordID, errVNextAlreadyExists)
 	}
-	if a.nextAllocationRecordID == 0 || a.nextAllocationRecordID >= uint64(math.MaxInt64) {
+	allocationRecordID := a.nextAllocationRecordID
+	if fixedIdentity {
+		if requestedAllocationRecordID == 0 || requestedAllocationRecordID >= uint64(math.MaxInt64) {
+			return vnextWriteGrant{}, errors.New("requested allocation record ID is outside the positive signed 64-bit ABI")
+		}
+		if requestedAllocationRecordID < a.nextAllocationRecordID {
+			return vnextWriteGrant{}, fmt.Errorf(
+				"requested allocation ID %d is below device high-water %d: %w",
+				requestedAllocationRecordID, a.nextAllocationRecordID, errVNextAlreadyExists)
+		}
+		allocationRecordID = requestedAllocationRecordID
+	}
+	if allocationRecordID == 0 || allocationRecordID >= uint64(math.MaxInt64) {
 		return vnextWriteGrant{}, errors.New("allocation record ID high-water reached the signed 64-bit ABI limit")
 	}
 	if a.nextOwnerTransaction == 0 || a.nextOwnerTransaction == math.MaxUint64 {
@@ -219,8 +267,13 @@ func (a *vnextCheckpointAllocator) reserve(request vnextCheckpointAllocationRequ
 			vnextMaxAllocationRecords, errVNextMetadataFull)
 	}
 
-	extents, err := a.planExtentsLocked(totalPages, request.MaxExtents)
-	if err != nil {
+	extents := append([]vnextPageExtent(nil), plannedExtents...)
+	if len(extents) == 0 {
+		extents, err = a.planExtentsLocked(totalPages, request.MaxExtents)
+		if err != nil {
+			return vnextWriteGrant{}, err
+		}
+	} else if err := a.validatePlannedExtentsLocked(extents, totalPages, request.MaxExtents); err != nil {
 		return vnextWriteGrant{}, err
 	}
 	var token [16]byte
@@ -231,7 +284,7 @@ func (a *vnextCheckpointAllocator) reserve(request vnextCheckpointAllocationRequ
 		return vnextWriteGrant{}, errors.New("write grant token source returned the reserved all-zero token")
 	}
 	record := &vnextAllocationRecord{
-		AllocationRecordID: a.nextAllocationRecordID,
+		AllocationRecordID: allocationRecordID,
 		RequestID:          request.RequestID,
 		CheckpointID:       request.CheckpointID,
 		ProducerID:         request.ProducerID,
@@ -259,7 +312,7 @@ func (a *vnextCheckpointAllocator) reserve(request vnextCheckpointAllocationRequ
 			vnextBitmapSet(candidateBitmap, index, true)
 		}
 	}
-	nextAllocationID := a.nextAllocationRecordID + 1
+	nextAllocationID := allocationRecordID + 1
 	nextTransaction := a.nextOwnerTransaction + 1
 	size, err := a.snapshotEncodedSizeLocked(
 		record, candidateBitmap, nextAllocationID, nextTransaction, a.snapshotSequence+1)
@@ -291,6 +344,23 @@ func (a *vnextCheckpointAllocator) commit(grant vnextWriteGrant) error {
 	if err != nil {
 		return err
 	}
+	return a.commitRecordLocked(record)
+}
+
+func (a *vnextCheckpointAllocator) commitByOwner(
+	allocationRecordID uint64,
+	checkpointID string,
+) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	record, ok := a.records[allocationRecordID]
+	if !ok || record.CheckpointID != checkpointID {
+		return fmt.Errorf("checkpoint %q allocation %d does not exist", checkpointID, allocationRecordID)
+	}
+	return a.commitRecordLocked(record)
+}
+
+func (a *vnextCheckpointAllocator) commitRecordLocked(record *vnextAllocationRecord) error {
 	if record.State != vnextAllocationReserved {
 		return fmt.Errorf(
 			"allocation %d is in state %d, expected RESERVED: %w",
@@ -321,6 +391,23 @@ func (a *vnextCheckpointAllocator) beginAbort(grant vnextWriteGrant) error {
 	if err != nil {
 		return err
 	}
+	return a.beginAbortRecordLocked(record)
+}
+
+func (a *vnextCheckpointAllocator) beginAbortByOwner(
+	allocationRecordID uint64,
+	checkpointID string,
+) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	record, ok := a.records[allocationRecordID]
+	if !ok || record.CheckpointID != checkpointID {
+		return fmt.Errorf("checkpoint %q allocation %d does not exist", checkpointID, allocationRecordID)
+	}
+	return a.beginAbortRecordLocked(record)
+}
+
+func (a *vnextCheckpointAllocator) beginAbortRecordLocked(record *vnextAllocationRecord) error {
 	if record.State != vnextAllocationReserved {
 		return fmt.Errorf(
 			"allocation %d is in state %d, expected RESERVED: %w",
@@ -510,6 +597,33 @@ func (a *vnextCheckpointAllocator) freePages() uint64 {
 	return a.freePagesLocked()
 }
 
+func (a *vnextCheckpointAllocator) freeRuns() []vnextFreeRun {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	runs := make([]vnextFreeRun, 0)
+	for index := uint64(0); index < a.superblock.Geometry.DataPageCount; {
+		if vnextBitmapGet(a.bitmap, index) {
+			index++
+			continue
+		}
+		start := index
+		for index < a.superblock.Geometry.DataPageCount && !vnextBitmapGet(a.bitmap, index) {
+			index++
+		}
+		runs = append(runs, vnextFreeRun{
+			StartDataPageIndex: start,
+			PageCount:          index - start,
+		})
+	}
+	return runs
+}
+
+func (a *vnextCheckpointAllocator) allocationIDHighWater() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.nextAllocationRecordID
+}
+
 func (a *vnextCheckpointAllocator) validate() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -562,6 +676,11 @@ func (a *vnextCheckpointAllocator) validateRequestLocked(
 		seenObjects[content.ObjectID] = struct{}{}
 		if content.ByteLength == 0 {
 			return nil, 0, fmt.Errorf("content object %d has zero bytes", content.ObjectID)
+		}
+		if content.Kind == vnextContentMemory && content.ByteLength%vnextContentPageSize != 0 {
+			return nil, 0, fmt.Errorf(
+				"memory object %d length %d is not a whole 4 KiB page",
+				content.ObjectID, content.ByteLength)
 		}
 		rounded, ok := vnextAdd(content.ByteLength, vnextContentPageSize-1)
 		if !ok {
@@ -632,6 +751,44 @@ func (a *vnextCheckpointAllocator) planExtentsLocked(
 			allocated, pageCount, errVNextNoSpace)
 	}
 	return extents, nil
+}
+
+func (a *vnextCheckpointAllocator) validatePlannedExtentsLocked(
+	extents []vnextPageExtent,
+	totalPages uint64,
+	maxExtents uint32,
+) error {
+	if len(extents) == 0 || len(extents) > int(maxExtents) {
+		return fmt.Errorf("planned extent count %d exceeds budget %d", len(extents), maxExtents)
+	}
+	var logical uint64
+	var previousEnd uint64
+	for index, extent := range extents {
+		if extent.PageCount == 0 || extent.LogicalPageStart != logical {
+			return fmt.Errorf("planned extent %d has invalid logical coverage", index)
+		}
+		end, ok := extent.end()
+		if !ok || end > a.superblock.Geometry.DataPageCount {
+			return fmt.Errorf("planned extent %d exceeds device capacity", index)
+		}
+		if index > 0 && extent.StartDataPageIndex <= previousEnd {
+			return fmt.Errorf("planned extents overlap, are unordered, or are not coalesced")
+		}
+		for page := extent.StartDataPageIndex; page < end; page++ {
+			if vnextBitmapGet(a.bitmap, page) {
+				return fmt.Errorf("planned extent page %d is allocated: %w", page, errVNextNoSpace)
+			}
+		}
+		previousEnd = end
+		logical, ok = vnextAdd(logical, extent.PageCount)
+		if !ok {
+			return errors.New("planned extent page count overflows")
+		}
+	}
+	if logical != totalPages {
+		return fmt.Errorf("planned extents cover %d pages, request needs %d", logical, totalPages)
+	}
+	return nil
 }
 
 func (a *vnextCheckpointAllocator) validateAuthorityLocked(authority vnextOwnerAuthority) error {
@@ -966,6 +1123,18 @@ func cloneVNextAllocationRecord(record *vnextAllocationRecord) vnextAllocationRe
 	cloned.Contents = append([]vnextContentSegment(nil), record.Contents...)
 	cloned.Extents = append([]vnextPageExtent(nil), record.Extents...)
 	return cloned
+}
+
+func vnextPageExtentsEqual(left, right []vnextPageExtent) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func vnextBitmapWordCount(pageCount uint64) (int, bool) {
