@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,19 +30,37 @@ const (
 	daemonName           = "cxld"
 	defaultSocketPath    = "/run/" + daemonName + "/" + daemonName + ".sock"
 	daemonStateDirectory = daemonName + "-state"
+	// The Unix socket remains a bounded control plane. Larger publication or
+	// CRC payloads require a future streaming or SCM_RIGHTS transport rather
+	// than increasing one JSON/base64 allocation without bound.
+	maxDaemonFrameBytes          = 32 << 20
+	daemonLargeFrameThreshold    = 1 << 20
+	daemonMaxConcurrentRequests  = 32
+	daemonMaxConcurrentLargeBody = 1
+	daemonFrameReadTimeout       = 30 * time.Second
+	daemonFrameWriteTimeout      = 30 * time.Second
+)
+
+var (
+	daemonRequestAdmission = make(chan struct{}, daemonMaxConcurrentRequests)
+	daemonLargeAdmission   = make(chan struct{}, daemonMaxConcurrentLargeBody)
 )
 
 type daemonRequest struct {
-	CommandLabel    string                    `json:"commandLabel"`
-	TimeoutMillis   int64                     `json:"timeoutMillis"`
-	Operation       string                    `json:"operation"`
-	CreateContainer *createContainerRequest   `json:"createContainer,omitempty"`
-	Checkpoint      *checkpointRequest        `json:"checkpointContainer,omitempty"`
-	Restore         *switchRequest            `json:"restoreIntoContainer,omitempty"`
-	Switch          *switchRequest            `json:"switchIntoCandidate,omitempty"`
-	Container       *containerRequest         `json:"container,omitempty"`
-	Cleanup         *cleanupContainersRequest `json:"cleanupContainers,omitempty"`
-	MetadataResolve *metadataResolveRequest   `json:"metadataResolve,omitempty"`
+	CommandLabel      string                    `json:"commandLabel"`
+	TimeoutMillis     int64                     `json:"timeoutMillis"`
+	Operation         string                    `json:"operation"`
+	CreateContainer   *createContainerRequest   `json:"createContainer,omitempty"`
+	Checkpoint        *checkpointRequest        `json:"checkpointContainer,omitempty"`
+	Restore           *switchRequest            `json:"restoreIntoContainer,omitempty"`
+	Switch            *switchRequest            `json:"switchIntoCandidate,omitempty"`
+	Container         *containerRequest         `json:"container,omitempty"`
+	Cleanup           *cleanupContainersRequest `json:"cleanupContainers,omitempty"`
+	MetadataResolve   *metadataResolveRequest   `json:"metadataResolve,omitempty"`
+	VNextOwnerReserve json.RawMessage           `json:"vnextOwnerReserve,omitempty"`
+	VNextOwnerSeal    json.RawMessage           `json:"vnextOwnerSeal,omitempty"`
+	VNextOwnerCommit  json.RawMessage           `json:"vnextOwnerCommit,omitempty"`
+	VNextOwnerAbort   json.RawMessage           `json:"vnextOwnerAbort,omitempty"`
 }
 
 // A structured checkpoint request is preferred over allowing the invoker to
@@ -236,13 +255,30 @@ func (d daxShardConfig) String() string {
 var activeConfig daemonConfig
 
 func writeFrame(conn net.Conn, payload []byte) error {
+	if len(payload) > maxDaemonFrameBytes {
+		return fmt.Errorf(
+			"frame is %d bytes, maximum is %d", len(payload), maxDaemonFrameBytes)
+	}
 	header := make([]byte, 4)
 	binary.BigEndian.PutUint32(header, uint32(len(payload)))
-	if _, err := conn.Write(header); err != nil {
+	if err := writeConnFull(conn, header); err != nil {
 		return err
 	}
-	_, err := conn.Write(payload)
-	return err
+	return writeConnFull(conn, payload)
+}
+
+func writeConnFull(conn net.Conn, payload []byte) error {
+	for len(payload) != 0 {
+		written, err := conn.Write(payload)
+		if err != nil {
+			return err
+		}
+		if written <= 0 || written > len(payload) {
+			return io.ErrShortWrite
+		}
+		payload = payload[written:]
+	}
+	return nil
 }
 
 func readFrame(conn net.Conn) ([]byte, error) {
@@ -251,6 +287,10 @@ func readFrame(conn net.Conn) ([]byte, error) {
 		return nil, err
 	}
 	size := binary.BigEndian.Uint32(header)
+	if size > maxDaemonFrameBytes {
+		return nil, fmt.Errorf(
+			"request frame is %d bytes, maximum is %d", size, maxDaemonFrameBytes)
+	}
 	body := make([]byte, size)
 	if _, err := io.ReadFull(conn, body); err != nil {
 		return nil, err
@@ -258,7 +298,76 @@ func readFrame(conn net.Conn) ([]byte, error) {
 	return body, nil
 }
 
-func runCommand(req daemonRequest) (resp execResponse) {
+// readDaemonRequestFrame acquires the single large-frame budget before it
+// allocates the request body. The returned release function must remain held
+// through JSON decoding and dispatch because those phases retain the body and
+// decoded base64 byte slices at the same time.
+func readDaemonRequestFrame(
+	conn net.Conn,
+	largeAdmission chan struct{},
+	readTimeout time.Duration,
+) ([]byte, func(), error) {
+	release := func() {}
+	if readTimeout <= 0 {
+		return nil, release, errors.New("daemon request read timeout must be positive")
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+		return nil, release, fmt.Errorf("set request read deadline: %w", err)
+	}
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return nil, release, err
+	}
+	size := binary.BigEndian.Uint32(header)
+	if size > maxDaemonFrameBytes {
+		return nil, release, fmt.Errorf(
+			"request frame is %d bytes, maximum is %d", size, maxDaemonFrameBytes)
+	}
+	acquiredLarge := false
+	if size > daemonLargeFrameThreshold {
+		timer := time.NewTimer(readTimeout)
+		defer timer.Stop()
+		select {
+		case largeAdmission <- struct{}{}:
+			acquiredLarge = true
+		case <-timer.C:
+			return nil, release, errors.New("timed out waiting for the large-request memory budget")
+		}
+	}
+	if acquiredLarge {
+		release = func() { <-largeAdmission }
+	}
+	body := make([]byte, size)
+	if _, err := io.ReadFull(conn, body); err != nil {
+		release()
+		return nil, func() {}, err
+	}
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		release()
+		return nil, func() {}, fmt.Errorf("clear request read deadline: %w", err)
+	}
+	return body, release, nil
+}
+
+func writeDaemonResponse(conn net.Conn, payload []byte) {
+	if len(payload) > maxDaemonFrameBytes {
+		payload, _ = json.Marshal(execResponse{
+			Ok:        false,
+			Error:     "daemon response exceeds the bounded control-frame contract",
+			ErrorCode: string(vnextOwnerServiceUnavailable),
+		})
+	}
+	_ = writeFrame(conn, payload)
+}
+
+func runCommand(req daemonRequest) execResponse {
+	return runCommandWithVNextOwnerRPC(req, activeVNextOwnerRPC)
+}
+
+func runCommandWithVNextOwnerRPC(
+	req daemonRequest,
+	vnextOwnerRPC *vnextOwnerRPC,
+) (resp execResponse) {
 	startedAt := time.Now()
 	operation := strings.TrimSpace(req.Operation)
 	if operation == "" && req.CreateContainer != nil {
@@ -283,6 +392,15 @@ func runCommand(req daemonRequest) (resp execResponse) {
 		resp.Operation = operation
 		resp.DurationMicros = elapsedMicros(startedAt)
 	}()
+	if vnextOwnerRPC != nil && vnextOwnerRejectsLegacyDAXOperation(operation) {
+		return execResponse{
+			Ok: false,
+			Error: fmt.Sprintf(
+				"legacy operation %q is disabled while the strict VNext Owner is active",
+				operation),
+			ErrorCode: string(vnextOwnerServicePublicationIncompatible),
+		}
+	}
 
 	switch operation {
 	case "createContainer":
@@ -320,10 +438,27 @@ func runCommand(req daemonRequest) (resp execResponse) {
 			return execResponse{Ok: false, Error: "metadataResolve operation requires metadataResolve request"}
 		}
 		return runMetadataResolveRequest(*req.MetadataResolve, req.TimeoutMillis, activeConfig)
+	case vnextOwnerRPCOperationReserve,
+		vnextOwnerRPCOperationSeal,
+		vnextOwnerRPCOperationCommit,
+		vnextOwnerRPCOperationAbort:
+		return runVNextOwnerRPC(operation, req, vnextOwnerRPC)
 	case "":
 		return execResponse{Ok: false, Error: "operation is empty"}
 	default:
 		return execResponse{Ok: false, Error: fmt.Sprintf("unsupported operation %q", operation)}
+	}
+}
+
+func vnextOwnerRejectsLegacyDAXOperation(operation string) bool {
+	switch operation {
+	case "checkpointContainer",
+		"restoreIntoContainer",
+		"switchIntoCandidate",
+		"metadataResolve":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -2043,23 +2178,111 @@ func startMetadataServer(config daemonConfig) (*http.Server, net.Listener, error
 	return server, listener, nil
 }
 
+func validateVNextOwnerExclusiveLegacyConfig(config daemonConfig) error {
+	var conflicts []string
+	if strings.TrimSpace(config.DaxDevice) != "" {
+		conflicts = append(conflicts, "dax-device")
+	}
+	if len(config.DaxShards) != 0 {
+		conflicts = append(conflicts, "dax-shards")
+	}
+	if len(config.ArtifactDaxShards) != 0 {
+		conflicts = append(conflicts, "artifact-dax-shards")
+	}
+	if len(config.ReaderDaxShards) != 0 {
+		conflicts = append(conflicts, "reader-dax-shards")
+	}
+	if len(config.ReaderArtifactDaxShards) != 0 {
+		conflicts = append(conflicts, "reader-artifact-dax-shards")
+	}
+	if strings.TrimSpace(config.MetadataListen) != "" {
+		conflicts = append(conflicts, "metadata-listen")
+	}
+	if len(config.MetadataPeers) != 0 {
+		conflicts = append(conflicts, "metadata-peers")
+	}
+	if config.DedupCheckpointMode != "" && config.DedupCheckpointMode != "off" {
+		conflicts = append(conflicts, "dedup-checkpoint-mode")
+	}
+	if len(conflicts) != 0 {
+		return fmt.Errorf(
+			"strict VNext Owner mode cannot share legacy DAX/metadata configuration: %s",
+			strings.Join(conflicts, ", "))
+	}
+	return nil
+}
+
 func serveConn(conn net.Conn) {
+	serveConnWithVNextOwnerRPC(conn, activeVNextOwnerRPC)
+}
+
+func serveConnWithVNextOwnerRPC(conn net.Conn, vnextOwnerRPC *vnextOwnerRPC) {
+	serveConnWithVNextOwnerRPCLimits(
+		conn,
+		vnextOwnerRPC,
+		daemonRequestAdmission,
+		daemonLargeAdmission,
+		daemonFrameReadTimeout,
+		daemonFrameWriteTimeout)
+}
+
+func serveConnWithVNextOwnerRPCLimits(
+	conn net.Conn,
+	vnextOwnerRPC *vnextOwnerRPC,
+	requestAdmission chan struct{},
+	largeAdmission chan struct{},
+	readTimeout time.Duration,
+	writeTimeout time.Duration,
+) {
+	if tryAcquireDaemonRequestAdmission(requestAdmission) {
+		defer func() { <-requestAdmission }()
+	} else {
+		// Do not wait while writing a rejection to a peer that may never read
+		// it. Closing immediately is what keeps excess connections from
+		// retaining goroutines and file descriptors for the write timeout.
+		_ = conn.Close()
+		return
+	}
+	serveAdmittedConnWithVNextOwnerRPCLimits(
+		conn, vnextOwnerRPC, largeAdmission, readTimeout, writeTimeout)
+}
+
+func serveAdmittedConnWithVNextOwnerRPCLimits(
+	conn net.Conn,
+	vnextOwnerRPC *vnextOwnerRPC,
+	largeAdmission chan struct{},
+	readTimeout time.Duration,
+	writeTimeout time.Duration,
+) {
 	defer conn.Close()
-
-	body, err := readFrame(conn)
+	body, releaseLarge, err := readDaemonRequestFrame(conn, largeAdmission, readTimeout)
 	if err != nil {
+		_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		resp, _ := json.Marshal(execResponse{
+			Ok:        false,
+			Error:     fmt.Sprintf("invalid request frame: %v", err),
+			ErrorCode: string(vnextOwnerServiceInvalidRequest),
+		})
+		writeDaemonResponse(conn, resp)
+		return
+	}
+	defer releaseLarge()
+
+	req, err := decodeDaemonRequest(body)
+	if err != nil {
+		_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		resp, _ := json.Marshal(execResponse{
+			Ok:        false,
+			Error:     fmt.Sprintf("invalid request: %v", err),
+			ErrorCode: string(vnextOwnerServiceInvalidRequest),
+		})
+		writeDaemonResponse(conn, resp)
 		return
 	}
 
-	var req daemonRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		resp, _ := json.Marshal(execResponse{Ok: false, Error: fmt.Sprintf("invalid request: %v", err)})
-		_ = writeFrame(conn, resp)
-		return
-	}
-
-	respBody, _ := json.Marshal(runCommand(req))
-	_ = writeFrame(conn, respBody)
+	respBody, _ := json.Marshal(runCommandWithVNextOwnerRPC(req, vnextOwnerRPC))
+	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	writeDaemonResponse(conn, respBody)
 }
 
 func main() {
@@ -2091,6 +2314,18 @@ func main() {
 	dedupExecution := flag.String("dedup-execution", envDefault("CXLD_DEDUP_EXECUTION", "cpu"), "dedupd fingerprint execution backend: cpu, sw, or hw")
 	dedupOutputDirectory := flag.String("dedup-output-directory", envDefault("CXLD_DEDUP_OUTPUT_DIRECTORY", ""), "directory for automatic dedup ledgers, plans, and status files")
 	dedupMinPages := flag.Uint64("dedup-min-pages", envDefaultUint64("CXLD_DEDUP_MIN_PAGES", 1), "minimum dedup extent size to publish")
+	vnextOwnerControlFile := flag.String(
+		"vnext-owner-control-file",
+		envDefault("CXLD_VNEXT_OWNER_CONTROL_FILE", ""),
+		"existing VNext Owner A/B control file; never created or formatted by cxld startup")
+	vnextOwnerControlSlotBytes := flag.Uint64(
+		"vnext-owner-control-slot-bytes",
+		envDefaultUint64("CXLD_VNEXT_OWNER_CONTROL_SLOT_BYTES", 0),
+		"exact byte capacity of one existing VNext Owner control slot")
+	vnextOwnerDAXDevices := flag.String(
+		"vnext-owner-dax-devices",
+		envDefault("CXLD_VNEXT_OWNER_DAX_DEVICES", ""),
+		"comma-separated existing TRCXL006 devdax paths owned by this cxld")
 	flag.Parse()
 	if *publicationSchemaVersion != uint64(trenvpub.Version) {
 		fmt.Fprintf(
@@ -2185,6 +2420,31 @@ func main() {
 		os.Exit(1)
 	}
 
+	vnextOwnerRuntime, err := openVNextOwnerRuntime(vnextOwnerRuntimeConfig{
+		ControlFilePath:  *vnextOwnerControlFile,
+		ControlSlotBytes: *vnextOwnerControlSlotBytes,
+		DAXDeviceList:    *vnextOwnerDAXDevices,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to open VNext Owner runtime: %v\n", err)
+		os.Exit(1)
+	}
+	if vnextOwnerRuntime != nil {
+		if err := validateVNextOwnerExclusiveLegacyConfig(activeConfig); err != nil {
+			if closeErr := closeVNextOwnerRuntimeWithRetry(vnextOwnerRuntime, 3); closeErr != nil {
+				fmt.Fprintf(os.Stderr, "failed to close invalid VNext Owner runtime: %v\n", closeErr)
+			}
+			fmt.Fprintf(os.Stderr, "invalid VNext Owner configuration: %v\n", err)
+			os.Exit(1)
+		}
+		defer func() {
+			if err := closeVNextOwnerRuntimeWithRetry(vnextOwnerRuntime, 3); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to close VNext Owner runtime: %v\n", err)
+			}
+		}()
+		activeVNextOwnerRPC = newVNextOwnerRPC(vnextOwnerRuntime.service)
+	}
+
 	metadataServer, metadataListener, err := startMetadataServer(activeConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to start metadata server: %v\n", err)
@@ -2216,13 +2476,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	_, daemonCancel := context.WithCancel(context.Background())
-	defer daemonCancel()
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	var requestWG sync.WaitGroup
 	go func() {
 		<-sigCh
-		daemonCancel()
 		if metadataServer != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			_ = metadataServer.Shutdown(ctx)
@@ -2230,17 +2489,53 @@ func main() {
 		}
 		_ = listener.Close()
 		_ = os.Remove(*socketPath)
-		os.Exit(0)
 	}()
 
+	var acceptRetryDelay time.Duration
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
+				requestWG.Wait()
 				return
 			}
+			if acceptRetryDelay == 0 {
+				acceptRetryDelay = 5 * time.Millisecond
+			} else {
+				acceptRetryDelay *= 2
+				if acceptRetryDelay > time.Second {
+					acceptRetryDelay = time.Second
+				}
+			}
+			time.Sleep(acceptRetryDelay)
 			continue
 		}
-		go serveConn(conn)
+		acceptRetryDelay = 0
+		if !tryAcquireDaemonRequestAdmission(daemonRequestAdmission) {
+			// Bound accepted file descriptors and goroutines before spawning
+			// request work, not after the scheduler happens to run it.
+			_ = conn.Close()
+			continue
+		}
+		requestWG.Add(1)
+		go func(admittedConn net.Conn) {
+			defer requestWG.Done()
+			defer func() { <-daemonRequestAdmission }()
+			serveAdmittedConnWithVNextOwnerRPCLimits(
+				admittedConn,
+				activeVNextOwnerRPC,
+				daemonLargeAdmission,
+				daemonFrameReadTimeout,
+				daemonFrameWriteTimeout)
+		}(conn)
+	}
+}
+
+func tryAcquireDaemonRequestAdmission(admission chan struct{}) bool {
+	select {
+	case admission <- struct{}{}:
+		return true
+	default:
+		return false
 	}
 }

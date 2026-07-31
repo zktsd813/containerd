@@ -124,9 +124,32 @@ type vnextMappedDAXStorage struct {
 	mappingAlignment uint64
 	dirty            []vnextByteRange
 	writeback        func([]byte) error
-	ownedFile        bool
+	closeFile        func() error
 	regularFile      bool
+	unmapped         bool
 	closed           bool
+}
+
+// os.File.Close is terminal even when it reports an error: the Go runtime
+// invalidates its poll descriptor before returning. Mark that stage
+// separately so callers retry writeback/sync/munmap failures, but never call
+// the same file Close callback twice and replace the original diagnosis with
+// os.ErrClosed.
+type vnextTerminalFileCloseError struct {
+	cause error
+}
+
+func (err *vnextTerminalFileCloseError) Error() string {
+	return err.cause.Error()
+}
+
+func (err *vnextTerminalFileCloseError) Unwrap() error {
+	return err.cause
+}
+
+func isVNextTerminalFileCloseError(err error) bool {
+	var terminal *vnextTerminalFileCloseError
+	return errors.As(err, &terminal)
 }
 
 func newVNextMappedDAXStorage(
@@ -171,21 +194,24 @@ func newVNextMappedDAXStorage(
 		_ = unix.Munmap(mapped)
 		return nil, fmt.Errorf("stat mapped VNext storage: %w", err)
 	}
-	return &vnextMappedDAXStorage{
+	storage := &vnextMappedDAXStorage{
 		file:             file,
 		mapped:           mapped,
 		size:             size,
 		mappingAlignment: mappingAlignment,
 		writeback:        writeback,
-		ownedFile:        ownedFile,
 		regularFile:      stat.Mode().IsRegular(),
-	}, nil
+	}
+	if ownedFile {
+		storage.closeFile = file.Close
+	}
+	return storage, nil
 }
 
 func (s *vnextMappedDAXStorage) ReadAt(data []byte, offset int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || s.unmapped {
 		return 0, os.ErrClosed
 	}
 	if err := vnextValidateSignedStorageRange(s.size, offset, len(data), "read"); err != nil {
@@ -197,7 +223,7 @@ func (s *vnextMappedDAXStorage) ReadAt(data []byte, offset int64) (int, error) {
 func (s *vnextMappedDAXStorage) WriteAt(data []byte, offset int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || s.unmapped {
 		return 0, os.ErrClosed
 	}
 	if err := vnextValidateSignedStorageRange(s.size, offset, len(data), "write"); err != nil {
@@ -219,7 +245,7 @@ func (s *vnextMappedDAXStorage) WriteAt(data []byte, offset int64) (int, error) 
 func (s *vnextMappedDAXStorage) Sync() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
+	if s.closed || s.unmapped {
 		return os.ErrClosed
 	}
 	return s.syncLocked()
@@ -278,19 +304,28 @@ func (s *vnextMappedDAXStorage) Close() error {
 	if s.closed {
 		return nil
 	}
-	if err := s.syncLocked(); err != nil {
-		return err
+	if !s.unmapped {
+		if err := s.syncLocked(); err != nil {
+			return err
+		}
+		if err := unix.Munmap(s.mapped); err != nil {
+			return fmt.Errorf("unmap VNext DAX storage: %w", err)
+		}
+		s.unmapped = true
+		s.mapped = nil
+		s.dirty = nil
 	}
-	if err := unix.Munmap(s.mapped); err != nil {
-		return fmt.Errorf("unmap VNext DAX storage: %w", err)
-	}
-	s.closed = true
-	s.mapped = nil
-	if s.ownedFile {
-		if err := s.file.Close(); err != nil {
-			return fmt.Errorf("close VNext DAX device: %w", err)
+	if s.closeFile != nil {
+		closeFile := s.closeFile
+		s.closeFile = nil
+		err := closeFile()
+		s.closed = true
+		if err != nil {
+			return &vnextTerminalFileCloseError{cause: fmt.Errorf(
+				"close VNext DAX device: %w", err)}
 		}
 	}
+	s.closed = true
 	return nil
 }
 
@@ -303,17 +338,24 @@ func (s *vnextMappedDAXStorage) discardAndClose() error {
 	if s.closed {
 		return nil
 	}
-	if err := unix.Munmap(s.mapped); err != nil {
-		return fmt.Errorf("unmap failed VNext DAX storage: %w", err)
+	if !s.unmapped {
+		if err := unix.Munmap(s.mapped); err != nil {
+			return fmt.Errorf("unmap failed VNext DAX storage: %w", err)
+		}
+		s.unmapped = true
+		s.mapped = nil
+		s.dirty = nil
 	}
-	s.closed = true
-	s.mapped = nil
-	s.dirty = nil
-	if s.ownedFile {
-		if err := s.file.Close(); err != nil {
+	if s.closeFile != nil {
+		closeFile := s.closeFile
+		s.closeFile = nil
+		err := closeFile()
+		s.closed = true
+		if err != nil {
 			return fmt.Errorf("close failed VNext DAX device: %w", err)
 		}
 	}
+	s.closed = true
 	return nil
 }
 

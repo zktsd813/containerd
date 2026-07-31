@@ -153,6 +153,36 @@ func TestVNextMappedDAXStorageWritebackFailureIsFailClosed(t *testing.T) {
 	}
 }
 
+func TestVNextMappedDAXStorageTreatsOwnedFileCloseAsExactlyOnceTerminal(t *testing.T) {
+	_, storage := newTestVNextMappedStorage(
+		t,
+		2*vnextContentPageSize,
+		func([]byte) error { return nil })
+	closeAttempts := 0
+	closeFailure := errors.New("injected owned-file close failure")
+	storage.closeFile = func() error {
+		closeAttempts++
+		return closeFailure
+	}
+	if err := storage.Close(); !errors.Is(err, closeFailure) {
+		t.Fatal("first owned-file close failure was hidden")
+	}
+	if !storage.closed || !storage.unmapped || closeAttempts != 1 {
+		t.Fatalf("terminal close state is wrong: closed=%v unmapped=%v attempts=%d",
+			storage.closed, storage.unmapped, closeAttempts)
+	}
+	if _, err := storage.ReadAt(make([]byte, 1), 0); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("unmapped storage remained readable after failed file close: %v", err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatalf("idempotent close after terminal file-close error: %v", err)
+	}
+	if !storage.closed || closeAttempts != 1 {
+		t.Fatalf("terminal file close was called again: closed=%v attempts=%d",
+			storage.closed, closeAttempts)
+	}
+}
+
 func TestVNextMappedDAXPersistentDeviceRestartAndABRecovery(t *testing.T) {
 	const capacity = 4 << 20
 	file, storage := newTestVNextMappedStorage(
