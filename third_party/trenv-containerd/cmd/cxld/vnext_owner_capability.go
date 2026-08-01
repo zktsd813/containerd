@@ -18,10 +18,12 @@ import (
 // mapping; physical CXL access revocation is a separate platform mechanism.
 
 var (
-	errVNextProducerCapabilityConflict = errors.New("VNext Producer capability request conflicts with durable state")
-	errVNextProducerCapabilityDenied   = errors.New("VNext Producer capability does not authorize this operation")
-	errVNextProducerCapabilityExpired  = errors.New("VNext Producer capability has expired")
-	errVNextProducerCapabilityRevoked  = errors.New("VNext Producer capability is revoked")
+	errVNextProducerCapabilityConflict            = errors.New("VNext Producer capability request conflicts with durable state")
+	errVNextProducerCapabilityDenied              = errors.New("VNext Producer capability does not authorize this operation")
+	errVNextProducerCapabilityExpired             = errors.New("VNext Producer capability has expired")
+	errVNextProducerCapabilityRevoked             = errors.New("VNext Producer capability is revoked")
+	errVNextProducerCapabilityTransactionNotFound = errors.New(
+		"VNext Producer capability allocation does not exist")
 )
 
 const (
@@ -83,6 +85,62 @@ type vnextOwnerIssueProducerCapabilityResponse struct {
 	ExpiresAtUnixNano uint64
 	Replayed          bool
 	SchedulerProof    vnextOwnerSchedulerProof
+}
+
+type vnextOwnerProducerCapabilityIssueStatus string
+
+const (
+	vnextOwnerProducerCapabilityIssueNotFound vnextOwnerProducerCapabilityIssueStatus = "NOT_FOUND"
+	vnextOwnerProducerCapabilityIssueIssued   vnextOwnerProducerCapabilityIssueStatus = "ISSUED"
+	vnextOwnerProducerCapabilityIssueRevoked  vnextOwnerProducerCapabilityIssueStatus = "REVOKED"
+	vnextOwnerProducerCapabilityIssueConflict vnextOwnerProducerCapabilityIssueStatus = "CONFLICT"
+)
+
+func (status vnextOwnerProducerCapabilityIssueStatus) valid() bool {
+	switch status {
+	case vnextOwnerProducerCapabilityIssueNotFound,
+		vnextOwnerProducerCapabilityIssueIssued,
+		vnextOwnerProducerCapabilityIssueRevoked,
+		vnextOwnerProducerCapabilityIssueConflict:
+		return true
+	default:
+		return false
+	}
+}
+
+// vnextOwnerProducerCapabilityIssueStatusAndFenceRequest names one exact
+// durable Issue attempt. ExpectedIssueCreateRevision is separately bound into
+// the current signed mutation so the Owner can distinguish a same-term
+// observation from a newer-term fence without receiving bearer material.
+type vnextOwnerProducerCapabilityIssueStatusAndFenceRequest struct {
+	RequestID                   string
+	Operation                   vnextOwnerOperationIdentity
+	ExpectedIssueRequestID      string
+	ExpectedIssueSchedulerProof vnextOwnerSchedulerProof
+	ExpectedIssueCreateRevision uint64
+	SchedulerAuthority          vnextOwnerSchedulerAuthority
+}
+
+// vnextOwnerProducerCapabilityStatus is intentionally public metadata only.
+// It must never grow a nonce, bearer token, token digest, scope digest, or
+// Issue request digest field.
+type vnextOwnerProducerCapabilityStatus struct {
+	CapabilityID      string
+	IssuedAtUnixNano  uint64
+	ExpiresAtUnixNano uint64
+	RevokedAtUnixNano uint64
+}
+
+type vnextOwnerProducerCapabilityIssueStatusAndFenceResponse struct {
+	RequestID           string
+	Operation           vnextOwnerOperationIdentity
+	State               vnextOwnerProducerCapabilityIssueStatus
+	ReplacementEligible bool
+	AdmissionState      vnextOwnerAdmissionState
+	AdmissionSequence   uint64
+	SnapshotSequence    uint64
+	FenceCreateRevision uint64
+	Capability          *vnextOwnerProducerCapabilityStatus
 }
 
 type vnextOwnerRevokeProducerCapabilityRequest struct {
@@ -211,6 +269,58 @@ func validateVNextOwnerIssueProducerCapabilityRequest(
 		return errors.New("Producer capability nonce is zero")
 	}
 	return nil
+}
+
+func validateVNextOwnerProducerCapabilityIssueStatusAndFenceRequest(
+	request vnextOwnerProducerCapabilityIssueStatusAndFenceRequest,
+) error {
+	if request.RequestID == "" || len(request.RequestID) > vnextMaxIdentityBytes {
+		return errors.New("Producer capability Issue status-and-fence request ID is empty or too long")
+	}
+	if err := validateVNextOwnerClientOperationIdentity(request.Operation); err != nil {
+		return fmt.Errorf("Producer capability Issue status allocation identity: %w", err)
+	}
+	if request.ExpectedIssueRequestID == "" ||
+		len(request.ExpectedIssueRequestID) > vnextMaxIdentityBytes {
+		return errors.New("expected Producer capability Issue request ID is empty or too long")
+	}
+	if !request.ExpectedIssueSchedulerProof.valid() {
+		return errors.New("expected Producer capability Issue Scheduler proof is incomplete")
+	}
+	if request.ExpectedIssueCreateRevision == 0 ||
+		request.ExpectedIssueCreateRevision > uint64(math.MaxInt64) {
+		return errors.New("expected Producer capability Issue create revision is outside the signed ABI")
+	}
+	return nil
+}
+
+func validateVNextOwnerProducerCapabilityIssueFenceTerm(
+	request vnextOwnerProducerCapabilityIssueStatusAndFenceRequest,
+	verified vnextOwnerSchedulerVerifiedAuthority,
+) (bool, error) {
+	currentRevision := verified.Parsed.CreateRevision
+	expectedRevision := request.ExpectedIssueCreateRevision
+	currentTerm := verified.Parsed.TermID
+	expectedTerm := request.ExpectedIssueSchedulerProof.TermID
+	if currentRevision < expectedRevision {
+		return false, fmt.Errorf(
+			"status-and-fence Scheduler revision %d precedes expected Issue revision %d: %w",
+			currentRevision, expectedRevision, errVNextOwnerSchedulerFenced)
+	}
+	if currentRevision == expectedRevision {
+		if currentTerm != expectedTerm {
+			return false, fmt.Errorf(
+				"same Scheduler revision has a different expected Issue term: %w",
+				errVNextOwnerSchedulerAuthority)
+		}
+		return false, nil
+	}
+	if currentTerm == expectedTerm {
+		return false, fmt.Errorf(
+			"newer Scheduler revision reuses the expected Issue term ID: %w",
+			errVNextOwnerSchedulerAuthority)
+	}
+	return true, nil
 }
 
 func vnextProducerCapabilityScopeDigest(
@@ -436,6 +546,100 @@ func (group *vnextOwnerGroup) issueProducerCapabilityWithScheduler(
 			"persist Producer capability issuance: %w", err))
 	}
 	return record, false, nil
+}
+
+// producerCapabilityIssueStatusAndFenceWithScheduler atomically observes one
+// exact Issue attempt and advances the Owner-wide durable Scheduler term
+// before returning. It deliberately persists no per-query receipt: the
+// journal's existing SchedulerHighWater is the durable fence, while the
+// returned SnapshotSequence identifies the committed observation point.
+func (group *vnextOwnerGroup) producerCapabilityIssueStatusAndFenceWithScheduler(
+	request vnextOwnerProducerCapabilityIssueStatusAndFenceRequest,
+	replacementEligible bool,
+	authority *vnextOwnerSchedulerVerifiedAuthority,
+) (vnextOwnerProducerCapabilityIssueStatusAndFenceResponse, error) {
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	if err := group.checkUsableLocked(); err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, err
+	}
+	if group.journal == nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{},
+			group.poisonLocked(errors.New("Producer capability Issue status journal is unavailable"))
+	}
+	if err := group.journal.validate(group.devices); err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{},
+			group.poisonLocked(fmt.Errorf(
+				"validate Producer capability Issue status journal: %w", err))
+	}
+	if err := validateVNextOwnerVerifiedSchedulerAuthority(authority); err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, err
+	}
+	if err := validateVNextOwnerProducerCapabilityIssueStatusAndFenceRequest(request); err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, err
+	}
+	if request.Operation.OwnerID != group.ownerID ||
+		request.Operation.OwnerEpoch != group.ownerEpoch {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, errVNextAuthority
+	}
+	transaction := group.journal.Transactions[request.Operation.AllocationRecordID]
+	if transaction == nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{},
+			errVNextProducerCapabilityTransactionNotFound
+	}
+	if transaction.RequestID != request.Operation.RequestID ||
+		transaction.CheckpointID != request.Operation.CheckpointID ||
+		transaction.ProducerID != request.Operation.ProducerID {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, errVNextAuthority
+	}
+	if transaction.State != vnextOwnerGranted {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, fmt.Errorf(
+			"Owner allocation %d is state %d: %w",
+			transaction.AllocationRecordID, transaction.State, errVNextInvalidState)
+	}
+
+	response := vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{
+		RequestID:           request.RequestID,
+		Operation:           request.Operation,
+		ReplacementEligible: false,
+		AdmissionState:      group.journal.AdmissionState,
+		AdmissionSequence:   group.journal.AdmissionSequence,
+		FenceCreateRevision: authority.Parsed.CreateRevision,
+	}
+	record := transaction.ProducerCapability
+	switch {
+	case record == nil:
+		response.State = vnextOwnerProducerCapabilityIssueNotFound
+		response.ReplacementEligible = replacementEligible
+	case record.IssueRequestID != request.ExpectedIssueRequestID ||
+		record.IssueSchedulerProof != request.ExpectedIssueSchedulerProof:
+		response.State = vnextOwnerProducerCapabilityIssueConflict
+	default:
+		response.State = vnextOwnerProducerCapabilityIssueIssued
+		if record.Revoked {
+			response.State = vnextOwnerProducerCapabilityIssueRevoked
+		}
+		response.Capability = &vnextOwnerProducerCapabilityStatus{
+			CapabilityID:      record.CapabilityID,
+			IssuedAtUnixNano:  record.IssuedAtUnixNano,
+			ExpiresAtUnixNano: record.ExpiresAtUnixNano,
+			RevokedAtUnixNano: record.RevokedAtUnixNano,
+		}
+	}
+
+	candidate := group.journal.clone()
+	if err := group.applySchedulerAuthorityLocked(candidate, authority); err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, err
+	}
+	if candidate.SchedulerHighWater != group.journal.SchedulerHighWater {
+		if err := group.persistJournalLocked(candidate); err != nil {
+			return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{},
+				group.poisonLocked(fmt.Errorf(
+					"persist Producer capability Issue status fence: %w", err))
+		}
+	}
+	response.SnapshotSequence = group.journal.SnapshotSequence
+	return response, nil
 }
 
 func (group *vnextOwnerGroup) revokeProducerCapabilityWithScheduler(

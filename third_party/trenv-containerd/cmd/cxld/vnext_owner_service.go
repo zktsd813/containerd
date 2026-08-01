@@ -567,6 +567,64 @@ func (service *vnextOwnerService) issueProducerCapabilityScheduler(
 	}, nil
 }
 
+func (service *vnextOwnerService) producerCapabilityIssueStatusAndFenceScheduler(
+	request vnextOwnerProducerCapabilityIssueStatusAndFenceRequest,
+	caller vnextOwnerCallerContext,
+) (vnextOwnerProducerCapabilityIssueStatusAndFenceResponse, error) {
+	const operation = "producer-capability-issue-status-and-fence"
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if err := caller.validate(); err != nil || caller.Role != vnextOwnerCallerScheduler {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{},
+			vnextOwnerServiceFailure(
+				operation, vnextOwnerServicePermissionDenied,
+				"only an authenticated Scheduler may resolve Producer capability Issue status", err)
+	}
+	if err := validateVNextOwnerProducerCapabilityIssueStatusAndFenceRequest(request); err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{},
+			vnextOwnerServiceFailure(
+				operation, vnextOwnerServiceInvalidRequest, err.Error(), err)
+	}
+	verified, err := service.prepareSchedulerMutation(
+		vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence,
+		request,
+		request.SchedulerAuthority)
+	if err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, err
+	}
+	replacementEligible, err := validateVNextOwnerProducerCapabilityIssueFenceTerm(
+		request, verified)
+	if err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{},
+			vnextOwnerServiceWrap(operation, err)
+	}
+	// Absence must never use the normal exact-receipt shortcut. Every query
+	// establishes a fresh linearizable current-term point before it can advance
+	// the Owner's durable high-water and report NOT_FOUND.
+	if err := service.verifyCurrentSchedulerMutation(operation, verified); err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, err
+	}
+	response, err := service.group.producerCapabilityIssueStatusAndFenceWithScheduler(
+		request, replacementEligible, &verified)
+	if err != nil {
+		if errors.Is(err, errVNextProducerCapabilityTransactionNotFound) {
+			return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{},
+				vnextOwnerServiceFailure(
+					operation, vnextOwnerServiceTransactionNotFound,
+					"allocation record does not exist", err)
+		}
+		if errors.Is(err, errVNextOwnerPoisoned) || errors.Is(err, errVNextCorrupt) {
+			return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{},
+				vnextOwnerServiceFailure(
+					operation, vnextOwnerServiceUnavailable,
+					"Owner control journal is unavailable", err)
+		}
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{},
+			vnextOwnerServiceWrap(operation, err)
+	}
+	return response, nil
+}
+
 func (service *vnextOwnerService) revokeProducerCapabilityScheduler(
 	request vnextOwnerRevokeProducerCapabilityRequest,
 	caller vnextOwnerCallerContext,

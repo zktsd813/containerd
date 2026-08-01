@@ -10,6 +10,7 @@ func vnextOwnerAuthorizedTestRole(operation string) vnextOwnerCallerRole {
 		return vnextOwnerCallerProducer
 	case vnextOwnerRPCOperationReserve,
 		vnextOwnerRPCOperationIssueProducerCapability,
+		vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence,
 		vnextOwnerRPCOperationRevokeProducerCapability,
 		vnextOwnerRPCOperationCommit,
 		vnextOwnerRPCOperationAbort,
@@ -49,6 +50,7 @@ func TestVNextOwnerAuthorizationPolicyIsFailClosed(t *testing.T) {
 		{vnextOwnerCallerScheduler, vnextOwnerRPCOperationCommit, true},
 		{vnextOwnerCallerScheduler, vnextOwnerRPCOperationAbort, true},
 		{vnextOwnerCallerScheduler, vnextOwnerRPCOperationIssueProducerCapability, true},
+		{vnextOwnerCallerScheduler, vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence, true},
 		{vnextOwnerCallerScheduler, vnextOwnerRPCOperationRevokeProducerCapability, true},
 		{vnextOwnerCallerScheduler, vnextOwnerRPCOperationSeal, false},
 		{vnextOwnerCallerProducer, vnextOwnerRPCOperationSeal, true},
@@ -56,6 +58,7 @@ func TestVNextOwnerAuthorizationPolicyIsFailClosed(t *testing.T) {
 		{vnextOwnerCallerProducer, vnextOwnerRPCOperationAbort, false},
 		{vnextOwnerCallerProducer, vnextOwnerRPCOperationCommit, false},
 		{vnextOwnerCallerProducer, vnextOwnerRPCOperationReserve, false},
+		{vnextOwnerCallerProducer, vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence, false},
 		{vnextOwnerCallerReader, vnextOwnerRPCOperationSeal, false},
 		{vnextOwnerCallerReader, vnextOwnerRPCOperationInventory, false},
 		{vnextOwnerCallerUnknown, vnextOwnerRPCOperationAbort, false},

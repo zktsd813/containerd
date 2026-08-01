@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	vnextOwnerSchedulerAuthorityProtocol = "cxld.vnext-owner.v4"
+	vnextOwnerSchedulerAuthorityProtocol = "cxld.vnext-owner.v5"
 	vnextOwnerSchedulerLeaderValuePrefix = "cxld-scheduler-leader-v1"
 	vnextOwnerSchedulerLeaderKeySuffix   = "/cxl-checkpoint/global-orchestrator-leader"
 
@@ -359,6 +359,19 @@ func vnextOwnerSchedulerMutationDigest(
 		vnextWriteU32(&buffer, uint32(request.AllowedOperations))
 		vnextWriteU64(&buffer, request.RequestedTTLMillis)
 		buffer.Write(request.Nonce[:])
+	case vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence:
+		request, ok := mutation.(vnextOwnerProducerCapabilityIssueStatusAndFenceRequest)
+		if !ok {
+			return zero, errors.New(
+				"Scheduler ProducerCapabilityIssueStatusAndFence mutation has the wrong type")
+		}
+		vnextWriteString(&buffer, request.RequestID)
+		vnextWriteOwnerSchedulerOperationIdentity(&buffer, request.Operation)
+		vnextWriteString(&buffer, request.ExpectedIssueRequestID)
+		buffer.Write(request.ExpectedIssueSchedulerProof.TermID[:])
+		buffer.Write(request.ExpectedIssueSchedulerProof.MutationDigest[:])
+		buffer.Write(request.ExpectedIssueSchedulerProof.Receipt[:])
+		vnextWriteU64(&buffer, request.ExpectedIssueCreateRevision)
 	case vnextOwnerRPCOperationRevokeProducerCapability:
 		request, ok := mutation.(vnextOwnerRevokeProducerCapabilityRequest)
 		if !ok {

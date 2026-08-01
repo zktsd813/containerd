@@ -25,7 +25,7 @@ import (
 //
 // The transport is responsible for encoding daemonRequest into the bounded
 // daemon frame and decoding its outer execResponse. This client owns the
-// cxld.vnext-owner.v4 operation payload and response contracts inside those
+// cxld.vnext-owner.v5 operation payload and response contracts inside those
 // envelopes.
 type vnextOwnerClientRoundTripper interface {
 	RoundTrip(context.Context, daemonRequest) (execResponse, error)
@@ -606,6 +606,140 @@ func (client *vnextOwnerClient) IssueProducerCapability(
 		Replayed:          decoded.Replayed,
 		SchedulerProof:    schedulerProof,
 	}, nil
+}
+
+func (client *vnextOwnerClient) ProducerCapabilityIssueStatusAndFence(
+	ctx context.Context,
+	request vnextOwnerProducerCapabilityIssueStatusAndFenceRequest,
+) (vnextOwnerProducerCapabilityIssueStatusAndFenceResponse, error) {
+	if client == nil || client.transport == nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, errors.New(
+			"VNext Owner client is unavailable")
+	}
+	if err := validateVNextOwnerProducerCapabilityIssueStatusAndFenceRequest(request); err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, err
+	}
+	currentProof, err := vnextOwnerSchedulerExpectedProof(
+		vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence,
+		request,
+		request.SchedulerAuthority)
+	if err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, fmt.Errorf(
+			"derive Producer capability Issue status-and-fence Scheduler proof: %w", err)
+	}
+	if request.SchedulerAuthority.CreateRevision < request.ExpectedIssueCreateRevision ||
+		(request.SchedulerAuthority.CreateRevision == request.ExpectedIssueCreateRevision &&
+			currentProof.TermID != request.ExpectedIssueSchedulerProof.TermID) ||
+		(request.SchedulerAuthority.CreateRevision > request.ExpectedIssueCreateRevision &&
+			currentProof.TermID == request.ExpectedIssueSchedulerProof.TermID) {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, errors.New(
+			"Producer capability Issue status-and-fence term relation is invalid")
+	}
+	expectedIssueProof, err := vnextOwnerRPCSchedulerProofWire(
+		request.ExpectedIssueSchedulerProof)
+	if err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, err
+	}
+	wire := vnextOwnerRPCProducerCapabilityIssueStatusAndFenceRequest{
+		Protocol:                    vnextOwnerRPCProtocol,
+		RequestID:                   request.RequestID,
+		Identity:                    vnextOwnerRPCIdentityFromInternal(request.Operation),
+		ExpectedIssueRequestID:      request.ExpectedIssueRequestID,
+		ExpectedIssueSchedulerProof: expectedIssueProof,
+		ExpectedIssueCreateRevision: request.ExpectedIssueCreateRevision,
+		SchedulerAuthority:          request.SchedulerAuthority,
+	}
+	raw, err := marshalVNextOwnerClientPayload(wire)
+	if err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, err
+	}
+	response, err := client.roundTrip(
+		ctx,
+		vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence,
+		daemonRequest{VNextOwnerCapabilityIssueStatusFence: raw})
+	if err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, err
+	}
+	var decoded vnextOwnerRPCProducerCapabilityIssueStatusAndFenceResponse
+	if err := decodeVNextOwnerClientSuccess(
+		response,
+		vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence,
+		&decoded); err != nil {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, err
+	}
+	return convertVNextOwnerClientProducerCapabilityIssueStatusAndFenceResponse(
+		request, decoded)
+}
+
+func convertVNextOwnerClientProducerCapabilityIssueStatusAndFenceResponse(
+	request vnextOwnerProducerCapabilityIssueStatusAndFenceRequest,
+	wire vnextOwnerRPCProducerCapabilityIssueStatusAndFenceResponse,
+) (vnextOwnerProducerCapabilityIssueStatusAndFenceResponse, error) {
+	state := vnextOwnerProducerCapabilityIssueStatus(wire.State)
+	admissionState, admissionOK := vnextOwnerRPCAdmissionState(wire.AdmissionState)
+	wantReplacementEligible := state == vnextOwnerProducerCapabilityIssueNotFound &&
+		request.SchedulerAuthority.CreateRevision > request.ExpectedIssueCreateRevision
+	if wire.Protocol != vnextOwnerRPCProtocol ||
+		wire.Operation != vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence ||
+		wire.RequestID != request.RequestID ||
+		wire.Identity.internal() != request.Operation ||
+		!state.valid() || !admissionOK || wire.AdmissionSequence == 0 ||
+		wire.AdmissionSequence > uint64(math.MaxInt64) || wire.SnapshotSequence == 0 ||
+		wire.SnapshotSequence > uint64(math.MaxInt64) ||
+		validateVNextOwnerAdmissionHeadPair(admissionState, wire.AdmissionSequence) != nil ||
+		wire.FenceCreateRevision != request.SchedulerAuthority.CreateRevision ||
+		wire.ReplacementEligible != wantReplacementEligible {
+		return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, errors.New(
+			"Producer capability Issue status-and-fence response does not match the exact request")
+	}
+	result := vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{
+		RequestID:           wire.RequestID,
+		Operation:           wire.Identity.internal(),
+		State:               state,
+		ReplacementEligible: wire.ReplacementEligible,
+		AdmissionState:      admissionState,
+		AdmissionSequence:   wire.AdmissionSequence,
+		SnapshotSequence:    wire.SnapshotSequence,
+		FenceCreateRevision: wire.FenceCreateRevision,
+	}
+	switch state {
+	case vnextOwnerProducerCapabilityIssueNotFound,
+		vnextOwnerProducerCapabilityIssueConflict:
+		if wire.HasCapability || wire.Capability != (vnextOwnerRPCProducerCapabilityStatus{}) {
+			return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, errors.New(
+				"Producer capability absence/conflict response exposed capability metadata")
+		}
+	case vnextOwnerProducerCapabilityIssueIssued,
+		vnextOwnerProducerCapabilityIssueRevoked:
+		capability := wire.Capability
+		if !wire.HasCapability ||
+			validateVNextProducerCapabilityID(capability.CapabilityID) != nil ||
+			capability.IssuedAtUnixNano == 0 ||
+			capability.IssuedAtUnixNano > uint64(math.MaxInt64) ||
+			capability.ExpiresAtUnixNano <= capability.IssuedAtUnixNano ||
+			capability.ExpiresAtUnixNano > uint64(math.MaxInt64) ||
+			capability.ExpiresAtUnixNano-capability.IssuedAtUnixNano <
+				uint64(time.Millisecond) ||
+			(capability.ExpiresAtUnixNano-capability.IssuedAtUnixNano)%
+				uint64(time.Millisecond) != 0 ||
+			capability.ExpiresAtUnixNano-capability.IssuedAtUnixNano >
+				uint64(vnextProducerCapabilityMaxLifetime) ||
+			(state == vnextOwnerProducerCapabilityIssueIssued &&
+				capability.RevokedAtUnixNano != 0) ||
+			(state == vnextOwnerProducerCapabilityIssueRevoked &&
+				(capability.RevokedAtUnixNano < capability.IssuedAtUnixNano ||
+					capability.RevokedAtUnixNano > uint64(math.MaxInt64))) {
+			return vnextOwnerProducerCapabilityIssueStatusAndFenceResponse{}, errors.New(
+				"Producer capability Issue status contains invalid public capability metadata")
+		}
+		result.Capability = &vnextOwnerProducerCapabilityStatus{
+			CapabilityID:      capability.CapabilityID,
+			IssuedAtUnixNano:  capability.IssuedAtUnixNano,
+			ExpiresAtUnixNano: capability.ExpiresAtUnixNano,
+			RevokedAtUnixNano: capability.RevokedAtUnixNano,
+		}
+	}
+	return result, nil
 }
 
 func (client *vnextOwnerClient) RevokeProducerCapability(

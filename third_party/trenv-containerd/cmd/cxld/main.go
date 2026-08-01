@@ -48,27 +48,28 @@ var (
 )
 
 type daemonRequest struct {
-	CommandLabel                       string                    `json:"commandLabel"`
-	TimeoutMillis                      int64                     `json:"timeoutMillis"`
-	Operation                          string                    `json:"operation"`
-	CreateContainer                    *createContainerRequest   `json:"createContainer,omitempty"`
-	Checkpoint                         *checkpointRequest        `json:"checkpointContainer,omitempty"`
-	Restore                            *switchRequest            `json:"restoreIntoContainer,omitempty"`
-	Switch                             *switchRequest            `json:"switchIntoCandidate,omitempty"`
-	Container                          *containerRequest         `json:"container,omitempty"`
-	Cleanup                            *cleanupContainersRequest `json:"cleanupContainers,omitempty"`
-	MetadataResolve                    *metadataResolveRequest   `json:"metadataResolve,omitempty"`
-	VNextOwnerReserve                  json.RawMessage           `json:"vnextOwnerReserve,omitempty"`
-	VNextOwnerIssueProducerCapability  json.RawMessage           `json:"vnextOwnerIssueProducerCapability,omitempty"`
-	VNextOwnerRevokeProducerCapability json.RawMessage           `json:"vnextOwnerRevokeProducerCapability,omitempty"`
-	VNextOwnerSeal                     json.RawMessage           `json:"vnextOwnerSeal,omitempty"`
-	VNextOwnerProducerAbort            json.RawMessage           `json:"vnextOwnerProducerAbort,omitempty"`
-	VNextOwnerCommit                   json.RawMessage           `json:"vnextOwnerCommit,omitempty"`
-	VNextOwnerAbort                    json.RawMessage           `json:"vnextOwnerAbort,omitempty"`
-	VNextOwnerInventory                json.RawMessage           `json:"vnextOwnerInventory,omitempty"`
-	VNextOwnerReservationStatus        json.RawMessage           `json:"vnextOwnerReservationStatus,omitempty"`
-	VNextOwnerSetAdmission             json.RawMessage           `json:"vnextOwnerSetAdmission,omitempty"`
-	VNextOwnerAdmissionStatus          json.RawMessage           `json:"vnextOwnerAdmissionStatus,omitempty"`
+	CommandLabel                         string                    `json:"commandLabel"`
+	TimeoutMillis                        int64                     `json:"timeoutMillis"`
+	Operation                            string                    `json:"operation"`
+	CreateContainer                      *createContainerRequest   `json:"createContainer,omitempty"`
+	Checkpoint                           *checkpointRequest        `json:"checkpointContainer,omitempty"`
+	Restore                              *switchRequest            `json:"restoreIntoContainer,omitempty"`
+	Switch                               *switchRequest            `json:"switchIntoCandidate,omitempty"`
+	Container                            *containerRequest         `json:"container,omitempty"`
+	Cleanup                              *cleanupContainersRequest `json:"cleanupContainers,omitempty"`
+	MetadataResolve                      *metadataResolveRequest   `json:"metadataResolve,omitempty"`
+	VNextOwnerReserve                    json.RawMessage           `json:"vnextOwnerReserve,omitempty"`
+	VNextOwnerIssueProducerCapability    json.RawMessage           `json:"vnextOwnerIssueProducerCapability,omitempty"`
+	VNextOwnerCapabilityIssueStatusFence json.RawMessage           `json:"vnextOwnerProducerCapabilityIssueStatusAndFence,omitempty"`
+	VNextOwnerRevokeProducerCapability   json.RawMessage           `json:"vnextOwnerRevokeProducerCapability,omitempty"`
+	VNextOwnerSeal                       json.RawMessage           `json:"vnextOwnerSeal,omitempty"`
+	VNextOwnerProducerAbort              json.RawMessage           `json:"vnextOwnerProducerAbort,omitempty"`
+	VNextOwnerCommit                     json.RawMessage           `json:"vnextOwnerCommit,omitempty"`
+	VNextOwnerAbort                      json.RawMessage           `json:"vnextOwnerAbort,omitempty"`
+	VNextOwnerInventory                  json.RawMessage           `json:"vnextOwnerInventory,omitempty"`
+	VNextOwnerReservationStatus          json.RawMessage           `json:"vnextOwnerReservationStatus,omitempty"`
+	VNextOwnerSetAdmission               json.RawMessage           `json:"vnextOwnerSetAdmission,omitempty"`
+	VNextOwnerAdmissionStatus            json.RawMessage           `json:"vnextOwnerAdmissionStatus,omitempty"`
 }
 
 // A structured checkpoint request is preferred over allowing the invoker to
@@ -460,6 +461,7 @@ func runCommandWithVNextOwnerBoundaryCaller(
 		return runMetadataResolveRequest(*req.MetadataResolve, req.TimeoutMillis, activeConfig)
 	case vnextOwnerRPCOperationReserve,
 		vnextOwnerRPCOperationIssueProducerCapability,
+		vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence,
 		vnextOwnerRPCOperationRevokeProducerCapability,
 		vnextOwnerRPCOperationSeal,
 		vnextOwnerRPCOperationProducerAbort,

@@ -112,10 +112,10 @@ func TestVNextOwnerSchedulerCanonicalGolden(t *testing.T) {
 	authority, verified := vnextOwnerSchedulerTestAuthority(
 		t, vnextOwnerRPCOperationReserve, mutation)
 	const wantLeaderValue = "cxld-scheduler-leader-v1:c2NoZWR1bGVyL3Rlc3QtYQ:01a2b3c4d5e6f708:oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8:MCowBQYDK2VwAyEAebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ"
-	const wantTermID = "f2779101ff9c44c87d5ecb872b01bd48e426c59f109da3e36fa393cb9b70f44b"
-	const wantMutationDigest = "83881e322d39fe5af7e182c1f4c874ca8ce144ef63864ae06dbeaa78343ed41b"
-	const wantSignature = "CXWLLzwTz5dDrBA3Xrlpw-cpOKupsCEkfwz_h68Yhn3s_Ogbc2TCcrZhWgiTTQegNd8K1DUQy6tZAwo8-J7dBg"
-	const wantReceipt = "be4253fc65a4418084664c6c3839ccacacc5d8cc387d0a03fcec0f3037be3e33"
+	const wantTermID = "fb5b8daad8459394988e90ad1fa291e9d9f2809692a9bcaece4f83de13090a23"
+	const wantMutationDigest = "356d18e484d1b1ea755a24c07f94b72de050d1a7be99dbfade743e5f9ffd9a34"
+	const wantSignature = "VNxpRP6_s3KntcpdD7S150D6-eqvKKzZO6uLtPAbtxVMoz-e1a9zhJliJjopFOezN-3uYz_7t_0clxyYXrChDA"
+	const wantReceipt = "e3af062b83fbca3452c8ebbfca8b793b2a239453d6e155af084e84fa389d4f1d"
 	for name, values := range map[string][2]string{
 		"leader value":    {authority.LeaderValue, wantLeaderValue},
 		"term ID":         {authority.TermID, wantTermID},
@@ -231,6 +231,79 @@ func TestVNextOwnerSchedulerSignatureBindsEveryReserveField(t *testing.T) {
 	}
 }
 
+func TestVNextOwnerSchedulerStatusAndFenceDigestBindsEveryField(t *testing.T) {
+	var proof vnextOwnerSchedulerProof
+	for index := range proof.TermID {
+		proof.TermID[index] = byte(0x10 + index)
+		proof.MutationDigest[index] = byte(0x40 + index)
+		proof.Receipt[index] = byte(0x70 + index)
+	}
+	base := vnextOwnerProducerCapabilityIssueStatusAndFenceRequest{
+		RequestID: "status-digest-request",
+		Operation: vnextOwnerOperationIdentity{
+			RequestID: "reserve-request", CheckpointID: "checkpoint",
+			ProducerID: "producer", OwnerID: "owner", OwnerEpoch: 7,
+			AllocationRecordID: 11,
+		},
+		ExpectedIssueRequestID:      "issue-request",
+		ExpectedIssueSchedulerProof: proof,
+		ExpectedIssueCreateRevision: 37,
+	}
+	want, err := vnextOwnerSchedulerMutationDigest(
+		vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutations := map[string]func(*vnextOwnerProducerCapabilityIssueStatusAndFenceRequest){
+		"request ID": func(value *vnextOwnerProducerCapabilityIssueStatusAndFenceRequest) { value.RequestID += "-changed" },
+		"allocation request ID": func(value *vnextOwnerProducerCapabilityIssueStatusAndFenceRequest) {
+			value.Operation.RequestID += "-changed"
+		},
+		"checkpoint ID": func(value *vnextOwnerProducerCapabilityIssueStatusAndFenceRequest) {
+			value.Operation.CheckpointID += "-changed"
+		},
+		"producer ID": func(value *vnextOwnerProducerCapabilityIssueStatusAndFenceRequest) {
+			value.Operation.ProducerID += "-changed"
+		},
+		"Owner ID": func(value *vnextOwnerProducerCapabilityIssueStatusAndFenceRequest) {
+			value.Operation.OwnerID += "-changed"
+		},
+		"Owner epoch": func(value *vnextOwnerProducerCapabilityIssueStatusAndFenceRequest) { value.Operation.OwnerEpoch++ },
+		"allocation record ID": func(value *vnextOwnerProducerCapabilityIssueStatusAndFenceRequest) {
+			value.Operation.AllocationRecordID++
+		},
+		"expected Issue request ID": func(value *vnextOwnerProducerCapabilityIssueStatusAndFenceRequest) {
+			value.ExpectedIssueRequestID += "-changed"
+		},
+		"expected term ID": func(value *vnextOwnerProducerCapabilityIssueStatusAndFenceRequest) {
+			value.ExpectedIssueSchedulerProof.TermID[0]++
+		},
+		"expected mutation digest": func(value *vnextOwnerProducerCapabilityIssueStatusAndFenceRequest) {
+			value.ExpectedIssueSchedulerProof.MutationDigest[0]++
+		},
+		"expected receipt": func(value *vnextOwnerProducerCapabilityIssueStatusAndFenceRequest) {
+			value.ExpectedIssueSchedulerProof.Receipt[0]++
+		},
+		"expected create revision": func(value *vnextOwnerProducerCapabilityIssueStatusAndFenceRequest) {
+			value.ExpectedIssueCreateRevision++
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			changed := base
+			mutate(&changed)
+			got, err := vnextOwnerSchedulerMutationDigest(
+				vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence, changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == want {
+				t.Fatal("status-and-fence mutation digest ignored changed field")
+			}
+		})
+	}
+}
+
 func TestVNextOwnerSchedulerSignatureRejectsCrossOperationReplay(t *testing.T) {
 	identity := vnextOwnerOperationIdentity{
 		RequestID:          "reserve-1",
@@ -268,6 +341,12 @@ func TestVNextOwnerSchedulerAllMutationGoldens(t *testing.T) {
 	for index := range issueNonce {
 		issueNonce[index] = byte(0x40 + index)
 	}
+	var expectedIssueProof vnextOwnerSchedulerProof
+	for index := 0; index < vnextOwnerSchedulerDigestBytes; index++ {
+		expectedIssueProof.TermID[index] = byte(0x10 + index)
+		expectedIssueProof.MutationDigest[index] = byte(0x40 + index)
+		expectedIssueProof.Receipt[index] = byte(0x70 + index)
+	}
 	vectors := []struct {
 		name          string
 		operation     string
@@ -284,9 +363,9 @@ func TestVNextOwnerSchedulerAllMutationGoldens(t *testing.T) {
 				From: vnextOwnerAdmissionActive, Target: vnextOwnerAdmissionReadOnly,
 				ExpectedSequence: 1,
 			},
-			wantMutation:  "3be23b4c74a1dab0e1344232c11e0bc136d989239ca7ff2b327ad4e8440823f3",
-			wantSignature: "1knSm8ccExztszT-YpbDLoKpdC3T0XKyMVbozkM7bkQIP6rnkkZrG6phYgBjbZW5flmCJ2-As6HrkEuhDt5GBQ",
-			wantReceipt:   "e01aac66ce7f2af0122ce3d30d260d2bed33cb61d01786629fbf18ed19c598e8",
+			wantMutation:  "46fc00d4e99f7c3074f6b7b8e460c0522bc19cb356de1cece0cde5438a137e2a",
+			wantSignature: "NMSQp_YtloA5ZlBR3tbM1EgyxnyubmANXPa0uLEle1t1lsU31NNA7w5p9xMRsonZD0YBTGc8eZfbNOETb6rqDA",
+			wantReceipt:   "5a289f9fb366eaf46d0eecf4d56e15f815bd3c10447368a30c6861daa2391fa8",
 		},
 		{
 			name:      "reserve-all-content-kinds",
@@ -304,9 +383,9 @@ func TestVNextOwnerSchedulerAllMutationGoldens(t *testing.T) {
 					{Kind: vnextOwnerServiceContentPublication, ObjectID: 6, ByteLength: 4096, CapacityPages: 1},
 				},
 			},
-			wantMutation:  "f4734cdcd32afbd90029e9eb7e4c2e5d4ad1bfef46d66bcc4526875931f8c2df",
-			wantSignature: "fy5sZfn8GaLf0tKasUzKs2gTxhntVs8iJmmfAumo0VTH8MfEYQTdCJqprBoAcfLPrk3gafoN_DCH02b-7T6KBA",
-			wantReceipt:   "7d973e14322696f1fdea060f3ee127d8e164f25f85267e5b2c5e4e0caf269fa7",
+			wantMutation:  "8ad5a03cd8dac4fac826cb0a88fcc4bd6b8d53adbdd4b1f0ddfb35c4d7adc1eb",
+			wantSignature: "WYbrUpD8bfJniZKUKVPbZlaXK-apOTAuGLAh7WTCVG1JsA0kLiciuLsa3TQaeX2jj7TSGkzLSDlIQUR2JorcDw",
+			wantReceipt:   "6b5ddbd9f1293cd265fb9ab57966844dc43f488a350d831cdc2f4a8112042485",
 		},
 		{
 			name:      "issue",
@@ -317,9 +396,22 @@ func TestVNextOwnerSchedulerAllMutationGoldens(t *testing.T) {
 				AllowedOperations:  vnextProducerCapabilityAll,
 				RequestedTTLMillis: 60000, Nonce: issueNonce,
 			},
-			wantMutation:  "690771483b750759fbe4326a1ef21ae2047faa58475fa283f249bb6758c78a28",
-			wantSignature: "jD-ErP6QbzpXyDaiGraZFSFCnPckErKNBMmqPyURryVy6yHbu16cKh3a55SESBd_ffa2FfM4U4G8qwJrqrKoDQ",
-			wantReceipt:   "7df4073e4a7332224733ed60c698ef0d0f13db3009a4257e2568d021c8ce5c3d",
+			wantMutation:  "6c4ae6ee6e43ef4fa89e19bab364624b0920f1c3dd8f865179a196aefd0e67f9",
+			wantSignature: "wdxReHbQYseS4SQlEihR4cobtiin4A6zxkUU7JB04WRnDtrOev-Fu-zFJIfzFwv-D3U-5QcRXxoqdUl1WkTJDA",
+			wantReceipt:   "b93f09c9da41e72fd45af7eff131edbf27cd2922f55a2ddc1068bf9fc226e8b8",
+		},
+		{
+			name:      "producer-capability-issue-status-and-fence",
+			operation: vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence,
+			mutation: vnextOwnerProducerCapabilityIssueStatusAndFenceRequest{
+				RequestID: "capability-status-1", Operation: identity,
+				ExpectedIssueRequestID:      "capability-issue-1",
+				ExpectedIssueSchedulerProof: expectedIssueProof,
+				ExpectedIssueCreateRevision: 37,
+			},
+			wantMutation:  "df25531cf3c57e0ca95dcf8c74749eca34fba6e59941cd55018d9e935f25e8a6",
+			wantSignature: "vIf1Wybp5nH9e943NCUXDzMOL_o-lW_ZYsS4v7K0KAzUtxfDqb_CLBFknqxAEwo02JBZFL7ETyY7cCI0sMgjCA",
+			wantReceipt:   "15e4554a18292bbb0e6e63504ea0a7585d30d62de4ef6dd719d5767e4867fd52",
 		},
 		{
 			name:      "revoke",
@@ -328,18 +420,18 @@ func TestVNextOwnerSchedulerAllMutationGoldens(t *testing.T) {
 				RequestID: "capability-revoke-1", Operation: identity,
 				CapabilityID: "00112233445566778899aabbccddeeff",
 			},
-			wantMutation:  "5a545a0cc7b560970910ccc2e8873584c462d6bf932e38d595da9177d52e1de4",
-			wantSignature: "iyB2ao1_iF4eeoLAU_GMJd1-RkZ8K8ySho5crq2VTr_ORhIdLTWV0TrpmnHKE9nbOiwvu0VRcadKdrZZiSj8Cg",
-			wantReceipt:   "b48dbecad5dd91b69e417ddfcb308a8e5a8ec7363bb9c98ab5c6d56dec98cef4",
+			wantMutation:  "91c9cd2dd9a1d998b401f8c24aa71facf5a0cf8bab5a3e21a72ae0fbb1d36d1d",
+			wantSignature: "pvJJQj9vi7vXB_ipoC834mzgHFrklDFDwnOeGve_hGb9ONUZIEKm3EOU9CREJGHXfUVSPRk21l4SzPG0ZqgFDQ",
+			wantReceipt:   "d6d7a18160972d70f5a1c9250cf4f9af924cc40797fefccfd56947e169f7e799",
 		},
 		{name: "commit", operation: vnextOwnerRPCOperationCommit, mutation: identity,
-			wantMutation:  "9964ae82d2982e079921c72d1fb54ae22dd4d9e1ae6f00025d4263c7503545cc",
-			wantSignature: "4jHO5r5kUdT0obnruAOJPXL98ypdr_tFTqEG8A8MhrKlmvxC4zN1rl4j6agGQs0YRcVWl6RMtZS0Ti0jIfvsBw",
-			wantReceipt:   "e11fec32ddda622e8fef5063a1dbd44f2fd675169e67c513469dfbe028ce92b7"},
+			wantMutation:  "242aab3a158e7408b2c950495b01209654f75089e56081514aafe687896fd026",
+			wantSignature: "QoV6Oo_hPB28iDl94x_4zmJIXTtHpM4TSPnYlxphIvEhF8ZqmE2Q1yORWjR5hCoPL7Kn-6fMqUINYyVwTo-qAg",
+			wantReceipt:   "9c3647db0d2e8b8fb7843153f4005e803574bd54100c803887c5b032699a182c"},
 		{name: "abort", operation: vnextOwnerRPCOperationAbort, mutation: identity,
-			wantMutation:  "e784f3c6f3f0c14aac5ff03f0474ba20205c1f591b991e7cf08e5ac83407d7e4",
-			wantSignature: "bj-927bdF_r2blE_sW1gHaQaugsIbxiol-BMGp9jcx8Z45-Oytxq4ETDgvhlH0DsQMBWbL9uXkEYHuQwNzeDDA",
-			wantReceipt:   "2600cbe33d73f4f654be041c0b227a3626e95f5d09c97d6f1e3253e0e1abb43c"},
+			wantMutation:  "7c5ca4c24280f675a223e3f190086ad88d51bd724449164c0949316dde2df104",
+			wantSignature: "LK6mXcIbm1T7eKV2u4P6XEiYvW-H6wSY_J6H4is0jCUkzaB3qgVKAG2x6gWICLxGJHkNXWFbWo-g1xUuhNW4Bg",
+			wantReceipt:   "afa36a040bac9ab0b034e673a34308f2866345f6aaf00ebc241f7e7b6c2c3c11"},
 	}
 	for _, vector := range vectors {
 		t.Run(vector.name, func(t *testing.T) {
@@ -366,9 +458,9 @@ func TestVNextOwnerSchedulerHighBitClusterIsCanonicalUnsigned(t *testing.T) {
 	if authority.ClusterID != "fedcba9876543210" || verified.Parsed.ClusterID != clusterID {
 		t.Fatalf("high-bit cluster lost unsigned representation: %#v", verified.Parsed)
 	}
-	if authority.TermID != "7a79ba8fb2b0355e52189d242ac965620c1804996513782ce537f61d40a5acfa" ||
-		authority.Signature != "rOwyzw7gAgom9N6sm_6G2TE6nzPk5MUgpEvZ1I3cfyfwUmgzxgHQhCnwLXFWVmivHORIsXHsUZzNuIhlUBwyAA" ||
-		hex.EncodeToString(verified.Receipt[:]) != "10687bc1e256d322c08b348bc1a1469bf09773bddbb74909b915d4a9733c9b1d" {
+	if authority.TermID != "885654027306807936306b62c6dbd4bb02c3a692277e4b18a322e96d08e7c564" ||
+		authority.Signature != "q2REIJAwgy2XwA_Xs9evlm7aSWCpq72-sZwnXeoKBI_SdsHzDrcqSoUUpS8XOgKNGQwTvHabJ14YUY8kgQShAg" ||
+		hex.EncodeToString(verified.Receipt[:]) != "5cf8aad626d139c743f8d00498101cf1d83e202d7ff9d2c13d73d29084c290dd" {
 		t.Fatalf("high-bit cluster golden changed: %#v", authority)
 	}
 }

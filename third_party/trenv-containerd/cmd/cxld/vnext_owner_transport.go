@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	vnextOwnerTLSALPN             = "cxld-vnext-owner/5"
+	vnextOwnerTLSALPN             = "cxld-vnext-owner/6"
 	vnextOwnerTLSDialTimeout      = 10 * time.Second
 	vnextOwnerTLSHandshakeTimeout = 10 * time.Second
 	vnextOwnerTLSMaxHandshakes    = 32
@@ -58,7 +58,7 @@ type vnextOwnerTLSClientConfig struct {
 // remote transport. Every field is mandatory, including empty failure fields,
 // so the peer can reject missing, null, duplicate, unknown, and trailing JSON
 // instead of inheriting the looser legacy daemon response decoder. Per-stage
-// timing maps are intentionally not part of this bounded v4 transport.
+// timing maps are intentionally not part of this bounded v5 transport.
 type vnextOwnerTLSExecResponse struct {
 	OK             bool   `json:"ok"`
 	Stdout         string `json:"stdout"`

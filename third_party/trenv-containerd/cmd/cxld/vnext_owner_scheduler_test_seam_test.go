@@ -133,6 +133,13 @@ func vnextOwnerTestAuthorizeIssue(
 		vnextOwnerRPCOperationIssueProducerCapability, *request)
 }
 
+func vnextOwnerTestAuthorizeProducerCapabilityIssueStatusAndFence(
+	request *vnextOwnerProducerCapabilityIssueStatusAndFenceRequest,
+) {
+	request.SchedulerAuthority = vnextOwnerTestSchedulerAuthority(
+		vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence, *request)
+}
+
 func vnextOwnerTestAuthorizeRevoke(
 	request *vnextOwnerRevokeProducerCapabilityRequest,
 ) {

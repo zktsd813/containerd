@@ -70,6 +70,7 @@ func authorizeVNextOwnerOperation(
 		switch operation {
 		case vnextOwnerRPCOperationReserve,
 			vnextOwnerRPCOperationIssueProducerCapability,
+			vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence,
 			vnextOwnerRPCOperationRevokeProducerCapability,
 			vnextOwnerRPCOperationCommit,
 			vnextOwnerRPCOperationAbort,

@@ -405,7 +405,7 @@ func TestVNextOwnerClientInventoryRoundTripsExactReadOnlyRequest(t *testing.T) {
 	}
 }
 
-func TestVNextOwnerClientAdmissionV4RoundTripsExactStatusAndTransition(t *testing.T) {
+func TestVNextOwnerClientAdmissionV5RoundTripsExactStatusAndTransition(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
 		UUID: "client-admission", Size: 256 << 10,
 	}})
@@ -1186,7 +1186,7 @@ func TestVNextOwnerClientRejectsNonCanonicalResponses(t *testing.T) {
 		{
 			name: "duplicate-field",
 			mutate: func(raw []byte) []byte {
-				prefix := []byte(`{"protocol":"cxld.vnext-owner.v4",`)
+				prefix := []byte(`{"protocol":"cxld.vnext-owner.v5",`)
 				return append(prefix, raw[1:]...)
 			},
 		},
