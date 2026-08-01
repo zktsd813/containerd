@@ -74,6 +74,8 @@ func authorizeVNextOwnerOperation(
 			vnextOwnerRPCOperationRevokeProducerCapability,
 			vnextOwnerRPCOperationCommit,
 			vnextOwnerRPCOperationAbort,
+			vnextOwnerRPCOperationReclaim,
+			vnextOwnerRPCOperationReclaimStatusAndFence,
 			vnextOwnerRPCOperationInventory,
 			vnextOwnerRPCOperationReservationStatus,
 			vnextOwnerRPCOperationSetAdmission,

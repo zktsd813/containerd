@@ -518,12 +518,12 @@ func TestVNextOwnerRPCPriorGenerationAndMalformedAdmissionRequestsFailClosed(t *
 		`"expectedAdmissionSequence":1`
 	for name, raw := range map[string]string{
 		"v2":        `{"protocol":"cxld.vnext-owner.v2",` + base + `}`,
-		"unknown":   `{"protocol":"cxld.vnext-owner.v5",` + base + `,"extra":true}`,
-		"duplicate": `{"protocol":"cxld.vnext-owner.v5","requestId":"a",` + base + `}`,
-		"reopen": `{"protocol":"cxld.vnext-owner.v5","requestId":"reopen",` +
+		"unknown":   `{"protocol":"cxld.vnext-owner.v6",` + base + `,"extra":true}`,
+		"duplicate": `{"protocol":"cxld.vnext-owner.v6","requestId":"a",` + base + `}`,
+		"reopen": `{"protocol":"cxld.vnext-owner.v6","requestId":"reopen",` +
 			`"expectedOwnerId":"owner-0","expectedOwnerEpoch":7,` +
 			`"fromState":"READ_ONLY","targetState":"ACTIVE","expectedAdmissionSequence":2}`,
-		"impossible-sequence-state": `{"protocol":"cxld.vnext-owner.v5",` +
+		"impossible-sequence-state": `{"protocol":"cxld.vnext-owner.v6",` +
 			`"requestId":"impossible-sequence-state","expectedOwnerId":"owner-0",` +
 			`"expectedOwnerEpoch":7,"fromState":"ACTIVE","targetState":"FENCED",` +
 			`"expectedAdmissionSequence":2}`,
@@ -786,7 +786,7 @@ func TestVNextOwnerRPCStrictlyRejectsUnknownAndTrailingJSON(t *testing.T) {
 	unknown := runCommandWithVNextOwnerRPCTestRole(daemonRequest{
 		Operation: vnextOwnerRPCOperationReserve,
 		VNextOwnerReserve: json.RawMessage(`{
-			"protocol":"cxld.vnext-owner.v5",
+			"protocol":"cxld.vnext-owner.v6",
 			"unknownMandatoryField":true
 		}`),
 	}, rpc)
@@ -902,7 +902,7 @@ func TestVNextOwnerRPCRejectsDuplicateCaseVariantAndMixedEnvelopeBeforeTypedDeco
 	}{
 		{
 			name: "duplicate protocol",
-			raw: `{"protocol":"cxld.vnext-owner.v5","protocol":"cxld.vnext-owner.v5",` +
+			raw: `{"protocol":"cxld.vnext-owner.v6","protocol":"cxld.vnext-owner.v6",` +
 				`"requestId":"r","checkpointId":"c","producerId":"p","ownerId":"o",` +
 				`"ownerEpoch":1,"contents":[],"maxExtents":1}`,
 			target:  &vnextOwnerRPCReserveRequest{},
@@ -910,19 +910,19 @@ func TestVNextOwnerRPCRejectsDuplicateCaseVariantAndMixedEnvelopeBeforeTypedDeco
 		},
 		{
 			name:    "case variant protocol",
-			raw:     `{"Protocol":"cxld.vnext-owner.v5"}`,
+			raw:     `{"Protocol":"cxld.vnext-owner.v6"}`,
 			target:  &vnextOwnerRPCReserveRequest{},
 			contain: "unknown field",
 		},
 		{
 			name:    "repeated contents",
-			raw:     `{"protocol":"cxld.vnext-owner.v5","contents":[],"contents":[]}`,
+			raw:     `{"protocol":"cxld.vnext-owner.v6","contents":[],"contents":[]}`,
 			target:  &vnextOwnerRPCReserveRequest{},
 			contain: "duplicate field",
 		},
 		{
 			name: "duplicate nested identity",
-			raw: `{"protocol":"cxld.vnext-owner.v5","identity":{` +
+			raw: `{"protocol":"cxld.vnext-owner.v6","identity":{` +
 				`"requestId":"a","requestId":"b"}}`,
 			target:  &vnextOwnerRPCLifecycleRequest{},
 			contain: "duplicate field",
@@ -960,7 +960,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "seal external CRC array",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v5",
+				"protocol":"cxld.vnext-owner.v6",
 				"identity":{
 					"requestId":"r","checkpointId":"c","producerId":"p",
 					"ownerId":"o","ownerEpoch":1,"allocationRecordId":1
@@ -1006,7 +1006,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "reserve content capacity",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v5",
+				"protocol":"cxld.vnext-owner.v6",
 				"requestId":"r","checkpointId":"c","producerId":"p","ownerId":"o",
 				"ownerEpoch":1,
 				"contents":[{"kind":"memory","objectId":1,"byteLength":4096}],
@@ -1018,7 +1018,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "lifecycle allocation identity",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v5",
+				"protocol":"cxld.vnext-owner.v6",
 				"identity":{
 					"requestId":"r","checkpointId":"c","producerId":"p",
 					"ownerId":"o","ownerEpoch":1
@@ -1030,7 +1030,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "inventory expected Owner epoch",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v5",
+				"protocol":"cxld.vnext-owner.v6",
 				"requestId":"r",
 				"expectedOwnerId":"owner-a"
 			}`),
@@ -1040,7 +1040,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "inventory response device array",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v5",
+				"protocol":"cxld.vnext-owner.v6",
 				"operation":"vnextOwnerInventory",
 				"requestId":"r",
 				"ownerId":"owner-a",

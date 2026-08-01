@@ -8,10 +8,10 @@ import (
 	"testing"
 )
 
-func TestVNextOwnerProtocolV5AndALPNV6AreHardCut(t *testing.T) {
-	if vnextOwnerRPCProtocol != "cxld.vnext-owner.v5" ||
-		vnextOwnerSchedulerAuthorityProtocol != "cxld.vnext-owner.v5" ||
-		vnextOwnerTLSALPN != "cxld-vnext-owner/6" {
+func TestVNextOwnerProtocolV6AndALPNV7AreHardCut(t *testing.T) {
+	if vnextOwnerRPCProtocol != "cxld.vnext-owner.v6" ||
+		vnextOwnerSchedulerAuthorityProtocol != "cxld.vnext-owner.v6" ||
+		vnextOwnerTLSALPN != "cxld-vnext-owner/7" {
 		t.Fatalf("unexpected VNext Owner hard-cut constants: protocol=%q authority=%q ALPN=%q",
 			vnextOwnerRPCProtocol, vnextOwnerSchedulerAuthorityProtocol, vnextOwnerTLSALPN)
 	}

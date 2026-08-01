@@ -1153,8 +1153,16 @@ func TestVNextOwnerRecoversMidReclaim(t *testing.T) {
 		t.Fatal("mid-reclaim fault did not leave RECLAIMING")
 	}
 	reopened := fixture.reopen(t)
-	if reopened.journal.Transactions[grant.AllocationRecordID].State != vnextOwnerReclaimed {
-		t.Fatal("mid-reclaim recovery did not reach RECLAIMED")
+	recovered := reopened.journal.Transactions[grant.AllocationRecordID]
+	if recovered.State != vnextOwnerReclaimed || recovered.Reclaim == nil ||
+		recovered.Reclaim.TerminalJournalSequence == 0 ||
+		vnextAllZero(recovered.Reclaim.OwnerReceipt[:]) ||
+		recovered.Reclaim.OwnerReceipt != vnextOwnerReclaimReceipt(
+			recovered.Reclaim.Allocation,
+			recovered.Reclaim.RequestDigest,
+			recovered.Reclaim.SchedulerProof,
+			recovered.Reclaim.TerminalJournalSequence) {
+		t.Fatalf("mid-reclaim recovery lacks terminal evidence: %#v", recovered)
 	}
 	for _, device := range reopened.devices {
 		record, ok := device.allocator.lookup(request.CheckpointID)

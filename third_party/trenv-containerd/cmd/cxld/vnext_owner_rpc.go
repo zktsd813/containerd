@@ -25,6 +25,8 @@ const (
 	vnextOwnerRPCOperationProducerAbort                         = "vnextOwnerProducerAbort"
 	vnextOwnerRPCOperationCommit                                = "vnextOwnerCommit"
 	vnextOwnerRPCOperationAbort                                 = "vnextOwnerAbort"
+	vnextOwnerRPCOperationReclaim                               = "vnextOwnerReclaim"
+	vnextOwnerRPCOperationReclaimStatusAndFence                 = "vnextOwnerReclaimStatusAndFence"
 	vnextOwnerRPCOperationInventory                             = "vnextOwnerInventory"
 	vnextOwnerRPCOperationReservationStatus                     = "vnextOwnerReservationStatus"
 	vnextOwnerRPCOperationSetAdmission                          = "vnextOwnerSetAdmission"
@@ -50,7 +52,7 @@ const (
 	// byte needs HTML-safe JSON escaping, this count keeps both the inner
 	// inventory JSON and its escaped outer execResponse below 32 MiB.
 	vnextOwnerRPCMaxInventoryDevices = 1024
-	// The complete daemon envelope currently defines twenty-two fields. Keep a
+	// The complete daemon envelope currently defines twenty-four fields. Keep a
 	// little legacy headroom, but reject an attacker-controlled number of
 	// unknown or duplicate members before retaining RawMessage entries.
 	vnextOwnerRPCMaxDaemonFields = 32
@@ -377,6 +379,62 @@ type vnextOwnerRPCLifecycleResponse struct {
 	SchedulerProof vnextOwnerRPCSchedulerProof    `json:"schedulerProof"`
 }
 
+type vnextOwnerRPCReclaimRequest struct {
+	Protocol                         string                         `json:"protocol"`
+	RequestID                        string                         `json:"requestId"`
+	Allocation                       vnextOwnerRPCOperationIdentity `json:"allocation"`
+	ExpectedCheckpointRoot           vnextOwnerRPCCheckpointRoot    `json:"expectedCheckpointRoot"`
+	RetirementEpoch                  uint64                         `json:"retirementEpoch"`
+	CatalogRevisionBarrier           uint64                         `json:"catalogRevisionBarrier"`
+	ActiveRestoreCount               uint64                         `json:"activeRestoreCount"`
+	ReaderDrainEvidenceDigest        string                         `json:"readerDrainEvidenceDigest"`
+	ProducerWriteFenceEvidenceDigest string                         `json:"producerWriteFenceEvidenceDigest"`
+	DedupReferenceDispositionDigest  string                         `json:"dedupReferenceDispositionDigest"`
+	SchedulerAuthority               vnextOwnerSchedulerAuthority   `json:"schedulerAuthority"`
+}
+
+type vnextOwnerRPCReclaimResponse struct {
+	Protocol                         string                         `json:"protocol"`
+	Operation                        string                         `json:"operation"`
+	State                            string                         `json:"state"`
+	RequestID                        string                         `json:"requestId"`
+	Allocation                       vnextOwnerRPCOperationIdentity `json:"allocation"`
+	ExpectedCheckpointRoot           vnextOwnerRPCCheckpointRoot    `json:"expectedCheckpointRoot"`
+	RetirementEpoch                  uint64                         `json:"retirementEpoch"`
+	CatalogRevisionBarrier           uint64                         `json:"catalogRevisionBarrier"`
+	ActiveRestoreCount               uint64                         `json:"activeRestoreCount"`
+	ReaderDrainEvidenceDigest        string                         `json:"readerDrainEvidenceDigest"`
+	ProducerWriteFenceEvidenceDigest string                         `json:"producerWriteFenceEvidenceDigest"`
+	DedupReferenceDispositionDigest  string                         `json:"dedupReferenceDispositionDigest"`
+	RequestDigest                    string                         `json:"requestDigest"`
+	OwnerJournalSequence             uint64                         `json:"ownerJournalSequence"`
+	OwnerReceipt                     string                         `json:"ownerReceipt"`
+	Replayed                         bool                           `json:"replayed"`
+	SchedulerProof                   vnextOwnerRPCSchedulerProof    `json:"schedulerProof"`
+}
+
+type vnextOwnerRPCReclaimStatusAndFenceRequest struct {
+	Protocol                      string                         `json:"protocol"`
+	RequestID                     string                         `json:"requestId"`
+	Allocation                    vnextOwnerRPCOperationIdentity `json:"allocation"`
+	ExpectedReclaimRequestID      string                         `json:"expectedReclaimRequestId"`
+	ExpectedReclaimRequestDigest  string                         `json:"expectedReclaimRequestDigest"`
+	ExpectedReclaimSchedulerProof vnextOwnerRPCSchedulerProof    `json:"expectedReclaimSchedulerProof"`
+	SchedulerAuthority            vnextOwnerSchedulerAuthority   `json:"schedulerAuthority"`
+}
+
+type vnextOwnerRPCReclaimStatusAndFenceResponse struct {
+	Protocol            string                         `json:"protocol"`
+	Operation           string                         `json:"operation"`
+	RequestID           string                         `json:"requestId"`
+	Allocation          vnextOwnerRPCOperationIdentity `json:"allocation"`
+	State               string                         `json:"state"`
+	SnapshotSequence    uint64                         `json:"snapshotSequence"`
+	FenceCreateRevision uint64                         `json:"fenceCreateRevision"`
+	HasReclaim          bool                           `json:"hasReclaim"`
+	Reclaim             vnextOwnerRPCReclaimResponse   `json:"reclaim"`
+}
+
 type vnextOwnerRPCProducerAbortResponse struct {
 	Protocol  string `json:"protocol"`
 	Operation string `json:"operation"`
@@ -581,12 +639,12 @@ func runVNextOwnerRPC(
 	caller vnextOwnerCallerContext,
 ) execResponse {
 	// VNext Owner mutations include persistence barriers that must not be
-	// cancelled halfway through. The v5 transport therefore does not pretend
+	// cancelled halfway through. The v6 transport therefore does not pretend
 	// that the legacy command timeout applies to these operations. A future
 	// protocol may add a deadline for admission before a mutation starts.
 	if request.TimeoutMillis != 0 {
 		return vnextOwnerRPCErrorResponse(errors.New(
-			"VNext Owner protocol v5 does not support timeoutMillis; it must be zero"))
+			"VNext Owner protocol v6 does not support timeoutMillis; it must be zero"))
 	}
 	if err := caller.validate(); err != nil {
 		return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
@@ -625,6 +683,10 @@ func runVNextOwnerRPC(
 		return rpc.commit(raw)
 	case vnextOwnerRPCOperationAbort:
 		return rpc.abort(raw)
+	case vnextOwnerRPCOperationReclaim:
+		return rpc.reclaim(raw, caller)
+	case vnextOwnerRPCOperationReclaimStatusAndFence:
+		return rpc.reclaimStatusAndFence(raw, caller)
 	case vnextOwnerRPCOperationInventory:
 		return rpc.inventory(raw)
 	case vnextOwnerRPCOperationReservationStatus:
@@ -648,6 +710,8 @@ func isVNextOwnerRPCOperation(operation string) bool {
 		vnextOwnerRPCOperationProducerAbort,
 		vnextOwnerRPCOperationCommit,
 		vnextOwnerRPCOperationAbort,
+		vnextOwnerRPCOperationReclaim,
+		vnextOwnerRPCOperationReclaimStatusAndFence,
 		vnextOwnerRPCOperationInventory,
 		vnextOwnerRPCOperationReservationStatus,
 		vnextOwnerRPCOperationSetAdmission,
@@ -682,6 +746,8 @@ var vnextOwnerRPCDaemonFields = map[string]struct{}{
 	"vnextOwnerProducerAbort":                         {},
 	"vnextOwnerCommit":                                {},
 	"vnextOwnerAbort":                                 {},
+	"vnextOwnerReclaim":                               {},
+	"vnextOwnerReclaimStatusAndFence":                 {},
 	"vnextOwnerInventory":                             {},
 	"vnextOwnerReservationStatus":                     {},
 	"vnextOwnerSetAdmission":                          {},
@@ -829,6 +895,10 @@ func decodeVNextOwnerRPCDaemonEnvelope(
 			request.VNextOwnerCommit = append(json.RawMessage(nil), field.raw...)
 		case "vnextOwnerAbort":
 			request.VNextOwnerAbort = append(json.RawMessage(nil), field.raw...)
+		case "vnextOwnerReclaim":
+			request.VNextOwnerReclaim = append(json.RawMessage(nil), field.raw...)
+		case "vnextOwnerReclaimStatusAndFence":
+			request.VNextOwnerReclaimStatusAndFence = append(json.RawMessage(nil), field.raw...)
 		case "vnextOwnerInventory":
 			request.VNextOwnerInventory = append(json.RawMessage(nil), field.raw...)
 		case "vnextOwnerReservationStatus":
@@ -878,6 +948,9 @@ func vnextOwnerRPCPayload(operation string, request daemonRequest) (json.RawMess
 		{vnextOwnerRPCOperationProducerAbort, request.VNextOwnerProducerAbort},
 		{vnextOwnerRPCOperationCommit, request.VNextOwnerCommit},
 		{vnextOwnerRPCOperationAbort, request.VNextOwnerAbort},
+		{vnextOwnerRPCOperationReclaim, request.VNextOwnerReclaim},
+		{vnextOwnerRPCOperationReclaimStatusAndFence,
+			request.VNextOwnerReclaimStatusAndFence},
 		{vnextOwnerRPCOperationInventory, request.VNextOwnerInventory},
 		{vnextOwnerRPCOperationReservationStatus, request.VNextOwnerReservationStatus},
 		{vnextOwnerRPCOperationSetAdmission, request.VNextOwnerSetAdmission},
@@ -1646,26 +1719,32 @@ func (rpc *vnextOwnerRPC) seal(
 	wireResponse := vnextOwnerRPCSealResponse{
 		Protocol:  vnextOwnerRPCProtocol,
 		Operation: vnextOwnerRPCOperationSeal,
-		Root: vnextOwnerRPCCheckpointRoot{
-			RootID:            response.Root.RootID,
-			RootVersion:       response.Root.RootVersion,
-			MMTemplateID:      response.Root.MMTemplateID,
-			PageMapID:         response.Root.PageMapID,
-			PageMapVersion:    response.Root.PageMapVersion,
-			DeviceTableDigest: hex.EncodeToString(response.Root.DeviceTableDigest[:]),
-			ContractID:        response.Root.ContractID,
-			Locator: vnextOwnerRPCRootLocator{
-				PublicationByteLength: response.Root.Locator.PublicationByteLength,
-				PublicationSHA256: hex.EncodeToString(
-					response.Root.Locator.PublicationSHA256[:]),
-				PageRuns: make(
-					[]vnextOwnerRPCPublicationPageRun,
-					len(response.Root.Locator.PageRuns)),
-			},
+		Root:      vnextOwnerRPCRootFromInternal(response.Root),
+	}
+	return marshalVNextOwnerRPCResponse(wireResponse)
+}
+
+func vnextOwnerRPCRootFromInternal(
+	root vnextOwnerCheckpointRoot,
+) vnextOwnerRPCCheckpointRoot {
+	wire := vnextOwnerRPCCheckpointRoot{
+		RootID:            root.RootID,
+		RootVersion:       root.RootVersion,
+		MMTemplateID:      root.MMTemplateID,
+		PageMapID:         root.PageMapID,
+		PageMapVersion:    root.PageMapVersion,
+		DeviceTableDigest: hex.EncodeToString(root.DeviceTableDigest[:]),
+		ContractID:        root.ContractID,
+		Locator: vnextOwnerRPCRootLocator{
+			PublicationByteLength: root.Locator.PublicationByteLength,
+			PublicationSHA256:     hex.EncodeToString(root.Locator.PublicationSHA256[:]),
+			PageRuns: make(
+				[]vnextOwnerRPCPublicationPageRun,
+				len(root.Locator.PageRuns)),
 		},
 	}
-	for index, run := range response.Root.Locator.PageRuns {
-		wireResponse.Root.Locator.PageRuns[index] = vnextOwnerRPCPublicationPageRun{
+	for index, run := range root.Locator.PageRuns {
+		wire.Locator.PageRuns[index] = vnextOwnerRPCPublicationPageRun{
 			FirstPage: vnextOwnerRPCPageID{
 				OwnerID:            run.FirstPage.OwnerID,
 				DeviceID:           run.FirstPage.DeviceUUID,
@@ -1675,7 +1754,7 @@ func (rpc *vnextOwnerRPC) seal(
 			PageCount: run.PageCount,
 		}
 	}
-	return marshalVNextOwnerRPCResponse(wireResponse)
+	return wire
 }
 
 func decodeVNextOwnerRPCSealRequest(
@@ -1804,6 +1883,194 @@ func decodeVNextOwnerRPCProducerAbortRequest(
 		return vnextOwnerOperationIdentity{}, vnextProducerCapabilityProof{}, err
 	}
 	return identity, capability, nil
+}
+
+func (rpc *vnextOwnerRPC) reclaim(
+	raw json.RawMessage,
+	caller vnextOwnerCallerContext,
+) execResponse {
+	request, err := decodeVNextOwnerRPCReclaimRequest(raw)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	response, err := rpc.service.reclaimScheduler(request, caller)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	wire, err := vnextOwnerRPCReclaimResponseFromInternal(response)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+			"reclaim", vnextOwnerServiceUnavailable,
+			"Owner reclaim evidence cannot be represented", err))
+	}
+	return marshalVNextOwnerRPCResponse(wire)
+}
+
+func vnextOwnerRPCReclaimResponseFromInternal(
+	response vnextOwnerReclaimResponse,
+) (vnextOwnerRPCReclaimResponse, error) {
+	schedulerProof, err := vnextOwnerRPCSchedulerProofWire(response.SchedulerProof)
+	if err != nil {
+		return vnextOwnerRPCReclaimResponse{}, err
+	}
+	return vnextOwnerRPCReclaimResponse{
+		Protocol:                         vnextOwnerRPCProtocol,
+		Operation:                        vnextOwnerRPCOperationReclaim,
+		State:                            "RECLAIMED",
+		RequestID:                        response.RequestID,
+		Allocation:                       vnextOwnerRPCIdentityFromInternal(response.Allocation),
+		ExpectedCheckpointRoot:           vnextOwnerRPCRootFromInternal(response.ExpectedCheckpointRoot),
+		RetirementEpoch:                  response.RetirementEpoch,
+		CatalogRevisionBarrier:           response.CatalogRevisionBarrier,
+		ActiveRestoreCount:               response.ActiveRestoreCount,
+		ReaderDrainEvidenceDigest:        hex.EncodeToString(response.ReaderDrainEvidenceDigest[:]),
+		ProducerWriteFenceEvidenceDigest: hex.EncodeToString(response.ProducerWriteFenceEvidenceDigest[:]),
+		DedupReferenceDispositionDigest:  hex.EncodeToString(response.DedupReferenceDispositionDigest[:]),
+		RequestDigest:                    hex.EncodeToString(response.RequestDigest[:]),
+		OwnerJournalSequence:             response.OwnerJournalSequence,
+		OwnerReceipt:                     hex.EncodeToString(response.OwnerReceipt[:]),
+		Replayed:                         response.Replayed,
+		SchedulerProof:                   schedulerProof,
+	}, nil
+}
+
+func decodeVNextOwnerRPCReclaimRequest(
+	raw json.RawMessage,
+) (vnextOwnerReclaimRequest, error) {
+	var wire vnextOwnerRPCReclaimRequest
+	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
+		return vnextOwnerReclaimRequest{}, err
+	}
+	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
+		return vnextOwnerReclaimRequest{}, err
+	}
+	allocation := wire.Allocation.internal()
+	rootResponse, err := convertVNextOwnerClientSealResponse(
+		allocation,
+		vnextOwnerRPCSealResponse{
+			Protocol:  vnextOwnerRPCProtocol,
+			Operation: vnextOwnerRPCOperationSeal,
+			Root:      wire.ExpectedCheckpointRoot,
+		})
+	if err != nil {
+		return vnextOwnerReclaimRequest{}, err
+	}
+	readerDrain, err := decodeCanonicalVNextOwnerClientDigest(
+		"reader-drain evidence digest", wire.ReaderDrainEvidenceDigest)
+	if err != nil {
+		return vnextOwnerReclaimRequest{}, err
+	}
+	producerFence, err := decodeCanonicalVNextOwnerClientDigest(
+		"producer-write-fence evidence digest", wire.ProducerWriteFenceEvidenceDigest)
+	if err != nil {
+		return vnextOwnerReclaimRequest{}, err
+	}
+	dedupDisposition, err := decodeCanonicalVNextOwnerClientDigest(
+		"dedup/reference-disposition digest", wire.DedupReferenceDispositionDigest)
+	if err != nil {
+		return vnextOwnerReclaimRequest{}, err
+	}
+	request := vnextOwnerReclaimRequest{
+		RequestID:                        wire.RequestID,
+		Allocation:                       allocation,
+		ExpectedCheckpointRoot:           rootResponse.Root,
+		RetirementEpoch:                  wire.RetirementEpoch,
+		CatalogRevisionBarrier:           wire.CatalogRevisionBarrier,
+		ActiveRestoreCount:               wire.ActiveRestoreCount,
+		ReaderDrainEvidenceDigest:        readerDrain,
+		ProducerWriteFenceEvidenceDigest: producerFence,
+		DedupReferenceDispositionDigest:  dedupDisposition,
+		SchedulerAuthority:               wire.SchedulerAuthority,
+	}
+	if err := validateVNextOwnerReclaimRequest(request); err != nil {
+		return vnextOwnerReclaimRequest{}, err
+	}
+	return request, nil
+}
+
+func (rpc *vnextOwnerRPC) reclaimStatusAndFence(
+	raw json.RawMessage,
+	caller vnextOwnerCallerContext,
+) execResponse {
+	request, err := decodeVNextOwnerRPCReclaimStatusAndFenceRequest(raw)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	response, err := rpc.service.reclaimStatusAndFenceScheduler(request, caller)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	wire := vnextOwnerRPCReclaimStatusAndFenceResponse{
+		Protocol:            vnextOwnerRPCProtocol,
+		Operation:           vnextOwnerRPCOperationReclaimStatusAndFence,
+		RequestID:           response.RequestID,
+		Allocation:          vnextOwnerRPCIdentityFromInternal(response.Allocation),
+		State:               string(response.State),
+		SnapshotSequence:    response.SnapshotSequence,
+		FenceCreateRevision: response.FenceCreateRevision,
+		Reclaim: vnextOwnerRPCReclaimResponse{
+			ExpectedCheckpointRoot: vnextOwnerRPCCheckpointRoot{
+				Locator: vnextOwnerRPCRootLocator{
+					PageRuns: []vnextOwnerRPCPublicationPageRun{},
+				},
+			},
+		},
+	}
+	if response.Reclaim != nil {
+		terminal, err := vnextOwnerRPCReclaimResponseFromInternal(*response.Reclaim)
+		if err != nil {
+			return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+				"reclaim-status-and-fence", vnextOwnerServiceUnavailable,
+				"Owner terminal reclaim evidence cannot be represented", err))
+		}
+		wire.HasReclaim = true
+		wire.Reclaim = terminal
+	}
+	return marshalVNextOwnerRPCResponse(wire)
+}
+
+func vnextOwnerRPCReclaimResponseIsZero(response vnextOwnerRPCReclaimResponse) bool {
+	if len(response.ExpectedCheckpointRoot.Locator.PageRuns) != 0 {
+		return false
+	}
+	// The strict wire shape uses [] instead of null for an absent terminal
+	// record. Normalize that canonical empty array before checking every other
+	// field for its exact zero value.
+	response.ExpectedCheckpointRoot.Locator.PageRuns = nil
+	return reflect.ValueOf(response).IsZero()
+}
+
+func decodeVNextOwnerRPCReclaimStatusAndFenceRequest(
+	raw json.RawMessage,
+) (vnextOwnerReclaimStatusAndFenceRequest, error) {
+	var wire vnextOwnerRPCReclaimStatusAndFenceRequest
+	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
+		return vnextOwnerReclaimStatusAndFenceRequest{}, err
+	}
+	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
+		return vnextOwnerReclaimStatusAndFenceRequest{}, err
+	}
+	digest, err := decodeCanonicalVNextOwnerClientDigest(
+		"expected reclaim request digest", wire.ExpectedReclaimRequestDigest)
+	if err != nil {
+		return vnextOwnerReclaimStatusAndFenceRequest{}, err
+	}
+	expectedProof, err := wire.ExpectedReclaimSchedulerProof.internal()
+	if err != nil {
+		return vnextOwnerReclaimStatusAndFenceRequest{}, err
+	}
+	request := vnextOwnerReclaimStatusAndFenceRequest{
+		RequestID:                     wire.RequestID,
+		Allocation:                    wire.Allocation.internal(),
+		ExpectedReclaimRequestID:      wire.ExpectedReclaimRequestID,
+		ExpectedReclaimRequestDigest:  digest,
+		ExpectedReclaimSchedulerProof: expectedProof,
+		SchedulerAuthority:            wire.SchedulerAuthority,
+	}
+	if err := validateVNextOwnerReclaimStatusAndFenceRequest(request); err != nil {
+		return vnextOwnerReclaimStatusAndFenceRequest{}, err
+	}
+	return request, nil
 }
 
 func (rpc *vnextOwnerRPC) commit(raw json.RawMessage) execResponse {

@@ -287,7 +287,7 @@ func openVNextOwnerRuntimeWithDependencies(
 	}
 	group, err := openVNextOwnerGroup(controlFile, config.ControlSlotBytes, devices)
 	if err != nil {
-		return nil, fmt.Errorf("open existing TROWN009 Owner group: %w", err)
+		return nil, fmt.Errorf("open existing TROWN010 Owner group: %w", err)
 	}
 	service, err := newVNextOwnerServiceWithSchedulerAuthority(
 		group, directory, schedulerAuthority)

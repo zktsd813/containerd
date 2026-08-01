@@ -373,6 +373,249 @@ type vnextOwnerSealResponse struct {
 	Root vnextOwnerCheckpointRoot
 }
 
+// vnextOwnerReclaimRequest is the complete Scheduler-signed authorization for
+// returning one committed checkpoint allocation to its Owner. RequestID is
+// independent from the original Reserve RequestID in Allocation. The two
+// evidence digests are opaque to the Owner, but their non-zero values and the
+// complete catalog barrier are covered by the Scheduler mutation signature.
+// The Owner deliberately accepts only ActiveRestoreCount == 0.
+type vnextOwnerReclaimRequest struct {
+	RequestID                        string
+	Allocation                       vnextOwnerOperationIdentity
+	ExpectedCheckpointRoot           vnextOwnerCheckpointRoot
+	RetirementEpoch                  uint64
+	CatalogRevisionBarrier           uint64
+	ActiveRestoreCount               uint64
+	ReaderDrainEvidenceDigest        [32]byte
+	ProducerWriteFenceEvidenceDigest [32]byte
+	DedupReferenceDispositionDigest  [32]byte
+	SchedulerAuthority               vnextOwnerSchedulerAuthority
+}
+
+// vnextOwnerReclaimResponse echoes every signed reclaim field. RequestDigest
+// is the exact Scheduler mutation digest persisted by the Owner before any
+// descriptor or bitmap side effect. Success is returned only after the Owner
+// journal durably reaches RECLAIMED.
+type vnextOwnerReclaimResponse struct {
+	RequestID                        string
+	Allocation                       vnextOwnerOperationIdentity
+	ExpectedCheckpointRoot           vnextOwnerCheckpointRoot
+	RetirementEpoch                  uint64
+	CatalogRevisionBarrier           uint64
+	ActiveRestoreCount               uint64
+	ReaderDrainEvidenceDigest        [32]byte
+	ProducerWriteFenceEvidenceDigest [32]byte
+	DedupReferenceDispositionDigest  [32]byte
+	RequestDigest                    [32]byte
+	OwnerJournalSequence             uint64
+	OwnerReceipt                     [32]byte
+	Replayed                         bool
+	SchedulerProof                   vnextOwnerSchedulerProof
+}
+
+type vnextOwnerReclaimStatus string
+
+const (
+	vnextOwnerReclaimNotFound   vnextOwnerReclaimStatus = "NOT_FOUND"
+	vnextOwnerReclaimConflict   vnextOwnerReclaimStatus = "CONFLICT"
+	vnextOwnerReclaimInProgress vnextOwnerReclaimStatus = "RECLAIMING"
+	vnextOwnerReclaimDone       vnextOwnerReclaimStatus = "RECLAIMED"
+)
+
+func (status vnextOwnerReclaimStatus) valid() bool {
+	switch status {
+	case vnextOwnerReclaimNotFound,
+		vnextOwnerReclaimConflict,
+		vnextOwnerReclaimInProgress,
+		vnextOwnerReclaimDone:
+		return true
+	default:
+		return false
+	}
+}
+
+type vnextOwnerReclaimStatusAndFenceRequest struct {
+	RequestID                     string
+	Allocation                    vnextOwnerOperationIdentity
+	ExpectedReclaimRequestID      string
+	ExpectedReclaimRequestDigest  [32]byte
+	ExpectedReclaimSchedulerProof vnextOwnerSchedulerProof
+	SchedulerAuthority            vnextOwnerSchedulerAuthority
+}
+
+type vnextOwnerReclaimStatusAndFenceResponse struct {
+	RequestID           string
+	Allocation          vnextOwnerOperationIdentity
+	State               vnextOwnerReclaimStatus
+	SnapshotSequence    uint64
+	FenceCreateRevision uint64
+	Reclaim             *vnextOwnerReclaimResponse
+}
+
+func validateVNextOwnerReclaimStatusAndFenceRequest(
+	request vnextOwnerReclaimStatusAndFenceRequest,
+) error {
+	if err := validateVNextOwnerClientText(
+		"reclaim status request ID", request.RequestID); err != nil {
+		return err
+	}
+	if request.RequestID == request.Allocation.RequestID ||
+		request.RequestID == request.ExpectedReclaimRequestID {
+		return errors.New("reclaim status RequestID must be independent")
+	}
+	if err := validateVNextOwnerClientOperationIdentity(request.Allocation); err != nil {
+		return err
+	}
+	if err := validateVNextOwnerClientText(
+		"expected reclaim request ID", request.ExpectedReclaimRequestID); err != nil {
+		return err
+	}
+	if vnextAllZero(request.ExpectedReclaimRequestDigest[:]) {
+		return errors.New("expected reclaim request digest must be non-zero")
+	}
+	if !request.ExpectedReclaimSchedulerProof.valid() ||
+		request.ExpectedReclaimSchedulerProof.MutationDigest !=
+			request.ExpectedReclaimRequestDigest {
+		return errors.New("expected reclaim Scheduler proof is invalid or has a different digest")
+	}
+	return nil
+}
+
+func validateVNextOwnerCheckpointRoot(
+	allocation vnextOwnerOperationIdentity,
+	root vnextOwnerCheckpointRoot,
+) error {
+	for name, value := range map[string]string{
+		"root ID":       root.RootID,
+		"MMTemplate ID": root.MMTemplateID,
+		"PageMap ID":    root.PageMapID,
+	} {
+		if err := validateVNextOwnerClientText(name, value); err != nil {
+			return err
+		}
+	}
+	if root.RootVersion == 0 || root.RootVersion > uint64(math.MaxInt64) ||
+		root.PageMapVersion == 0 || root.PageMapVersion > uint64(math.MaxInt64) ||
+		root.ContractID != cxlcheckpoint.V6CompatibilityID ||
+		vnextAllZero(root.DeviceTableDigest[:]) ||
+		vnextAllZero(root.Locator.PublicationSHA256[:]) {
+		return errors.New("checkpoint root versions, contract, or digests are invalid")
+	}
+	if root.Locator.PublicationByteLength == 0 ||
+		root.Locator.PublicationByteLength >
+			uint64(cxlcheckpoint.MaxPayloadBytes)+uint64(cxlcheckpoint.PublicationEnvelopeHeaderBytes) ||
+		len(root.Locator.PageRuns) == 0 ||
+		len(root.Locator.PageRuns) > vnextOwnerRPCMaxExtents {
+		return errors.New("checkpoint root publication locator has invalid bounds")
+	}
+	wantPages := (root.Locator.PublicationByteLength + cxlcheckpoint.PageSize - 1) /
+		cxlcheckpoint.PageSize
+	var covered uint64
+	physical := make(map[string][]vnextOwnerPublicationPageRun)
+	for index, run := range root.Locator.PageRuns {
+		if err := validateVNextOwnerClientDeviceID(run.FirstPage.DeviceUUID); err != nil {
+			return err
+		}
+		if run.FirstPage.OwnerID != allocation.OwnerID ||
+			run.FirstPage.AllocationRecordID != allocation.AllocationRecordID ||
+			run.FirstPage.DataPageIndex > uint64(math.MaxInt64) ||
+			run.PageCount == 0 || run.PageCount > uint64(math.MaxInt64) {
+			return fmt.Errorf("checkpoint root publication run %d has invalid authority or range", index)
+		}
+		end, ok := vnextAdd(run.FirstPage.DataPageIndex, run.PageCount)
+		if !ok || end > uint64(math.MaxInt64) {
+			return fmt.Errorf("checkpoint root publication run %d overflows", index)
+		}
+		if index > 0 {
+			previous := root.Locator.PageRuns[index-1]
+			previousEnd := previous.FirstPage.DataPageIndex + previous.PageCount
+			if previous.FirstPage.OwnerID == run.FirstPage.OwnerID &&
+				previous.FirstPage.DeviceUUID == run.FirstPage.DeviceUUID &&
+				previous.FirstPage.AllocationRecordID == run.FirstPage.AllocationRecordID &&
+				previousEnd == run.FirstPage.DataPageIndex {
+				return fmt.Errorf("checkpoint root publication runs %d and %d are not coalesced", index-1, index)
+			}
+		}
+		covered, ok = vnextAdd(covered, run.PageCount)
+		if !ok || covered > wantPages {
+			return errors.New("checkpoint root publication coverage overflows")
+		}
+		physical[run.FirstPage.DeviceUUID] = append(
+			physical[run.FirstPage.DeviceUUID], run)
+	}
+	if covered != wantPages {
+		return fmt.Errorf("checkpoint root publication covers %d pages, expected %d", covered, wantPages)
+	}
+	for deviceID, runs := range physical {
+		sort.Slice(runs, func(i, j int) bool {
+			return runs[i].FirstPage.DataPageIndex < runs[j].FirstPage.DataPageIndex
+		})
+		for index := 1; index < len(runs); index++ {
+			previousEnd := runs[index-1].FirstPage.DataPageIndex + runs[index-1].PageCount
+			if previousEnd > runs[index].FirstPage.DataPageIndex {
+				return fmt.Errorf("checkpoint root publication runs overlap on device %q", deviceID)
+			}
+		}
+	}
+	return nil
+}
+
+func validateVNextOwnerReclaimRequest(request vnextOwnerReclaimRequest) error {
+	if err := validateVNextOwnerClientText("reclaim request ID", request.RequestID); err != nil {
+		return err
+	}
+	if request.RequestID == request.Allocation.RequestID {
+		return errors.New("reclaim RequestID must be independent from Reserve RequestID")
+	}
+	if err := validateVNextOwnerClientOperationIdentity(request.Allocation); err != nil {
+		return err
+	}
+	if err := validateVNextOwnerCheckpointRoot(
+		request.Allocation, request.ExpectedCheckpointRoot); err != nil {
+		return err
+	}
+	if request.RetirementEpoch == 0 ||
+		request.RetirementEpoch > uint64(math.MaxInt64) ||
+		request.CatalogRevisionBarrier == 0 ||
+		request.CatalogRevisionBarrier > uint64(math.MaxInt64) {
+		return errors.New("reclaim retirement epoch or catalog revision is outside the signed ABI")
+	}
+	if request.ActiveRestoreCount != 0 {
+		return errors.New("reclaim requires activeRestoreCount exactly zero")
+	}
+	if vnextAllZero(request.ReaderDrainEvidenceDigest[:]) ||
+		vnextAllZero(request.ProducerWriteFenceEvidenceDigest[:]) ||
+		vnextAllZero(request.DedupReferenceDispositionDigest[:]) {
+		return errors.New("reclaim reader-drain, producer-fence, and dedup/reference evidence digests must be non-zero")
+	}
+	return nil
+}
+
+func cloneVNextOwnerCheckpointRoot(root vnextOwnerCheckpointRoot) vnextOwnerCheckpointRoot {
+	root.Locator.PageRuns = append(
+		[]vnextOwnerPublicationPageRun(nil), root.Locator.PageRuns...)
+	return root
+}
+
+func equalVNextOwnerCheckpointRoot(left, right vnextOwnerCheckpointRoot) bool {
+	if left.RootID != right.RootID || left.RootVersion != right.RootVersion ||
+		left.MMTemplateID != right.MMTemplateID || left.PageMapID != right.PageMapID ||
+		left.PageMapVersion != right.PageMapVersion ||
+		left.DeviceTableDigest != right.DeviceTableDigest ||
+		left.ContractID != right.ContractID ||
+		left.Locator.PublicationByteLength != right.Locator.PublicationByteLength ||
+		left.Locator.PublicationSHA256 != right.Locator.PublicationSHA256 ||
+		len(left.Locator.PageRuns) != len(right.Locator.PageRuns) {
+		return false
+	}
+	for index := range left.Locator.PageRuns {
+		if left.Locator.PageRuns[index] != right.Locator.PageRuns[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func newVNextOwnerService(
 	group *vnextOwnerGroup,
 	directory *vnextLocalDAXDirectory,
@@ -1369,6 +1612,120 @@ func (service *vnextOwnerService) abortScheduler(
 	return service.schedulerLifecycle(
 		"abort", vnextOwnerRPCOperationAbort, request,
 		vnextOwnerAborted, service.group.abortWithScheduler)
+}
+
+func (service *vnextOwnerService) reclaimScheduler(
+	request vnextOwnerReclaimRequest,
+	caller vnextOwnerCallerContext,
+) (vnextOwnerReclaimResponse, error) {
+	const operation = "reclaim"
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if err := caller.validate(); err != nil || caller.Role != vnextOwnerCallerScheduler {
+		return vnextOwnerReclaimResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServicePermissionDenied,
+			"only an authenticated Scheduler may reclaim a checkpoint", err)
+	}
+	if err := validateVNextOwnerReclaimRequest(request); err != nil {
+		return vnextOwnerReclaimResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceInvalidRequest, err.Error(), err)
+	}
+	verified, err := service.prepareSchedulerMutation(
+		vnextOwnerRPCOperationReclaim, request, request.SchedulerAuthority)
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	_, _, err = service.authorizePreparedSchedulerMutation(
+		operation, vnextOwnerRPCOperationReclaim, request, verified)
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	record, replayed, err := service.group.reclaimCheckpointWithScheduler(
+		request, &verified)
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, vnextOwnerServiceWrap(operation, err)
+	}
+	durableProof, err := service.durableSchedulerProof(
+		operation, vnextOwnerRPCOperationReclaim, request, verified)
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	if record == nil || record.SchedulerProof != durableProof ||
+		record.TerminalJournalSequence == 0 ||
+		vnextAllZero(record.OwnerReceipt[:]) ||
+		!vnextOwnerReclaimRecordMatches(record, request, durableProof) {
+		return vnextOwnerReclaimResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable,
+			"durable Owner reclaim evidence is incomplete", errVNextCorrupt)
+	}
+	return vnextOwnerReclaimResponse{
+		RequestID:                        record.RequestID,
+		Allocation:                       record.Allocation,
+		ExpectedCheckpointRoot:           cloneVNextOwnerCheckpointRoot(record.ExpectedCheckpointRoot),
+		RetirementEpoch:                  record.RetirementEpoch,
+		CatalogRevisionBarrier:           record.CatalogRevisionBarrier,
+		ActiveRestoreCount:               record.ActiveRestoreCount,
+		ReaderDrainEvidenceDigest:        record.ReaderDrainEvidenceDigest,
+		ProducerWriteFenceEvidenceDigest: record.ProducerWriteFenceEvidenceDigest,
+		DedupReferenceDispositionDigest:  record.DedupReferenceDispositionDigest,
+		RequestDigest:                    record.RequestDigest,
+		OwnerJournalSequence:             record.TerminalJournalSequence,
+		OwnerReceipt:                     record.OwnerReceipt,
+		Replayed:                         replayed,
+		SchedulerProof:                   durableProof,
+	}, nil
+}
+
+func (service *vnextOwnerService) reclaimStatusAndFenceScheduler(
+	request vnextOwnerReclaimStatusAndFenceRequest,
+	caller vnextOwnerCallerContext,
+) (vnextOwnerReclaimStatusAndFenceResponse, error) {
+	const operation = "reclaim-status-and-fence"
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if err := caller.validate(); err != nil || caller.Role != vnextOwnerCallerScheduler {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServicePermissionDenied,
+			"only an authenticated Scheduler may resolve reclaim status", err)
+	}
+	if err := validateVNextOwnerReclaimStatusAndFenceRequest(request); err != nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceInvalidRequest, err.Error(), err)
+	}
+	verified, err := service.prepareSchedulerMutation(
+		vnextOwnerRPCOperationReclaimStatusAndFence,
+		request,
+		request.SchedulerAuthority)
+	if err != nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, err
+	}
+	// Unlike an exact Reclaim replay, a status query must always establish a
+	// fresh linearizable current-term point before it reports absence.
+	if err := service.verifyCurrentSchedulerMutation(operation, verified); err != nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, err
+	}
+	response, err := service.group.reclaimStatusAndFenceWithScheduler(
+		request, &verified)
+	if err != nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, vnextOwnerServiceWrap(
+			operation, err)
+	}
+	if response.RequestID != request.RequestID ||
+		response.Allocation != request.Allocation ||
+		!response.State.valid() ||
+		response.SnapshotSequence == 0 ||
+		response.SnapshotSequence > uint64(math.MaxInt64) ||
+		response.FenceCreateRevision != verified.Parsed.CreateRevision {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable,
+			"Owner reclaim status evidence is invalid", errVNextCorrupt)
+	}
+	if (response.State == vnextOwnerReclaimDone) != (response.Reclaim != nil) {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable,
+			"Owner reclaim terminal status evidence is inconsistent", errVNextCorrupt)
+	}
+	return response, nil
 }
 
 func (service *vnextOwnerService) schedulerLifecycle(

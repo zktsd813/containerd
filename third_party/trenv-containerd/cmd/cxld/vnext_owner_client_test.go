@@ -1186,7 +1186,7 @@ func TestVNextOwnerClientRejectsNonCanonicalResponses(t *testing.T) {
 		{
 			name: "duplicate-field",
 			mutate: func(raw []byte) []byte {
-				prefix := []byte(`{"protocol":"cxld.vnext-owner.v5",`)
+				prefix := []byte(`{"protocol":"cxld.vnext-owner.v6",`)
 				return append(prefix, raw[1:]...)
 			},
 		},

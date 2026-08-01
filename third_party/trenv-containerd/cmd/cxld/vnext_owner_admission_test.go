@@ -567,6 +567,18 @@ func TestVNextOwnerFencedRestartNeverCompletesFreeingRecovery(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			var reclaimRequest vnextOwnerReclaimRequest
+			var reclaimAuthority *vnextOwnerSchedulerVerifiedAuthority
+			if test.state == vnextOwnerReclaiming {
+				reclaimRequest, err = vnextOwnerTestReclaimRequest(
+					fixture.group, request.CheckpointID, grant.AllocationRecordID,
+					"fenced-recovery-reclaim")
+				if err != nil {
+					t.Fatal(err)
+				}
+				reclaimAuthority = vnextOwnerTestVerifiedAuthority(
+					vnextOwnerRPCOperationReclaim, reclaimRequest)
+			}
 			if _, err := fixture.group.setAdmission(vnextOwnerAdmissionTestRequest(
 				"recovery-"+test.name,
 				vnextOwnerAdmissionActive,
@@ -580,6 +592,21 @@ func TestVNextOwnerFencedRestartNeverCompletesFreeingRecovery(t *testing.T) {
 			if test.state == vnextOwnerAborting {
 				candidate.Transactions[grant.AllocationRecordID].AbortOrigin =
 					vnextOwnerAbortByRecovery
+			} else {
+				candidate.Transactions[grant.AllocationRecordID].Reclaim =
+					&vnextOwnerReclaimRecord{
+						RequestID:                        reclaimRequest.RequestID,
+						RequestDigest:                    reclaimAuthority.MutationDigest,
+						Allocation:                       reclaimRequest.Allocation,
+						ExpectedCheckpointRoot:           cloneVNextOwnerCheckpointRoot(reclaimRequest.ExpectedCheckpointRoot),
+						RetirementEpoch:                  reclaimRequest.RetirementEpoch,
+						CatalogRevisionBarrier:           reclaimRequest.CatalogRevisionBarrier,
+						ActiveRestoreCount:               reclaimRequest.ActiveRestoreCount,
+						ReaderDrainEvidenceDigest:        reclaimRequest.ReaderDrainEvidenceDigest,
+						ProducerWriteFenceEvidenceDigest: reclaimRequest.ProducerWriteFenceEvidenceDigest,
+						DedupReferenceDispositionDigest:  reclaimRequest.DedupReferenceDispositionDigest,
+						SchedulerProof:                   reclaimAuthority.proof(),
+					}
 			}
 			err = fixture.group.persistJournalLocked(candidate)
 			fixture.group.mu.Unlock()

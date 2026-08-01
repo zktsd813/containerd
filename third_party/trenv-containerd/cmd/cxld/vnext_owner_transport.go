@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	vnextOwnerTLSALPN             = "cxld-vnext-owner/6"
+	vnextOwnerTLSALPN             = "cxld-vnext-owner/7"
 	vnextOwnerTLSDialTimeout      = 10 * time.Second
 	vnextOwnerTLSHandshakeTimeout = 10 * time.Second
 	vnextOwnerTLSMaxHandshakes    = 32

@@ -25,7 +25,7 @@ import (
 //
 // The transport is responsible for encoding daemonRequest into the bounded
 // daemon frame and decoding its outer execResponse. This client owns the
-// cxld.vnext-owner.v5 operation payload and response contracts inside those
+// cxld.vnext-owner.v6 operation payload and response contracts inside those
 // envelopes.
 type vnextOwnerClientRoundTripper interface {
 	RoundTrip(context.Context, daemonRequest) (execResponse, error)
@@ -931,6 +931,320 @@ func (client *vnextOwnerClient) AbortVNextCheckpoint(
 	authority vnextOwnerSchedulerAuthority,
 ) error {
 	return client.lifecycle(ctx, vnextOwnerRPCOperationAbort, "ABORTED", identity, authority)
+}
+
+func (client *vnextOwnerClient) ReclaimVNextCheckpoint(
+	ctx context.Context,
+	request vnextOwnerReclaimRequest,
+) (vnextOwnerReclaimResponse, error) {
+	if client == nil || client.transport == nil {
+		return vnextOwnerReclaimResponse{}, errors.New("VNext Owner client is unavailable")
+	}
+	if err := validateVNextOwnerReclaimRequest(request); err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	wire := vnextOwnerRPCReclaimRequest{
+		Protocol:                         vnextOwnerRPCProtocol,
+		RequestID:                        request.RequestID,
+		Allocation:                       vnextOwnerRPCIdentityFromInternal(request.Allocation),
+		ExpectedCheckpointRoot:           vnextOwnerRPCRootFromInternal(request.ExpectedCheckpointRoot),
+		RetirementEpoch:                  request.RetirementEpoch,
+		CatalogRevisionBarrier:           request.CatalogRevisionBarrier,
+		ActiveRestoreCount:               request.ActiveRestoreCount,
+		ReaderDrainEvidenceDigest:        hex.EncodeToString(request.ReaderDrainEvidenceDigest[:]),
+		ProducerWriteFenceEvidenceDigest: hex.EncodeToString(request.ProducerWriteFenceEvidenceDigest[:]),
+		DedupReferenceDispositionDigest:  hex.EncodeToString(request.DedupReferenceDispositionDigest[:]),
+		SchedulerAuthority:               request.SchedulerAuthority,
+	}
+	raw, err := marshalVNextOwnerClientPayload(wire)
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	response, err := client.roundTrip(
+		ctx,
+		vnextOwnerRPCOperationReclaim,
+		daemonRequest{VNextOwnerReclaim: raw})
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	var decoded vnextOwnerRPCReclaimResponse
+	if err := decodeVNextOwnerClientSuccess(
+		response, vnextOwnerRPCOperationReclaim, &decoded); err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	return convertVNextOwnerClientReclaimResponse(request, decoded)
+}
+
+func convertVNextOwnerClientReclaimResponse(
+	request vnextOwnerReclaimRequest,
+	wire vnextOwnerRPCReclaimResponse,
+) (vnextOwnerReclaimResponse, error) {
+	if wire.Protocol != vnextOwnerRPCProtocol ||
+		wire.Operation != vnextOwnerRPCOperationReclaim ||
+		wire.State != "RECLAIMED" ||
+		wire.RequestID != request.RequestID ||
+		wire.Allocation.internal() != request.Allocation ||
+		wire.RetirementEpoch != request.RetirementEpoch ||
+		wire.CatalogRevisionBarrier != request.CatalogRevisionBarrier ||
+		wire.ActiveRestoreCount != request.ActiveRestoreCount ||
+		wire.OwnerJournalSequence == 0 ||
+		wire.OwnerJournalSequence > uint64(math.MaxInt64) {
+		return vnextOwnerReclaimResponse{}, errors.New(
+			"reclaim response protocol, state, identity, or barrier differs")
+	}
+	rootResponse, err := convertVNextOwnerClientSealResponse(
+		request.Allocation,
+		vnextOwnerRPCSealResponse{
+			Protocol:  vnextOwnerRPCProtocol,
+			Operation: vnextOwnerRPCOperationSeal,
+			Root:      wire.ExpectedCheckpointRoot,
+		})
+	if err != nil || !equalVNextOwnerCheckpointRoot(
+		rootResponse.Root, request.ExpectedCheckpointRoot) {
+		return vnextOwnerReclaimResponse{}, errors.New(
+			"reclaim response expected checkpoint root differs")
+	}
+	readerDrain, err := decodeCanonicalVNextOwnerClientDigest(
+		"reader-drain evidence digest", wire.ReaderDrainEvidenceDigest)
+	if err != nil || readerDrain != request.ReaderDrainEvidenceDigest {
+		return vnextOwnerReclaimResponse{}, errors.New(
+			"reclaim response reader-drain evidence differs")
+	}
+	producerFence, err := decodeCanonicalVNextOwnerClientDigest(
+		"producer-write-fence evidence digest", wire.ProducerWriteFenceEvidenceDigest)
+	if err != nil || producerFence != request.ProducerWriteFenceEvidenceDigest {
+		return vnextOwnerReclaimResponse{}, errors.New(
+			"reclaim response producer-write-fence evidence differs")
+	}
+	dedupDisposition, err := decodeCanonicalVNextOwnerClientDigest(
+		"dedup/reference-disposition digest", wire.DedupReferenceDispositionDigest)
+	if err != nil || dedupDisposition != request.DedupReferenceDispositionDigest {
+		return vnextOwnerReclaimResponse{}, errors.New(
+			"reclaim response dedup/reference disposition differs")
+	}
+	requestDigest, err := decodeCanonicalVNextOwnerClientDigest(
+		"reclaim request digest", wire.RequestDigest)
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	ownerReceipt, err := decodeCanonicalVNextOwnerClientDigest(
+		"Owner reclaim receipt", wire.OwnerReceipt)
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	schedulerProof, err := wire.SchedulerProof.internal()
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	expectedProof, err := vnextOwnerSchedulerExpectedProof(
+		vnextOwnerRPCOperationReclaim, request, request.SchedulerAuthority)
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, fmt.Errorf(
+			"derive VNext Owner reclaim Scheduler proof: %w", err)
+	}
+	if schedulerProof != expectedProof ||
+		requestDigest != expectedProof.MutationDigest ||
+		ownerReceipt != vnextOwnerReclaimReceipt(
+			request.Allocation, requestDigest, schedulerProof, wire.OwnerJournalSequence) {
+		return vnextOwnerReclaimResponse{}, errors.New(
+			"reclaim response proof, digest, or Owner receipt differs")
+	}
+	return vnextOwnerReclaimResponse{
+		RequestID:                        request.RequestID,
+		Allocation:                       request.Allocation,
+		ExpectedCheckpointRoot:           cloneVNextOwnerCheckpointRoot(request.ExpectedCheckpointRoot),
+		RetirementEpoch:                  request.RetirementEpoch,
+		CatalogRevisionBarrier:           request.CatalogRevisionBarrier,
+		ActiveRestoreCount:               request.ActiveRestoreCount,
+		ReaderDrainEvidenceDigest:        readerDrain,
+		ProducerWriteFenceEvidenceDigest: producerFence,
+		DedupReferenceDispositionDigest:  dedupDisposition,
+		RequestDigest:                    requestDigest,
+		OwnerJournalSequence:             wire.OwnerJournalSequence,
+		OwnerReceipt:                     ownerReceipt,
+		Replayed:                         wire.Replayed,
+		SchedulerProof:                   schedulerProof,
+	}, nil
+}
+
+func (client *vnextOwnerClient) ReclaimStatusAndFence(
+	ctx context.Context,
+	request vnextOwnerReclaimStatusAndFenceRequest,
+) (vnextOwnerReclaimStatusAndFenceResponse, error) {
+	if client == nil || client.transport == nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, errors.New(
+			"VNext Owner client is unavailable")
+	}
+	if err := validateVNextOwnerReclaimStatusAndFenceRequest(request); err != nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, err
+	}
+	expectedProof, err := vnextOwnerRPCSchedulerProofWire(
+		request.ExpectedReclaimSchedulerProof)
+	if err != nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, err
+	}
+	wire := vnextOwnerRPCReclaimStatusAndFenceRequest{
+		Protocol:                      vnextOwnerRPCProtocol,
+		RequestID:                     request.RequestID,
+		Allocation:                    vnextOwnerRPCIdentityFromInternal(request.Allocation),
+		ExpectedReclaimRequestID:      request.ExpectedReclaimRequestID,
+		ExpectedReclaimRequestDigest:  hex.EncodeToString(request.ExpectedReclaimRequestDigest[:]),
+		ExpectedReclaimSchedulerProof: expectedProof,
+		SchedulerAuthority:            request.SchedulerAuthority,
+	}
+	raw, err := marshalVNextOwnerClientPayload(wire)
+	if err != nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, err
+	}
+	response, err := client.roundTrip(
+		ctx,
+		vnextOwnerRPCOperationReclaimStatusAndFence,
+		daemonRequest{VNextOwnerReclaimStatusAndFence: raw})
+	if err != nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, err
+	}
+	var decoded vnextOwnerRPCReclaimStatusAndFenceResponse
+	if err := decodeVNextOwnerClientSuccess(
+		response, vnextOwnerRPCOperationReclaimStatusAndFence, &decoded); err != nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, err
+	}
+	state := vnextOwnerReclaimStatus(decoded.State)
+	if decoded.Protocol != vnextOwnerRPCProtocol ||
+		decoded.Operation != vnextOwnerRPCOperationReclaimStatusAndFence ||
+		decoded.RequestID != request.RequestID ||
+		decoded.Allocation.internal() != request.Allocation ||
+		!state.valid() || decoded.SnapshotSequence == 0 ||
+		decoded.SnapshotSequence > uint64(math.MaxInt64) ||
+		decoded.FenceCreateRevision == 0 ||
+		decoded.FenceCreateRevision > uint64(math.MaxInt64) ||
+		decoded.FenceCreateRevision !=
+			request.SchedulerAuthority.CreateRevision ||
+		(state == vnextOwnerReclaimDone) != decoded.HasReclaim {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, errors.New(
+			"reclaim status response identity, state, or fence is invalid")
+	}
+	if !decoded.HasReclaim &&
+		!vnextOwnerRPCReclaimResponseIsZero(decoded.Reclaim) {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, errors.New(
+			"non-terminal reclaim status exposed terminal evidence")
+	}
+	result := vnextOwnerReclaimStatusAndFenceResponse{
+		RequestID:           request.RequestID,
+		Allocation:          request.Allocation,
+		State:               state,
+		SnapshotSequence:    decoded.SnapshotSequence,
+		FenceCreateRevision: decoded.FenceCreateRevision,
+	}
+	if decoded.HasReclaim {
+		terminal, err := decodeVNextOwnerClientReclaimEvidence(decoded.Reclaim)
+		if err != nil {
+			return vnextOwnerReclaimStatusAndFenceResponse{}, err
+		}
+		if terminal.RequestID != request.ExpectedReclaimRequestID ||
+			terminal.Allocation != request.Allocation ||
+			terminal.RequestDigest != request.ExpectedReclaimRequestDigest ||
+			terminal.SchedulerProof != request.ExpectedReclaimSchedulerProof {
+			return vnextOwnerReclaimStatusAndFenceResponse{}, errors.New(
+				"terminal reclaim status does not match expected request")
+		}
+		if decoded.SnapshotSequence < terminal.OwnerJournalSequence {
+			return vnextOwnerReclaimStatusAndFenceResponse{}, errors.New(
+				"reclaim status snapshot predates terminal Owner evidence")
+		}
+		result.Reclaim = &terminal
+	}
+	return result, nil
+}
+
+func decodeVNextOwnerClientReclaimEvidence(
+	wire vnextOwnerRPCReclaimResponse,
+) (vnextOwnerReclaimResponse, error) {
+	allocation := wire.Allocation.internal()
+	if wire.Protocol != vnextOwnerRPCProtocol ||
+		wire.Operation != vnextOwnerRPCOperationReclaim || wire.State != "RECLAIMED" ||
+		wire.RequestID == "" || wire.ActiveRestoreCount != 0 ||
+		wire.OwnerJournalSequence == 0 ||
+		wire.OwnerJournalSequence > uint64(math.MaxInt64) {
+		return vnextOwnerReclaimResponse{}, errors.New("terminal reclaim evidence is invalid")
+	}
+	rootResponse, err := convertVNextOwnerClientSealResponse(
+		allocation,
+		vnextOwnerRPCSealResponse{
+			Protocol:  vnextOwnerRPCProtocol,
+			Operation: vnextOwnerRPCOperationSeal,
+			Root:      wire.ExpectedCheckpointRoot,
+		})
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	readerDrain, err := decodeCanonicalVNextOwnerClientDigest(
+		"reader-drain evidence digest", wire.ReaderDrainEvidenceDigest)
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	producerFence, err := decodeCanonicalVNextOwnerClientDigest(
+		"producer-write-fence evidence digest", wire.ProducerWriteFenceEvidenceDigest)
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	dedupDisposition, err := decodeCanonicalVNextOwnerClientDigest(
+		"dedup/reference-disposition digest", wire.DedupReferenceDispositionDigest)
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	request := vnextOwnerReclaimRequest{
+		RequestID:                        wire.RequestID,
+		Allocation:                       allocation,
+		ExpectedCheckpointRoot:           rootResponse.Root,
+		RetirementEpoch:                  wire.RetirementEpoch,
+		CatalogRevisionBarrier:           wire.CatalogRevisionBarrier,
+		ActiveRestoreCount:               wire.ActiveRestoreCount,
+		ReaderDrainEvidenceDigest:        readerDrain,
+		ProducerWriteFenceEvidenceDigest: producerFence,
+		DedupReferenceDispositionDigest:  dedupDisposition,
+	}
+	if err := validateVNextOwnerReclaimRequest(request); err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	wantDigest, err := vnextOwnerSchedulerMutationDigest(
+		vnextOwnerRPCOperationReclaim, request)
+	if err != nil {
+		return vnextOwnerReclaimResponse{}, err
+	}
+	requestDigest, err := decodeCanonicalVNextOwnerClientDigest(
+		"reclaim request digest", wire.RequestDigest)
+	if err != nil || requestDigest != wantDigest {
+		return vnextOwnerReclaimResponse{}, errors.New(
+			"terminal reclaim request digest differs")
+	}
+	proof, err := wire.SchedulerProof.internal()
+	if err != nil || proof.MutationDigest != wantDigest {
+		return vnextOwnerReclaimResponse{}, errors.New(
+			"terminal reclaim Scheduler proof differs")
+	}
+	ownerReceipt, err := decodeCanonicalVNextOwnerClientDigest(
+		"Owner reclaim receipt", wire.OwnerReceipt)
+	if err != nil || ownerReceipt != vnextOwnerReclaimReceipt(
+		allocation, wantDigest, proof, wire.OwnerJournalSequence) {
+		return vnextOwnerReclaimResponse{}, errors.New(
+			"terminal Owner reclaim receipt differs")
+	}
+	return vnextOwnerReclaimResponse{
+		RequestID:                        request.RequestID,
+		Allocation:                       allocation,
+		ExpectedCheckpointRoot:           rootResponse.Root,
+		RetirementEpoch:                  request.RetirementEpoch,
+		CatalogRevisionBarrier:           request.CatalogRevisionBarrier,
+		ActiveRestoreCount:               request.ActiveRestoreCount,
+		ReaderDrainEvidenceDigest:        readerDrain,
+		ProducerWriteFenceEvidenceDigest: producerFence,
+		DedupReferenceDispositionDigest:  dedupDisposition,
+		RequestDigest:                    wantDigest,
+		OwnerJournalSequence:             wire.OwnerJournalSequence,
+		OwnerReceipt:                     ownerReceipt,
+		Replayed:                         wire.Replayed,
+		SchedulerProof:                   proof,
+	}, nil
 }
 
 func (client *vnextOwnerClient) ProducerAbortVNextCheckpoint(

@@ -427,7 +427,7 @@ func decodeVNextOwnerGatewayCall(
 	}
 	if request.TimeoutMillis != 0 {
 		return vnextOwnerGatewayCall{}, errors.New(
-			"VNext Owner protocol v5 does not support timeoutMillis; it must be zero")
+			"VNext Owner protocol v6 does not support timeoutMillis; it must be zero")
 	}
 	raw, err := vnextOwnerRPCPayload(operation, request)
 	if err != nil {
@@ -552,6 +552,32 @@ func decodeVNextOwnerGatewayCall(
 			key: vnextOwnerGatewayRouteKey{identity.OwnerID, identity.OwnerEpoch},
 			invoke: func(ctx context.Context, client *vnextOwnerClient) error {
 				return client.ProducerAbortVNextCheckpoint(ctx, identity, capability)
+			},
+		}, nil
+	case vnextOwnerRPCOperationReclaim:
+		decoded, err := decodeVNextOwnerRPCReclaimRequest(raw)
+		if err != nil {
+			return vnextOwnerGatewayCall{}, err
+		}
+		return vnextOwnerGatewayCall{
+			key: vnextOwnerGatewayRouteKey{
+				decoded.Allocation.OwnerID, decoded.Allocation.OwnerEpoch},
+			invoke: func(ctx context.Context, client *vnextOwnerClient) error {
+				_, err := client.ReclaimVNextCheckpoint(ctx, decoded)
+				return err
+			},
+		}, nil
+	case vnextOwnerRPCOperationReclaimStatusAndFence:
+		decoded, err := decodeVNextOwnerRPCReclaimStatusAndFenceRequest(raw)
+		if err != nil {
+			return vnextOwnerGatewayCall{}, err
+		}
+		return vnextOwnerGatewayCall{
+			key: vnextOwnerGatewayRouteKey{
+				decoded.Allocation.OwnerID, decoded.Allocation.OwnerEpoch},
+			invoke: func(ctx context.Context, client *vnextOwnerClient) error {
+				_, err := client.ReclaimStatusAndFence(ctx, decoded)
+				return err
 			},
 		}, nil
 	case vnextOwnerRPCOperationCommit, vnextOwnerRPCOperationAbort:

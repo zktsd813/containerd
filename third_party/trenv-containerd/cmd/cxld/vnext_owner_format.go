@@ -15,7 +15,7 @@ const (
 	vnextOwnerSchedulerProofEncodedBytes            = 96
 )
 
-var vnextOwnerJournalMagic = [8]byte{'T', 'R', 'O', 'W', 'N', '0', '0', '9'}
+var vnextOwnerJournalMagic = [8]byte{'T', 'R', 'O', 'W', 'N', '0', '1', '0'}
 
 type vnextOwnerTransactionState uint8
 
@@ -66,6 +66,26 @@ type vnextOwnerDeviceFragment struct {
 	Extents            []vnextOwnerExtent
 }
 
+// vnextOwnerReclaimRecord is the exact Scheduler-authorized reclaim request
+// persisted before any descriptor or allocator mutation. It remains attached
+// to the terminal tombstone so a lost response can be recovered only by an
+// exact signed replay; a different request can never claim the same pages.
+type vnextOwnerReclaimRecord struct {
+	RequestID                        string
+	RequestDigest                    [32]byte
+	Allocation                       vnextOwnerOperationIdentity
+	ExpectedCheckpointRoot           vnextOwnerCheckpointRoot
+	RetirementEpoch                  uint64
+	CatalogRevisionBarrier           uint64
+	ActiveRestoreCount               uint64
+	ReaderDrainEvidenceDigest        [32]byte
+	ProducerWriteFenceEvidenceDigest [32]byte
+	DedupReferenceDispositionDigest  [32]byte
+	SchedulerProof                   vnextOwnerSchedulerProof
+	TerminalJournalSequence          uint64
+	OwnerReceipt                     [32]byte
+}
+
 type vnextOwnerTransaction struct {
 	AllocationRecordID    uint64
 	RequestID             string
@@ -75,6 +95,7 @@ type vnextOwnerTransaction struct {
 	SchedulerReserveProof vnextOwnerSchedulerProof
 	SchedulerCommitProof  vnextOwnerSchedulerProof
 	SchedulerAbortProof   vnextOwnerSchedulerProof
+	Reclaim               *vnextOwnerReclaimRecord
 	AbortOrigin           vnextOwnerAbortOrigin
 	State                 vnextOwnerTransactionState
 	TotalPages            uint64
@@ -145,6 +166,12 @@ func (journal *vnextOwnerJournal) clone() *vnextOwnerJournal {
 			capability := *transaction.ProducerCapability
 			copyTransaction.ProducerCapability = &capability
 		}
+		if transaction.Reclaim != nil {
+			reclaim := *transaction.Reclaim
+			reclaim.ExpectedCheckpointRoot = cloneVNextOwnerCheckpointRoot(
+				transaction.Reclaim.ExpectedCheckpointRoot)
+			copyTransaction.Reclaim = &reclaim
+		}
 		cloned.Transactions[allocationID] = &copyTransaction
 	}
 	for requestID, allocationID := range journal.RequestIndex {
@@ -210,6 +237,14 @@ func (journal *vnextOwnerJournal) marshalAtSequence(
 		vnextMarshalOwnerSchedulerProof(&payload, transaction.SchedulerReserveProof)
 		vnextMarshalOwnerSchedulerProof(&payload, transaction.SchedulerCommitProof)
 		vnextMarshalOwnerSchedulerProof(&payload, transaction.SchedulerAbortProof)
+		if transaction.Reclaim == nil {
+			payload.WriteByte(0)
+			payload.Write(make([]byte, 7))
+		} else {
+			payload.WriteByte(1)
+			payload.Write(make([]byte, 7))
+			vnextMarshalOwnerReclaimRecord(&payload, transaction.Reclaim)
+		}
 		vnextWriteU32(&payload, uint32(len(transaction.Contents)))
 		for _, content := range transaction.Contents {
 			payload.WriteByte(byte(content.Kind))
@@ -264,6 +299,60 @@ func (journal *vnextOwnerJournal) marshalAtSequence(
 		}
 	}
 	return vnextMarshalEnvelope(vnextOwnerJournalMagic, payload.Bytes())
+}
+
+func vnextMarshalOwnerReclaimRecord(
+	payload *bytes.Buffer,
+	record *vnextOwnerReclaimRecord,
+) {
+	vnextWriteString(payload, record.RequestID)
+	payload.Write(record.RequestDigest[:])
+	vnextMarshalOwnerOperationIdentity(payload, record.Allocation)
+	vnextMarshalOwnerCheckpointRoot(payload, record.ExpectedCheckpointRoot)
+	vnextWriteU64(payload, record.RetirementEpoch)
+	vnextWriteU64(payload, record.CatalogRevisionBarrier)
+	vnextWriteU64(payload, record.ActiveRestoreCount)
+	payload.Write(record.ReaderDrainEvidenceDigest[:])
+	payload.Write(record.ProducerWriteFenceEvidenceDigest[:])
+	payload.Write(record.DedupReferenceDispositionDigest[:])
+	vnextMarshalOwnerSchedulerProof(payload, record.SchedulerProof)
+	vnextWriteU64(payload, record.TerminalJournalSequence)
+	payload.Write(record.OwnerReceipt[:])
+}
+
+func vnextMarshalOwnerOperationIdentity(
+	payload *bytes.Buffer,
+	identity vnextOwnerOperationIdentity,
+) {
+	vnextWriteString(payload, identity.RequestID)
+	vnextWriteString(payload, identity.CheckpointID)
+	vnextWriteString(payload, identity.ProducerID)
+	vnextWriteString(payload, identity.OwnerID)
+	vnextWriteU64(payload, identity.OwnerEpoch)
+	vnextWriteU64(payload, identity.AllocationRecordID)
+}
+
+func vnextMarshalOwnerCheckpointRoot(
+	payload *bytes.Buffer,
+	root vnextOwnerCheckpointRoot,
+) {
+	vnextWriteString(payload, root.RootID)
+	vnextWriteU64(payload, root.RootVersion)
+	vnextWriteString(payload, root.MMTemplateID)
+	vnextWriteString(payload, root.PageMapID)
+	vnextWriteU64(payload, root.PageMapVersion)
+	payload.Write(root.DeviceTableDigest[:])
+	vnextWriteString(payload, root.ContractID)
+	vnextWriteU64(payload, root.Locator.PublicationByteLength)
+	payload.Write(root.Locator.PublicationSHA256[:])
+	vnextWriteU32(payload, uint32(len(root.Locator.PageRuns)))
+	for _, run := range root.Locator.PageRuns {
+		vnextWriteString(payload, run.FirstPage.OwnerID)
+		vnextWriteString(payload, run.FirstPage.DeviceUUID)
+		vnextWriteU64(payload, run.FirstPage.DataPageIndex)
+		vnextWriteU64(payload, run.FirstPage.AllocationRecordID)
+		vnextWriteU64(payload, run.PageCount)
+	}
 }
 
 func vnextMarshalOwnerSchedulerHighWater(
@@ -601,6 +690,23 @@ func vnextParseOwnerTransaction(decoder *vnextDecoder) (*vnextOwnerTransaction, 
 	if err != nil {
 		return nil, err
 	}
+	hasReclaim, err := decoder.u8()
+	if err != nil {
+		return nil, err
+	}
+	reserved, err = decoder.bytes(7)
+	if err != nil {
+		return nil, err
+	}
+	if hasReclaim > 1 || !vnextAllZero(reserved) {
+		return nil, fmt.Errorf("Owner reclaim presence field is invalid: %w", errVNextWrongFormat)
+	}
+	if hasReclaim == 1 {
+		transaction.Reclaim, err = vnextParseOwnerReclaimRecord(decoder)
+		if err != nil {
+			return nil, err
+		}
+	}
 	contentCount, err := decoder.u32()
 	if err != nil {
 		return nil, err
@@ -700,6 +806,156 @@ func vnextParseOwnerTransaction(decoder *vnextDecoder) (*vnextOwnerTransaction, 
 		transaction.ProducerCapability = capability
 	}
 	return transaction, nil
+}
+
+func vnextParseOwnerReclaimRecord(
+	decoder *vnextDecoder,
+) (*vnextOwnerReclaimRecord, error) {
+	record := &vnextOwnerReclaimRecord{}
+	var err error
+	if record.RequestID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return nil, err
+	}
+	digest, err := decoder.bytes(32)
+	if err != nil {
+		return nil, err
+	}
+	copy(record.RequestDigest[:], digest)
+	if record.Allocation, err = vnextParseOwnerOperationIdentity(decoder); err != nil {
+		return nil, err
+	}
+	if record.ExpectedCheckpointRoot, err = vnextParseOwnerCheckpointRoot(decoder); err != nil {
+		return nil, err
+	}
+	if record.RetirementEpoch, err = decoder.u64(); err != nil {
+		return nil, err
+	}
+	if record.CatalogRevisionBarrier, err = decoder.u64(); err != nil {
+		return nil, err
+	}
+	if record.ActiveRestoreCount, err = decoder.u64(); err != nil {
+		return nil, err
+	}
+	digest, err = decoder.bytes(32)
+	if err != nil {
+		return nil, err
+	}
+	copy(record.ReaderDrainEvidenceDigest[:], digest)
+	digest, err = decoder.bytes(32)
+	if err != nil {
+		return nil, err
+	}
+	copy(record.ProducerWriteFenceEvidenceDigest[:], digest)
+	digest, err = decoder.bytes(32)
+	if err != nil {
+		return nil, err
+	}
+	copy(record.DedupReferenceDispositionDigest[:], digest)
+	if record.SchedulerProof, err = vnextParseOwnerSchedulerProof(decoder); err != nil {
+		return nil, err
+	}
+	if record.TerminalJournalSequence, err = decoder.u64(); err != nil {
+		return nil, err
+	}
+	receipt, err := decoder.bytes(32)
+	if err != nil {
+		return nil, err
+	}
+	copy(record.OwnerReceipt[:], receipt)
+	return record, nil
+}
+
+func vnextParseOwnerOperationIdentity(
+	decoder *vnextDecoder,
+) (vnextOwnerOperationIdentity, error) {
+	var identity vnextOwnerOperationIdentity
+	var err error
+	if identity.RequestID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return identity, err
+	}
+	if identity.CheckpointID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return identity, err
+	}
+	if identity.ProducerID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return identity, err
+	}
+	if identity.OwnerID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return identity, err
+	}
+	if identity.OwnerEpoch, err = decoder.u64(); err != nil {
+		return identity, err
+	}
+	if identity.AllocationRecordID, err = decoder.u64(); err != nil {
+		return identity, err
+	}
+	return identity, nil
+}
+
+func vnextParseOwnerCheckpointRoot(
+	decoder *vnextDecoder,
+) (vnextOwnerCheckpointRoot, error) {
+	var root vnextOwnerCheckpointRoot
+	var err error
+	if root.RootID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return root, err
+	}
+	if root.RootVersion, err = decoder.u64(); err != nil {
+		return root, err
+	}
+	if root.MMTemplateID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return root, err
+	}
+	if root.PageMapID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return root, err
+	}
+	if root.PageMapVersion, err = decoder.u64(); err != nil {
+		return root, err
+	}
+	digest, err := decoder.bytes(32)
+	if err != nil {
+		return root, err
+	}
+	copy(root.DeviceTableDigest[:], digest)
+	if root.ContractID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return root, err
+	}
+	if root.Locator.PublicationByteLength, err = decoder.u64(); err != nil {
+		return root, err
+	}
+	digest, err = decoder.bytes(32)
+	if err != nil {
+		return root, err
+	}
+	copy(root.Locator.PublicationSHA256[:], digest)
+	runCount, err := decoder.u32()
+	if err != nil {
+		return root, err
+	}
+	if runCount == 0 || runCount > vnextOwnerRPCMaxExtents {
+		return root, fmt.Errorf("Owner checkpoint-root run count %d is invalid: %w",
+			runCount, errVNextCorrupt)
+	}
+	root.Locator.PageRuns = make([]vnextOwnerPublicationPageRun, 0, runCount)
+	for index := uint32(0); index < runCount; index++ {
+		var run vnextOwnerPublicationPageRun
+		if run.FirstPage.OwnerID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+			return root, err
+		}
+		if run.FirstPage.DeviceUUID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+			return root, err
+		}
+		if run.FirstPage.DataPageIndex, err = decoder.u64(); err != nil {
+			return root, err
+		}
+		if run.FirstPage.AllocationRecordID, err = decoder.u64(); err != nil {
+			return root, err
+		}
+		if run.PageCount, err = decoder.u64(); err != nil {
+			return root, err
+		}
+		root.Locator.PageRuns = append(root.Locator.PageRuns, run)
+	}
+	return root, nil
 }
 
 func vnextParseProducerCapabilityRecord(
@@ -905,6 +1161,18 @@ func vnextValidateOwnerTransaction(
 		return fmt.Errorf("Owner transaction %d attributes a non-Scheduler abort to Scheduler: %w",
 			transaction.AllocationRecordID, errVNextCorrupt)
 	}
+	reclaimState := transaction.State == vnextOwnerReclaiming ||
+		transaction.State == vnextOwnerReclaimed
+	if reclaimState != (transaction.Reclaim != nil) {
+		return fmt.Errorf("Owner transaction %d has inconsistent reclaim metadata: %w",
+			transaction.AllocationRecordID, errVNextCorrupt)
+	}
+	if transaction.Reclaim != nil {
+		if err := vnextValidateOwnerReclaimRecord(
+			transaction, ownerID, ownerEpoch); err != nil {
+			return err
+		}
+	}
 	negativeTombstone := transaction.State == vnextOwnerRejectedNoSpace
 	if (len(transaction.Fragments) == 0) != negativeTombstone {
 		return fmt.Errorf("Owner transaction %d has fragments inconsistent with state %d: %w",
@@ -1030,6 +1298,76 @@ func vnextValidateOwnerTransaction(
 		transaction.ProducerCapability, ownerID, ownerEpoch, transaction); err != nil {
 		return fmt.Errorf("Owner transaction %d Producer capability is invalid: %w",
 			transaction.AllocationRecordID, err)
+	}
+	return nil
+}
+
+func vnextValidateOwnerReclaimRecord(
+	transaction *vnextOwnerTransaction,
+	ownerID string,
+	ownerEpoch uint64,
+) error {
+	record := transaction.Reclaim
+	if record == nil {
+		return fmt.Errorf("Owner transaction %d lacks reclaim metadata: %w",
+			transaction.AllocationRecordID, errVNextCorrupt)
+	}
+	wantAllocation := vnextOwnerOperationIdentity{
+		RequestID:          transaction.RequestID,
+		CheckpointID:       transaction.CheckpointID,
+		ProducerID:         transaction.ProducerID,
+		OwnerID:            ownerID,
+		OwnerEpoch:         ownerEpoch,
+		AllocationRecordID: transaction.AllocationRecordID,
+	}
+	request := vnextOwnerReclaimRequest{
+		RequestID:                        record.RequestID,
+		Allocation:                       record.Allocation,
+		ExpectedCheckpointRoot:           record.ExpectedCheckpointRoot,
+		RetirementEpoch:                  record.RetirementEpoch,
+		CatalogRevisionBarrier:           record.CatalogRevisionBarrier,
+		ActiveRestoreCount:               record.ActiveRestoreCount,
+		ReaderDrainEvidenceDigest:        record.ReaderDrainEvidenceDigest,
+		ProducerWriteFenceEvidenceDigest: record.ProducerWriteFenceEvidenceDigest,
+		DedupReferenceDispositionDigest:  record.DedupReferenceDispositionDigest,
+	}
+	if record.Allocation != wantAllocation {
+		return fmt.Errorf("Owner transaction %d reclaim allocation identity differs: %w",
+			transaction.AllocationRecordID, errVNextCorrupt)
+	}
+	if err := validateVNextOwnerReclaimRequest(request); err != nil {
+		return fmt.Errorf("Owner transaction %d reclaim request is invalid: %w",
+			transaction.AllocationRecordID, err)
+	}
+	wantDigest, err := vnextOwnerSchedulerMutationDigest(
+		vnextOwnerRPCOperationReclaim, request)
+	if err != nil || record.RequestDigest != wantDigest ||
+		record.SchedulerProof.MutationDigest != wantDigest ||
+		!record.SchedulerProof.valid() {
+		return fmt.Errorf("Owner transaction %d reclaim proof or digest differs: %w",
+			transaction.AllocationRecordID, errVNextCorrupt)
+	}
+	if transaction.State == vnextOwnerReclaiming {
+		if record.TerminalJournalSequence != 0 ||
+			record.OwnerReceipt != ([32]byte{}) {
+			return fmt.Errorf("Owner transaction %d RECLAIMING has terminal evidence: %w",
+				transaction.AllocationRecordID, errVNextCorrupt)
+		}
+		return nil
+	}
+	if record.TerminalJournalSequence == 0 ||
+		record.TerminalJournalSequence > uint64(math.MaxInt64) {
+		return fmt.Errorf("Owner transaction %d has invalid terminal reclaim sequence: %w",
+			transaction.AllocationRecordID, errVNextCorrupt)
+	}
+	wantReceipt := vnextOwnerReclaimReceipt(
+		record.Allocation,
+		record.RequestDigest,
+		record.SchedulerProof,
+		record.TerminalJournalSequence)
+	if record.OwnerReceipt != wantReceipt || vnextAllZero(record.OwnerReceipt[:]) {
+		return fmt.Errorf("Owner transaction %d reclaim receipt is invalid: %w",
+			transaction.AllocationRecordID, errVNextCorrupt)
 	}
 	return nil
 }

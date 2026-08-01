@@ -66,6 +66,8 @@ type daemonRequest struct {
 	VNextOwnerProducerAbort              json.RawMessage           `json:"vnextOwnerProducerAbort,omitempty"`
 	VNextOwnerCommit                     json.RawMessage           `json:"vnextOwnerCommit,omitempty"`
 	VNextOwnerAbort                      json.RawMessage           `json:"vnextOwnerAbort,omitempty"`
+	VNextOwnerReclaim                    json.RawMessage           `json:"vnextOwnerReclaim,omitempty"`
+	VNextOwnerReclaimStatusAndFence      json.RawMessage           `json:"vnextOwnerReclaimStatusAndFence,omitempty"`
 	VNextOwnerInventory                  json.RawMessage           `json:"vnextOwnerInventory,omitempty"`
 	VNextOwnerReservationStatus          json.RawMessage           `json:"vnextOwnerReservationStatus,omitempty"`
 	VNextOwnerSetAdmission               json.RawMessage           `json:"vnextOwnerSetAdmission,omitempty"`
@@ -467,6 +469,8 @@ func runCommandWithVNextOwnerBoundaryCaller(
 		vnextOwnerRPCOperationProducerAbort,
 		vnextOwnerRPCOperationCommit,
 		vnextOwnerRPCOperationAbort,
+		vnextOwnerRPCOperationReclaim,
+		vnextOwnerRPCOperationReclaimStatusAndFence,
 		vnextOwnerRPCOperationInventory,
 		vnextOwnerRPCOperationReservationStatus,
 		vnextOwnerRPCOperationSetAdmission,

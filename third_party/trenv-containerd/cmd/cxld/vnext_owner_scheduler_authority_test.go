@@ -112,10 +112,10 @@ func TestVNextOwnerSchedulerCanonicalGolden(t *testing.T) {
 	authority, verified := vnextOwnerSchedulerTestAuthority(
 		t, vnextOwnerRPCOperationReserve, mutation)
 	const wantLeaderValue = "cxld-scheduler-leader-v1:c2NoZWR1bGVyL3Rlc3QtYQ:01a2b3c4d5e6f708:oKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr8:MCowBQYDK2VwAyEAebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ"
-	const wantTermID = "fb5b8daad8459394988e90ad1fa291e9d9f2809692a9bcaece4f83de13090a23"
-	const wantMutationDigest = "356d18e484d1b1ea755a24c07f94b72de050d1a7be99dbfade743e5f9ffd9a34"
-	const wantSignature = "VNxpRP6_s3KntcpdD7S150D6-eqvKKzZO6uLtPAbtxVMoz-e1a9zhJliJjopFOezN-3uYz_7t_0clxyYXrChDA"
-	const wantReceipt = "e3af062b83fbca3452c8ebbfca8b793b2a239453d6e155af084e84fa389d4f1d"
+	const wantTermID = "ba38f636fde761e7ae5464a599cf8724382b0b1e024de34910fa95799ff4bc70"
+	const wantMutationDigest = "52df6e9dbef3ef7ab2f1a1f5acdf75b77c7f5fa54e7ffa9ec3aac25c35cee3af"
+	const wantSignature = "P7GoUywXygshB-GaRPujODQPFipdyThpdju7MjG0geweRbe6UmO1Wwy-ZRwQpE0VRS0juWPT6Npzk1_fCv4tAQ"
+	const wantReceipt = "53ee272bb94c81f40a840153eb3a39225cc5753de63fd3611a64aeafc1c9f6c6"
 	for name, values := range map[string][2]string{
 		"leader value":    {authority.LeaderValue, wantLeaderValue},
 		"term ID":         {authority.TermID, wantTermID},
@@ -363,9 +363,9 @@ func TestVNextOwnerSchedulerAllMutationGoldens(t *testing.T) {
 				From: vnextOwnerAdmissionActive, Target: vnextOwnerAdmissionReadOnly,
 				ExpectedSequence: 1,
 			},
-			wantMutation:  "46fc00d4e99f7c3074f6b7b8e460c0522bc19cb356de1cece0cde5438a137e2a",
-			wantSignature: "NMSQp_YtloA5ZlBR3tbM1EgyxnyubmANXPa0uLEle1t1lsU31NNA7w5p9xMRsonZD0YBTGc8eZfbNOETb6rqDA",
-			wantReceipt:   "5a289f9fb366eaf46d0eecf4d56e15f815bd3c10447368a30c6861daa2391fa8",
+			wantMutation:  "1f32284a798f4654e7555867f469ba1d1ed105899a88e8f8a8fec82274f46e1d",
+			wantSignature: "MSUo2iIzx6IVOnaAojIQsmrB5-L3drZGy02montmsiGX_1yhEsU2Ch_Lz4B-npEO_CE4182aiL8WJTCmhi6xDA",
+			wantReceipt:   "733872c6b5f55fb96bc7634812d297fe0afc30472d9fa6bd2241d397654948e1",
 		},
 		{
 			name:      "reserve-all-content-kinds",
@@ -383,9 +383,9 @@ func TestVNextOwnerSchedulerAllMutationGoldens(t *testing.T) {
 					{Kind: vnextOwnerServiceContentPublication, ObjectID: 6, ByteLength: 4096, CapacityPages: 1},
 				},
 			},
-			wantMutation:  "8ad5a03cd8dac4fac826cb0a88fcc4bd6b8d53adbdd4b1f0ddfb35c4d7adc1eb",
-			wantSignature: "WYbrUpD8bfJniZKUKVPbZlaXK-apOTAuGLAh7WTCVG1JsA0kLiciuLsa3TQaeX2jj7TSGkzLSDlIQUR2JorcDw",
-			wantReceipt:   "6b5ddbd9f1293cd265fb9ab57966844dc43f488a350d831cdc2f4a8112042485",
+			wantMutation:  "143d83349d3e6d0df901c87fb867a0896321cb694d383f26e760fc98c2332a5f",
+			wantSignature: "uLU1Xvtp-l3IllNg91OeUT319HrfPM3CUAdZQG5Ct4xhFI_IaFR4fyOGcHW9fH1iV21HI98EYGsB3YgjScyyCA",
+			wantReceipt:   "276882e003461fad9b6d1abc58032352a8a5ceb9e72ac9c03cfb9253ec76486e",
 		},
 		{
 			name:      "issue",
@@ -396,9 +396,9 @@ func TestVNextOwnerSchedulerAllMutationGoldens(t *testing.T) {
 				AllowedOperations:  vnextProducerCapabilityAll,
 				RequestedTTLMillis: 60000, Nonce: issueNonce,
 			},
-			wantMutation:  "6c4ae6ee6e43ef4fa89e19bab364624b0920f1c3dd8f865179a196aefd0e67f9",
-			wantSignature: "wdxReHbQYseS4SQlEihR4cobtiin4A6zxkUU7JB04WRnDtrOev-Fu-zFJIfzFwv-D3U-5QcRXxoqdUl1WkTJDA",
-			wantReceipt:   "b93f09c9da41e72fd45af7eff131edbf27cd2922f55a2ddc1068bf9fc226e8b8",
+			wantMutation:  "a202f0d217e9876535c6a512754f73ce3f41c75a871331dfae7a14b6c473abd8",
+			wantSignature: "nMU_FVU5u-rXe2ZDvnQZImxLCl9oXzTWlBrlH3bl9VMLYsudKzyCA2p19Jgl5tjYERhCRqzF6fq3ObOFDe2YBg",
+			wantReceipt:   "aac9b2e793bb9f7e9df68f97c94362588df9cd7f6eb4b85b793b32a6e8df27d1",
 		},
 		{
 			name:      "producer-capability-issue-status-and-fence",
@@ -409,9 +409,9 @@ func TestVNextOwnerSchedulerAllMutationGoldens(t *testing.T) {
 				ExpectedIssueSchedulerProof: expectedIssueProof,
 				ExpectedIssueCreateRevision: 37,
 			},
-			wantMutation:  "df25531cf3c57e0ca95dcf8c74749eca34fba6e59941cd55018d9e935f25e8a6",
-			wantSignature: "vIf1Wybp5nH9e943NCUXDzMOL_o-lW_ZYsS4v7K0KAzUtxfDqb_CLBFknqxAEwo02JBZFL7ETyY7cCI0sMgjCA",
-			wantReceipt:   "15e4554a18292bbb0e6e63504ea0a7585d30d62de4ef6dd719d5767e4867fd52",
+			wantMutation:  "b7de5ff0f799ffa403eef0e3dfde7a694c00ab02fa251f7c27fa78cf2aa3c0a1",
+			wantSignature: "JXvhLCN20UF6t5jUxB7WNpzLqcgEtptEgLSFPjUpodRCRBx3p4p2mlvNFvihA7W242Wwf1kuDU6iybE9WAvVDA",
+			wantReceipt:   "78d56a30ac075d2d65e34b5bbcfa2e8c6dea4d4f7518708bb5e04b5a18ba6e4a",
 		},
 		{
 			name:      "revoke",
@@ -420,18 +420,18 @@ func TestVNextOwnerSchedulerAllMutationGoldens(t *testing.T) {
 				RequestID: "capability-revoke-1", Operation: identity,
 				CapabilityID: "00112233445566778899aabbccddeeff",
 			},
-			wantMutation:  "91c9cd2dd9a1d998b401f8c24aa71facf5a0cf8bab5a3e21a72ae0fbb1d36d1d",
-			wantSignature: "pvJJQj9vi7vXB_ipoC834mzgHFrklDFDwnOeGve_hGb9ONUZIEKm3EOU9CREJGHXfUVSPRk21l4SzPG0ZqgFDQ",
-			wantReceipt:   "d6d7a18160972d70f5a1c9250cf4f9af924cc40797fefccfd56947e169f7e799",
+			wantMutation:  "5bffee14ac917792991f8bbaf709223f567ab75ee52f00289915863f83a6b309",
+			wantSignature: "TqMvJUk6SABiTjb3kWtPDBQeUrWMkQ214uqo9o-d4wvM7XuVWUzKPHJPYM7VDdAjpo4BBJR5COgEYrtdwG3uDQ",
+			wantReceipt:   "f676a3cf3e6e087fbe6e690b089b1208e8224b333fabaa0f1aa91a0c1fc79555",
 		},
 		{name: "commit", operation: vnextOwnerRPCOperationCommit, mutation: identity,
-			wantMutation:  "242aab3a158e7408b2c950495b01209654f75089e56081514aafe687896fd026",
-			wantSignature: "QoV6Oo_hPB28iDl94x_4zmJIXTtHpM4TSPnYlxphIvEhF8ZqmE2Q1yORWjR5hCoPL7Kn-6fMqUINYyVwTo-qAg",
-			wantReceipt:   "9c3647db0d2e8b8fb7843153f4005e803574bd54100c803887c5b032699a182c"},
+			wantMutation:  "0c620f5c09a0a23658d907f228c9e014eadc61e8ff31022aadd8267090c7dac0",
+			wantSignature: "9akIOy3Dtmw0KLhhbVRG8YYQcKhoVDE0TJ1HibdpPgPz9LF5suEuJa4cvag2tHuTBrW6VfbEah9_C9rLB8vHDw",
+			wantReceipt:   "8bb92aea82b4f195ed520bb2f9c81906ac3286c7b443f7a48951659166389df6"},
 		{name: "abort", operation: vnextOwnerRPCOperationAbort, mutation: identity,
-			wantMutation:  "7c5ca4c24280f675a223e3f190086ad88d51bd724449164c0949316dde2df104",
-			wantSignature: "LK6mXcIbm1T7eKV2u4P6XEiYvW-H6wSY_J6H4is0jCUkzaB3qgVKAG2x6gWICLxGJHkNXWFbWo-g1xUuhNW4Bg",
-			wantReceipt:   "afa36a040bac9ab0b034e673a34308f2866345f6aaf00ebc241f7e7b6c2c3c11"},
+			wantMutation:  "e822fae38318749e79a38f28d7e6e8918b9133dc6410b15355172a62eaab26eb",
+			wantSignature: "Sr16_M4wxIuXroM0vBi2T74Mp5nSOqvPdqco0aN7qvs9nhWDyw4YePzUVeFMRCq3dMvL0stH3MdBUsLUrzzGAQ",
+			wantReceipt:   "44b173640b05a4baaefb6873481e1375c777f4344a7a7e1962af41612e36c184"},
 	}
 	for _, vector := range vectors {
 		t.Run(vector.name, func(t *testing.T) {
@@ -458,9 +458,9 @@ func TestVNextOwnerSchedulerHighBitClusterIsCanonicalUnsigned(t *testing.T) {
 	if authority.ClusterID != "fedcba9876543210" || verified.Parsed.ClusterID != clusterID {
 		t.Fatalf("high-bit cluster lost unsigned representation: %#v", verified.Parsed)
 	}
-	if authority.TermID != "885654027306807936306b62c6dbd4bb02c3a692277e4b18a322e96d08e7c564" ||
-		authority.Signature != "q2REIJAwgy2XwA_Xs9evlm7aSWCpq72-sZwnXeoKBI_SdsHzDrcqSoUUpS8XOgKNGQwTvHabJ14YUY8kgQShAg" ||
-		hex.EncodeToString(verified.Receipt[:]) != "5cf8aad626d139c743f8d00498101cf1d83e202d7ff9d2c13d73d29084c290dd" {
+	if authority.TermID != "61bf312fa1c37b3f3ea77c1fce31a8bfdc9358177564517a7ef4fdcf42282736" ||
+		authority.Signature != "qIRa6aA91ibP65WpEo2Lb9haNKo576OyI9FbobiaErcDb5HYcbVjXHvOi_0Fz373X8Z1LbPJ818BEHOMnomfCA" ||
+		hex.EncodeToString(verified.Receipt[:]) != "dde3ab28ff4d2c03c98093b889bec7c138a9c40a910cd8d55c995e1a9300cef5" {
 		t.Fatalf("high-bit cluster golden changed: %#v", authority)
 	}
 }

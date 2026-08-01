@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	vnextOwnerSchedulerAuthorityProtocol = "cxld.vnext-owner.v5"
+	vnextOwnerSchedulerAuthorityProtocol = "cxld.vnext-owner.v6"
 	vnextOwnerSchedulerLeaderValuePrefix = "cxld-scheduler-leader-v1"
 	vnextOwnerSchedulerLeaderKeySuffix   = "/cxl-checkpoint/global-orchestrator-leader"
 
@@ -23,6 +23,7 @@ const (
 	vnextOwnerSchedulerMutationDomain  = "cxld-vnext-owner-scheduler-mutation-v1"
 	vnextOwnerSchedulerSignatureDomain = "cxld-vnext-owner-scheduler-signature-v1"
 	vnextOwnerSchedulerReceiptDomain   = "cxld-vnext-owner-scheduler-receipt-v1"
+	vnextOwnerReclaimReceiptDomain     = "cxld-vnext-owner-reclaim-receipt-v1"
 
 	vnextOwnerSchedulerNonceBytes     = 32
 	vnextOwnerSchedulerDigestBytes    = sha256.Size
@@ -386,6 +387,33 @@ func vnextOwnerSchedulerMutationDigest(
 			return zero, errors.New("Scheduler lifecycle mutation has the wrong type")
 		}
 		vnextWriteOwnerSchedulerOperationIdentity(&buffer, identity)
+	case vnextOwnerRPCOperationReclaim:
+		request, ok := mutation.(vnextOwnerReclaimRequest)
+		if !ok {
+			return zero, errors.New("Scheduler Reclaim mutation has the wrong type")
+		}
+		vnextWriteString(&buffer, request.RequestID)
+		vnextWriteOwnerSchedulerOperationIdentity(&buffer, request.Allocation)
+		vnextMarshalOwnerCheckpointRoot(&buffer, request.ExpectedCheckpointRoot)
+		vnextWriteU64(&buffer, request.RetirementEpoch)
+		vnextWriteU64(&buffer, request.CatalogRevisionBarrier)
+		vnextWriteU64(&buffer, request.ActiveRestoreCount)
+		buffer.Write(request.ReaderDrainEvidenceDigest[:])
+		buffer.Write(request.ProducerWriteFenceEvidenceDigest[:])
+		buffer.Write(request.DedupReferenceDispositionDigest[:])
+	case vnextOwnerRPCOperationReclaimStatusAndFence:
+		request, ok := mutation.(vnextOwnerReclaimStatusAndFenceRequest)
+		if !ok {
+			return zero, errors.New(
+				"Scheduler ReclaimStatusAndFence mutation has the wrong type")
+		}
+		vnextWriteString(&buffer, request.RequestID)
+		vnextWriteOwnerSchedulerOperationIdentity(&buffer, request.Allocation)
+		vnextWriteString(&buffer, request.ExpectedReclaimRequestID)
+		buffer.Write(request.ExpectedReclaimRequestDigest[:])
+		buffer.Write(request.ExpectedReclaimSchedulerProof.TermID[:])
+		buffer.Write(request.ExpectedReclaimSchedulerProof.MutationDigest[:])
+		buffer.Write(request.ExpectedReclaimSchedulerProof.Receipt[:])
 	default:
 		return zero, fmt.Errorf("operation %q is not a Scheduler mutation", operation)
 	}
@@ -435,6 +463,25 @@ func vnextOwnerSchedulerReceipt(
 	buffer.Write(termID[:])
 	buffer.Write(mutationDigest[:])
 	buffer.Write(signature[:])
+	return sha256.Sum256(buffer.Bytes())
+}
+
+func vnextOwnerReclaimReceipt(
+	allocation vnextOwnerOperationIdentity,
+	requestDigest [vnextOwnerSchedulerDigestBytes]byte,
+	schedulerProof vnextOwnerSchedulerProof,
+	terminalJournalSequence uint64,
+) [vnextOwnerSchedulerDigestBytes]byte {
+	var buffer bytes.Buffer
+	vnextWriteString(&buffer, vnextOwnerReclaimReceiptDomain)
+	vnextWriteString(&buffer, vnextOwnerSchedulerAuthorityProtocol)
+	vnextWriteOwnerSchedulerOperationIdentity(&buffer, allocation)
+	buffer.Write(requestDigest[:])
+	buffer.Write(schedulerProof.TermID[:])
+	buffer.Write(schedulerProof.MutationDigest[:])
+	buffer.Write(schedulerProof.Receipt[:])
+	vnextWriteU64(&buffer, terminalJournalSequence)
+	vnextWriteString(&buffer, "RECLAIMED")
 	return sha256.Sum256(buffer.Bytes())
 }
 
@@ -636,6 +683,16 @@ func (group *vnextOwnerGroup) schedulerProofStatus(
 			proof = transaction.SchedulerAbortProof
 		}
 		found = true
+	case vnextOwnerRPCOperationReclaim:
+		request, ok := mutation.(vnextOwnerReclaimRequest)
+		if !ok {
+			return proof, vnextOwnerSchedulerReceiptMissing
+		}
+		transaction := group.journal.Transactions[request.Allocation.AllocationRecordID]
+		if transaction != nil && transaction.Reclaim != nil {
+			proof = transaction.Reclaim.SchedulerProof
+			found = true
+		}
 	}
 	if !found || proof == (vnextOwnerSchedulerProof{}) {
 		return proof, vnextOwnerSchedulerReceiptMissing

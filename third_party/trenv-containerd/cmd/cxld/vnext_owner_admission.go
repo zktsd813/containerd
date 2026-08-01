@@ -18,7 +18,7 @@ var (
 
 // vnextOwnerAdmissionState is the durable allocation-admission state for one
 // exact Owner epoch. State only moves forward. Reopening allocation requires a
-// new Owner epoch and a newly formatted TROWN009 journal.
+// new Owner epoch and a newly formatted TROWN010 journal.
 type vnextOwnerAdmissionState uint8
 
 const (

@@ -603,51 +603,268 @@ func (group *vnextOwnerGroup) abortWithScheduler(
 	return nil
 }
 
-func (group *vnextOwnerGroup) reclaimCheckpoint(
-	checkpointID string,
-	allocationRecordID uint64,
-) error {
+func (group *vnextOwnerGroup) reclaimCheckpointWithScheduler(
+	request vnextOwnerReclaimRequest,
+	authority *vnextOwnerSchedulerVerifiedAuthority,
+) (*vnextOwnerReclaimRecord, bool, error) {
 	group.mu.Lock()
 	defer group.mu.Unlock()
 	if err := group.checkUsableLocked(); err != nil {
-		return err
+		return nil, false, err
 	}
-	transaction := group.journal.Transactions[allocationRecordID]
-	if transaction == nil || transaction.CheckpointID != checkpointID {
-		return fmt.Errorf("Owner reclaim does not name an allocation")
+	if err := validateVNextOwnerReclaimRequest(request); err != nil {
+		return nil, false, err
 	}
-	if transaction.State == vnextOwnerReclaimed {
-		return nil
+	if err := validateVNextOwnerVerifiedSchedulerAuthority(authority); err != nil {
+		return nil, false, err
+	}
+	wantDigest, err := vnextOwnerSchedulerMutationDigest(
+		vnextOwnerRPCOperationReclaim, request)
+	if err != nil || authority.MutationDigest != wantDigest {
+		return nil, false, fmt.Errorf("Owner reclaim Scheduler digest differs: %w",
+			errVNextOwnerSchedulerReceiptConflict)
+	}
+	transaction := group.journal.Transactions[request.Allocation.AllocationRecordID]
+	if transaction == nil || request.Allocation != (vnextOwnerOperationIdentity{
+		RequestID:          transaction.RequestID,
+		CheckpointID:       transaction.CheckpointID,
+		ProducerID:         transaction.ProducerID,
+		OwnerID:            group.ownerID,
+		OwnerEpoch:         group.ownerEpoch,
+		AllocationRecordID: transaction.AllocationRecordID,
+	}) {
+		return nil, false, fmt.Errorf("Owner reclaim does not name the exact allocation: %w",
+			errVNextAuthority)
+	}
+	if transaction.Reclaim != nil {
+		if !vnextOwnerReclaimRecordMatches(
+			transaction.Reclaim, request, authority.proof()) {
+			return nil, false, errVNextOwnerSchedulerReceiptConflict
+		}
+		switch transaction.State {
+		case vnextOwnerReclaimed:
+			return cloneVNextOwnerReclaimRecord(transaction.Reclaim), true, nil
+		case vnextOwnerReclaiming:
+			if err := group.requireReclaimSafetyLocked("reclaim-replay"); err != nil {
+				return nil, false, err
+			}
+			if err := group.completeReclaimLocked(transaction); err != nil {
+				return nil, false, group.poisonLocked(err)
+			}
+			if err := group.persistReclaimedTerminalLocked(transaction.AllocationRecordID); err != nil {
+				return nil, false, group.poisonLocked(err)
+			}
+			return cloneVNextOwnerReclaimRecord(
+				group.journal.Transactions[transaction.AllocationRecordID].Reclaim), true, nil
+		default:
+			return nil, false, fmt.Errorf("Owner allocation has reclaim metadata in state %d: %w",
+				transaction.State, errVNextCorrupt)
+		}
 	}
 	if transaction.State != vnextOwnerCommitted {
-		return fmt.Errorf("cannot reclaim Owner allocation in state %d: %w",
+		return nil, false, fmt.Errorf("cannot reclaim Owner allocation in state %d: %w",
 			transaction.State, errVNextInvalidState)
 	}
-	// A terminal RECLAIMED replay changes no allocator or journal state. Only
-	// the live COMMITTED path reaches the physical-reuse safety gate.
 	if err := group.requireReclaimSafetyLocked("reclaim"); err != nil {
-		return err
+		return nil, false, err
+	}
+	if transaction.ProducerCapability != nil &&
+		!transaction.ProducerCapability.Revoked {
+		return nil, false, fmt.Errorf(
+			"Owner reclaim requires durable Producer capability revocation: %w",
+			errVNextAuthority)
+	}
+	if err := group.validateReclaimRootOwnedLocked(
+		transaction, request.ExpectedCheckpointRoot); err != nil {
+		return nil, false, err
 	}
 	for _, fragment := range transaction.Fragments {
 		if err := group.devices[fragment.DeviceUUID].validateOwnerFragmentReclaimable(
-			checkpointID, allocationRecordID); err != nil {
-			return fmt.Errorf("validate reclaim fragment %q: %w", fragment.DeviceUUID, err)
+			transaction.CheckpointID, transaction.AllocationRecordID); err != nil {
+			return nil, false, fmt.Errorf("validate reclaim fragment %q: %w", fragment.DeviceUUID, err)
 		}
 	}
 	candidate := group.journal.clone()
-	candidate.Transactions[allocationRecordID].State = vnextOwnerReclaiming
-	if err := group.persistJournalLocked(candidate); err != nil {
-		return group.poisonLocked(fmt.Errorf("persist Owner RECLAIMING: %w", err))
+	candidateTransaction := candidate.Transactions[transaction.AllocationRecordID]
+	candidateTransaction.State = vnextOwnerReclaiming
+	candidateTransaction.Reclaim = &vnextOwnerReclaimRecord{
+		RequestID:                        request.RequestID,
+		RequestDigest:                    wantDigest,
+		Allocation:                       request.Allocation,
+		ExpectedCheckpointRoot:           cloneVNextOwnerCheckpointRoot(request.ExpectedCheckpointRoot),
+		RetirementEpoch:                  request.RetirementEpoch,
+		CatalogRevisionBarrier:           request.CatalogRevisionBarrier,
+		ActiveRestoreCount:               request.ActiveRestoreCount,
+		ReaderDrainEvidenceDigest:        request.ReaderDrainEvidenceDigest,
+		ProducerWriteFenceEvidenceDigest: request.ProducerWriteFenceEvidenceDigest,
+		DedupReferenceDispositionDigest:  request.DedupReferenceDispositionDigest,
+		SchedulerProof:                   authority.proof(),
 	}
-	if err := group.completeReclaimLocked(group.journal.Transactions[allocationRecordID]); err != nil {
-		return group.poisonLocked(err)
+	if err := group.applySchedulerAuthorityLocked(candidate, authority); err != nil {
+		return nil, false, err
 	}
-	candidate = group.journal.clone()
-	candidate.Transactions[allocationRecordID].State = vnextOwnerReclaimed
 	if err := group.persistJournalLocked(candidate); err != nil {
-		return group.poisonLocked(fmt.Errorf("persist Owner RECLAIMED: %w", err))
+		return nil, false, group.poisonLocked(fmt.Errorf("persist Owner RECLAIMING: %w", err))
+	}
+	if err := group.completeReclaimLocked(
+		group.journal.Transactions[transaction.AllocationRecordID]); err != nil {
+		return nil, false, group.poisonLocked(err)
+	}
+	if err := group.persistReclaimedTerminalLocked(transaction.AllocationRecordID); err != nil {
+		return nil, false, group.poisonLocked(err)
+	}
+	return cloneVNextOwnerReclaimRecord(
+		group.journal.Transactions[transaction.AllocationRecordID].Reclaim), false, nil
+}
+
+func cloneVNextOwnerReclaimRecord(
+	record *vnextOwnerReclaimRecord,
+) *vnextOwnerReclaimRecord {
+	if record == nil {
+		return nil
+	}
+	clone := *record
+	clone.ExpectedCheckpointRoot = cloneVNextOwnerCheckpointRoot(
+		record.ExpectedCheckpointRoot)
+	return &clone
+}
+
+func vnextOwnerReclaimRecordMatches(
+	record *vnextOwnerReclaimRecord,
+	request vnextOwnerReclaimRequest,
+	proof vnextOwnerSchedulerProof,
+) bool {
+	return record != nil &&
+		record.RequestID == request.RequestID &&
+		record.Allocation == request.Allocation &&
+		equalVNextOwnerCheckpointRoot(
+			record.ExpectedCheckpointRoot, request.ExpectedCheckpointRoot) &&
+		record.RetirementEpoch == request.RetirementEpoch &&
+		record.CatalogRevisionBarrier == request.CatalogRevisionBarrier &&
+		record.ActiveRestoreCount == request.ActiveRestoreCount &&
+		record.ReaderDrainEvidenceDigest == request.ReaderDrainEvidenceDigest &&
+		record.ProducerWriteFenceEvidenceDigest == request.ProducerWriteFenceEvidenceDigest &&
+		record.DedupReferenceDispositionDigest == request.DedupReferenceDispositionDigest &&
+		record.SchedulerProof == proof &&
+		record.RequestDigest == proof.MutationDigest
+}
+
+func (group *vnextOwnerGroup) validateReclaimRootOwnedLocked(
+	transaction *vnextOwnerTransaction,
+	root vnextOwnerCheckpointRoot,
+) error {
+	for _, run := range root.Locator.PageRuns {
+		runEnd, ok := vnextAdd(run.FirstPage.DataPageIndex, run.PageCount)
+		if !ok {
+			return fmt.Errorf("reclaim checkpoint root run overflows: %w", errVNextCorrupt)
+		}
+		owned := false
+		for _, fragment := range transaction.Fragments {
+			if fragment.DeviceUUID != run.FirstPage.DeviceUUID {
+				continue
+			}
+			for _, extent := range fragment.Extents {
+				extentEnd, ok := vnextAdd(extent.StartDataPageIndex, extent.PageCount)
+				if ok && run.FirstPage.DataPageIndex >= extent.StartDataPageIndex &&
+					runEnd <= extentEnd {
+					owned = true
+					break
+				}
+			}
+			if owned {
+				break
+			}
+		}
+		if !owned {
+			return fmt.Errorf("reclaim checkpoint root names a page outside allocation: %w",
+				errVNextAuthority)
+		}
 	}
 	return nil
+}
+
+// reclaimStatusAndFenceWithScheduler observes one exact reclaim attempt only
+// after advancing the durable Owner-wide Scheduler high-water to the verified
+// current term. The per-query proof is intentionally not journaled; terminal
+// reclaim evidence is the original durable Reclaim proof, sequence, and Owner
+// receipt returned in Reclaim.
+func (group *vnextOwnerGroup) reclaimStatusAndFenceWithScheduler(
+	request vnextOwnerReclaimStatusAndFenceRequest,
+	authority *vnextOwnerSchedulerVerifiedAuthority,
+) (vnextOwnerReclaimStatusAndFenceResponse, error) {
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	if err := group.checkUsableLocked(); err != nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, err
+	}
+	if err := validateVNextOwnerVerifiedSchedulerAuthority(authority); err != nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, err
+	}
+	if err := validateVNextOwnerReclaimStatusAndFenceRequest(request); err != nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, err
+	}
+	transaction := group.journal.Transactions[request.Allocation.AllocationRecordID]
+	if transaction == nil || request.Allocation != (vnextOwnerOperationIdentity{
+		RequestID:          transaction.RequestID,
+		CheckpointID:       transaction.CheckpointID,
+		ProducerID:         transaction.ProducerID,
+		OwnerID:            group.ownerID,
+		OwnerEpoch:         group.ownerEpoch,
+		AllocationRecordID: transaction.AllocationRecordID,
+	}) {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, errVNextAuthority
+	}
+	response := vnextOwnerReclaimStatusAndFenceResponse{
+		RequestID:           request.RequestID,
+		Allocation:          request.Allocation,
+		State:               vnextOwnerReclaimNotFound,
+		FenceCreateRevision: authority.Parsed.CreateRevision,
+	}
+	record := transaction.Reclaim
+	switch {
+	case record == nil:
+		response.State = vnextOwnerReclaimNotFound
+	case record.RequestID != request.ExpectedReclaimRequestID ||
+		record.RequestDigest != request.ExpectedReclaimRequestDigest ||
+		record.SchedulerProof != request.ExpectedReclaimSchedulerProof:
+		response.State = vnextOwnerReclaimConflict
+	case transaction.State == vnextOwnerReclaiming:
+		response.State = vnextOwnerReclaimInProgress
+	case transaction.State == vnextOwnerReclaimed:
+		response.State = vnextOwnerReclaimDone
+		response.Reclaim = &vnextOwnerReclaimResponse{
+			RequestID:                        record.RequestID,
+			Allocation:                       record.Allocation,
+			ExpectedCheckpointRoot:           cloneVNextOwnerCheckpointRoot(record.ExpectedCheckpointRoot),
+			RetirementEpoch:                  record.RetirementEpoch,
+			CatalogRevisionBarrier:           record.CatalogRevisionBarrier,
+			ActiveRestoreCount:               record.ActiveRestoreCount,
+			ReaderDrainEvidenceDigest:        record.ReaderDrainEvidenceDigest,
+			ProducerWriteFenceEvidenceDigest: record.ProducerWriteFenceEvidenceDigest,
+			DedupReferenceDispositionDigest:  record.DedupReferenceDispositionDigest,
+			RequestDigest:                    record.RequestDigest,
+			OwnerJournalSequence:             record.TerminalJournalSequence,
+			OwnerReceipt:                     record.OwnerReceipt,
+			Replayed:                         true,
+			SchedulerProof:                   record.SchedulerProof,
+		}
+	default:
+		return vnextOwnerReclaimStatusAndFenceResponse{}, fmt.Errorf(
+			"Owner reclaim status is inconsistent with transaction state %d: %w",
+			transaction.State, errVNextCorrupt)
+	}
+	candidate := group.journal.clone()
+	if err := group.applySchedulerAuthorityLocked(candidate, authority); err != nil {
+		return vnextOwnerReclaimStatusAndFenceResponse{}, err
+	}
+	if candidate.SchedulerHighWater != group.journal.SchedulerHighWater {
+		if err := group.persistJournalLocked(candidate); err != nil {
+			return vnextOwnerReclaimStatusAndFenceResponse{}, group.poisonLocked(
+				fmt.Errorf("persist Owner reclaim status fence: %w", err))
+		}
+	}
+	response.SnapshotSequence = group.journal.SnapshotSequence
+	return response, nil
 }
 
 func (group *vnextOwnerGroup) validateOwnerRequestLocked(
@@ -1154,6 +1371,40 @@ func (group *vnextOwnerGroup) completeReclaimLocked(transaction *vnextOwnerTrans
 	return nil
 }
 
+func (group *vnextOwnerGroup) persistReclaimedTerminalLocked(
+	allocationRecordID uint64,
+) error {
+	transaction := group.journal.Transactions[allocationRecordID]
+	if transaction == nil || transaction.State != vnextOwnerReclaiming ||
+		transaction.Reclaim == nil {
+		return fmt.Errorf("Owner reclaim terminal transition is unavailable: %w", errVNextCorrupt)
+	}
+	if group.journal.SnapshotSequence == math.MaxUint64 {
+		return errors.New("Owner journal sequence is exhausted")
+	}
+	terminalSequence := group.journal.SnapshotSequence + 1
+	if terminalSequence == 0 || terminalSequence > uint64(math.MaxInt64) {
+		return fmt.Errorf("Owner reclaim terminal sequence is outside the signed ABI: %w",
+			errVNextCorrupt)
+	}
+	candidate := group.journal.clone()
+	candidateTransaction := candidate.Transactions[allocationRecordID]
+	candidateTransaction.State = vnextOwnerReclaimed
+	candidateTransaction.Reclaim.TerminalJournalSequence = terminalSequence
+	candidateTransaction.Reclaim.OwnerReceipt = vnextOwnerReclaimReceipt(
+		candidateTransaction.Reclaim.Allocation,
+		candidateTransaction.Reclaim.RequestDigest,
+		candidateTransaction.Reclaim.SchedulerProof,
+		terminalSequence)
+	if err := group.persistJournalLocked(candidate); err != nil {
+		return fmt.Errorf("persist Owner RECLAIMED: %w", err)
+	}
+	if group.journal.SnapshotSequence != terminalSequence {
+		return fmt.Errorf("Owner reclaim terminal sequence changed: %w", errVNextCorrupt)
+	}
+	return nil
+}
+
 func (group *vnextOwnerGroup) recoverTransactionsLocked() error {
 	allocationIDs := make([]uint64, 0, len(group.journal.Transactions))
 	for allocationID := range group.journal.Transactions {
@@ -1199,9 +1450,7 @@ func (group *vnextOwnerGroup) recoverTransactionsLocked() error {
 			if err := group.completeReclaimLocked(transaction); err != nil {
 				return fmt.Errorf("recover Owner reclaim %d: %w", allocationID, err)
 			}
-			candidate := group.journal.clone()
-			candidate.Transactions[allocationID].State = vnextOwnerReclaimed
-			if err := group.persistJournalLocked(candidate); err != nil {
+			if err := group.persistReclaimedTerminalLocked(allocationID); err != nil {
 				return err
 			}
 		case vnextOwnerQuarantined:
