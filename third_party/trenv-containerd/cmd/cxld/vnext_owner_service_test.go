@@ -31,7 +31,8 @@ func newVNextOwnerServiceForFixture(
 	if err != nil {
 		t.Fatalf("build Owner-service DAX directory: %v", err)
 	}
-	service, err := newVNextOwnerService(fixture.group, directory)
+	service, err := newVNextOwnerServiceWithSchedulerAuthority(
+		fixture.group, directory, vnextOwnerTestSchedulerVerifier{})
 	if err != nil {
 		t.Fatalf("build VNext Owner service: %v", err)
 	}

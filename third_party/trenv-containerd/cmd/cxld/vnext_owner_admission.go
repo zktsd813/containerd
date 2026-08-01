@@ -18,7 +18,7 @@ var (
 
 // vnextOwnerAdmissionState is the durable allocation-admission state for one
 // exact Owner epoch. State only moves forward. Reopening allocation requires a
-// new Owner epoch and a newly formatted TROWN008 journal.
+// new Owner epoch and a newly formatted TROWN009 journal.
 type vnextOwnerAdmissionState uint8
 
 const (
@@ -56,6 +56,7 @@ type vnextOwnerAdmissionTransitionRequest struct {
 type vnextOwnerAdmissionTransitionRecord struct {
 	RequestID        string
 	RequestDigest    [32]byte
+	SchedulerProof   vnextOwnerSchedulerProof
 	From             vnextOwnerAdmissionState
 	Target           vnextOwnerAdmissionState
 	ExpectedSequence uint64
@@ -215,6 +216,10 @@ func validateVNextOwnerAdmissionJournal(journal *vnextOwnerJournal) error {
 			return fmt.Errorf("Owner admission transition %d has an invalid request ID: %w",
 				index, errVNextCorrupt)
 		}
+		if !record.SchedulerProof.valid() {
+			return fmt.Errorf("Owner admission transition %d lacks its Scheduler proof: %w",
+				index, errVNextCorrupt)
+		}
 		if _, duplicate := seenRequestIDs[record.RequestID]; duplicate {
 			return fmt.Errorf("Owner admission request %q is duplicated: %w",
 				record.RequestID, errVNextCorrupt)
@@ -333,12 +338,16 @@ func (group *vnextOwnerGroup) admissionStatus(
 	return group.admissionSnapshotLocked(), nil
 }
 
-func (group *vnextOwnerGroup) setAdmission(
+func (group *vnextOwnerGroup) setAdmissionWithScheduler(
 	request vnextOwnerAdmissionTransitionRequest,
+	authority *vnextOwnerSchedulerVerifiedAuthority,
 ) (vnextOwnerAdmissionTransitionResult, error) {
 	group.mu.Lock()
 	defer group.mu.Unlock()
 	if err := group.checkUsableLocked(); err != nil {
+		return vnextOwnerAdmissionTransitionResult{}, err
+	}
+	if err := validateVNextOwnerVerifiedSchedulerAuthority(authority); err != nil {
 		return vnextOwnerAdmissionTransitionResult{}, err
 	}
 	if err := validateVNextOwnerAdmissionTransitionRequest(request); err != nil {
@@ -365,6 +374,10 @@ func (group *vnextOwnerGroup) setAdmission(
 			return vnextOwnerAdmissionTransitionResult{},
 				&vnextOwnerAdmissionRequestConflictError{RequestID: request.RequestID}
 		}
+		if record.SchedulerProof != authority.proof() {
+			return vnextOwnerAdmissionTransitionResult{},
+				errVNextOwnerSchedulerReceiptConflict
+		}
 		return vnextOwnerAdmissionTransitionResult{Record: record, Replayed: true}, nil
 	}
 	if request.From != group.journal.AdmissionState ||
@@ -384,6 +397,7 @@ func (group *vnextOwnerGroup) setAdmission(
 	record := vnextOwnerAdmissionTransitionRecord{
 		RequestID:        request.RequestID,
 		RequestDigest:    digest,
+		SchedulerProof:   authority.proof(),
 		From:             request.From,
 		Target:           request.Target,
 		ExpectedSequence: request.ExpectedSequence,
@@ -393,6 +407,9 @@ func (group *vnextOwnerGroup) setAdmission(
 	candidate.AdmissionState = request.Target
 	candidate.AdmissionSequence = record.ResultSequence
 	candidate.AdmissionTransitions = append(candidate.AdmissionTransitions, record)
+	if err := group.applySchedulerAuthorityLocked(candidate, authority); err != nil {
+		return vnextOwnerAdmissionTransitionResult{}, err
+	}
 	if err := group.persistJournalLocked(candidate); err != nil {
 		return vnextOwnerAdmissionTransitionResult{}, group.poisonLocked(fmt.Errorf(
 			"persist Owner admission transition: %w", err))

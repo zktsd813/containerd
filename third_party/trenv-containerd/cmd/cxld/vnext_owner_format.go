@@ -9,11 +9,13 @@ import (
 )
 
 const (
-	vnextMinimumOwnerControlSlotBytes uint64 = 4096
-	vnextMaxOwnerTransactions                = 1 << 20
+	vnextMinimumOwnerControlSlotBytes        uint64 = 4096
+	vnextMaxOwnerTransactions                       = 1 << 20
+	vnextOwnerSchedulerHighWaterEncodedBytes        = 168
+	vnextOwnerSchedulerProofEncodedBytes            = 96
 )
 
-var vnextOwnerJournalMagic = [8]byte{'T', 'R', 'O', 'W', 'N', '0', '0', '8'}
+var vnextOwnerJournalMagic = [8]byte{'T', 'R', 'O', 'W', 'N', '0', '0', '9'}
 
 type vnextOwnerTransactionState uint8
 
@@ -34,6 +36,23 @@ func (state vnextOwnerTransactionState) valid() bool {
 	return state >= vnextOwnerPreparing && state <= vnextOwnerRejectedNoSpace
 }
 
+// vnextOwnerAbortOrigin makes terminal abort authority durable. A Scheduler
+// abort carries its exact Scheduler proof; Producer and recovery aborts never
+// do. This prevents a later Scheduler request from claiming an abort that was
+// actually authorized by a different path.
+type vnextOwnerAbortOrigin uint8
+
+const (
+	vnextOwnerAbortNone vnextOwnerAbortOrigin = iota
+	vnextOwnerAbortByScheduler
+	vnextOwnerAbortByProducer
+	vnextOwnerAbortByRecovery
+)
+
+func (origin vnextOwnerAbortOrigin) valid() bool {
+	return origin >= vnextOwnerAbortByScheduler && origin <= vnextOwnerAbortByRecovery
+}
+
 type vnextOwnerExtent struct {
 	StartDataPageIndex uint64
 	PageCount          uint64
@@ -48,17 +67,21 @@ type vnextOwnerDeviceFragment struct {
 }
 
 type vnextOwnerTransaction struct {
-	AllocationRecordID uint64
-	RequestID          string
-	CheckpointID       string
-	ProducerID         string
-	RequestDigest      [32]byte
-	State              vnextOwnerTransactionState
-	TotalPages         uint64
-	MaxExtents         uint32
-	Contents           []vnextContentSegment
-	Fragments          []vnextOwnerDeviceFragment
-	ProducerCapability *vnextProducerCapabilityRecord
+	AllocationRecordID    uint64
+	RequestID             string
+	CheckpointID          string
+	ProducerID            string
+	RequestDigest         [32]byte
+	SchedulerReserveProof vnextOwnerSchedulerProof
+	SchedulerCommitProof  vnextOwnerSchedulerProof
+	SchedulerAbortProof   vnextOwnerSchedulerProof
+	AbortOrigin           vnextOwnerAbortOrigin
+	State                 vnextOwnerTransactionState
+	TotalPages            uint64
+	MaxExtents            uint32
+	Contents              []vnextContentSegment
+	Fragments             []vnextOwnerDeviceFragment
+	ProducerCapability    *vnextProducerCapabilityRecord
 }
 
 // vnextOwnerJournal is a bounded full-snapshot redo/control record. Its file
@@ -68,6 +91,7 @@ type vnextOwnerTransaction struct {
 type vnextOwnerJournal struct {
 	OwnerID                string
 	OwnerEpoch             uint64
+	SchedulerHighWater     vnextOwnerSchedulerHighWater
 	AdmissionState         vnextOwnerAdmissionState
 	AdmissionSequence      uint64
 	AdmissionTransitions   []vnextOwnerAdmissionTransitionRecord
@@ -99,6 +123,7 @@ func (journal *vnextOwnerJournal) clone() *vnextOwnerJournal {
 	cloned := &vnextOwnerJournal{
 		OwnerID:                journal.OwnerID,
 		OwnerEpoch:             journal.OwnerEpoch,
+		SchedulerHighWater:     journal.SchedulerHighWater,
 		AdmissionState:         journal.AdmissionState,
 		AdmissionSequence:      journal.AdmissionSequence,
 		AdmissionTransitions:   append([]vnextOwnerAdmissionTransitionRecord(nil), journal.AdmissionTransitions...),
@@ -145,6 +170,7 @@ func (journal *vnextOwnerJournal) marshalAtSequence(
 	vnextWriteU64(&payload, sequence)
 	vnextWriteString(&payload, journal.OwnerID)
 	vnextWriteU64(&payload, journal.OwnerEpoch)
+	vnextMarshalOwnerSchedulerHighWater(&payload, journal.SchedulerHighWater)
 	payload.WriteByte(byte(journal.AdmissionState))
 	payload.Write(make([]byte, 7))
 	vnextWriteU64(&payload, journal.AdmissionSequence)
@@ -153,6 +179,7 @@ func (journal *vnextOwnerJournal) marshalAtSequence(
 	for _, transition := range journal.AdmissionTransitions {
 		vnextWriteString(&payload, transition.RequestID)
 		payload.Write(transition.RequestDigest[:])
+		vnextMarshalOwnerSchedulerProof(&payload, transition.SchedulerProof)
 		payload.WriteByte(byte(transition.From))
 		payload.WriteByte(byte(transition.Target))
 		payload.Write(make([]byte, 6))
@@ -171,7 +198,8 @@ func (journal *vnextOwnerJournal) marshalAtSequence(
 	for _, transaction := range transactions {
 		vnextWriteU64(&payload, transaction.AllocationRecordID)
 		payload.WriteByte(byte(transaction.State))
-		payload.Write(make([]byte, 7))
+		payload.WriteByte(byte(transaction.AbortOrigin))
+		payload.Write(make([]byte, 6))
 		vnextWriteU64(&payload, transaction.TotalPages)
 		vnextWriteU32(&payload, transaction.MaxExtents)
 		payload.Write(make([]byte, 4))
@@ -179,6 +207,9 @@ func (journal *vnextOwnerJournal) marshalAtSequence(
 		vnextWriteString(&payload, transaction.CheckpointID)
 		vnextWriteString(&payload, transaction.ProducerID)
 		payload.Write(transaction.RequestDigest[:])
+		vnextMarshalOwnerSchedulerProof(&payload, transaction.SchedulerReserveProof)
+		vnextMarshalOwnerSchedulerProof(&payload, transaction.SchedulerCommitProof)
+		vnextMarshalOwnerSchedulerProof(&payload, transaction.SchedulerAbortProof)
 		vnextWriteU32(&payload, uint32(len(transaction.Contents)))
 		for _, content := range transaction.Contents {
 			payload.WriteByte(byte(content.Kind))
@@ -216,7 +247,7 @@ func (journal *vnextOwnerJournal) marshalAtSequence(
 			vnextWriteString(&payload, capability.IssuerPrincipal)
 			payload.WriteByte(byte(capability.AllowedOperations))
 			payload.Write(make([]byte, 7))
-			vnextWriteString(&payload, capability.SchedulerTerm)
+			vnextMarshalOwnerSchedulerProof(&payload, capability.IssueSchedulerProof)
 			vnextWriteU64(&payload, capability.IssuedAtUnixNano)
 			vnextWriteU64(&payload, capability.ExpiresAtUnixNano)
 			if capability.Revoked {
@@ -228,11 +259,122 @@ func (journal *vnextOwnerJournal) marshalAtSequence(
 			vnextWriteString(&payload, capability.RevokeRequestID)
 			payload.Write(capability.RevokeRequestDigest[:])
 			vnextWriteString(&payload, capability.RevokedByPrincipal)
-			vnextWriteString(&payload, capability.RevokeSchedulerTerm)
+			vnextMarshalOwnerSchedulerProof(&payload, capability.RevokeSchedulerProof)
 			vnextWriteU64(&payload, capability.RevokedAtUnixNano)
 		}
 	}
 	return vnextMarshalEnvelope(vnextOwnerJournalMagic, payload.Bytes())
+}
+
+func vnextMarshalOwnerSchedulerHighWater(
+	payload *bytes.Buffer,
+	highWater vnextOwnerSchedulerHighWater,
+) {
+	if highWater.Initialized {
+		payload.WriteByte(1)
+	} else {
+		payload.WriteByte(0)
+	}
+	payload.Write(make([]byte, 7))
+	payload.Write(highWater.LeaderKeyDigest[:])
+	vnextWriteU64(payload, highWater.ClusterID)
+	vnextWriteU64(payload, highWater.CreateRevision)
+	vnextWriteU64(payload, highWater.ModRevision)
+	vnextWriteU64(payload, highWater.LeaseID)
+	payload.Write(highWater.LeaderValueDigest[:])
+	payload.Write(highWater.PublicKeyDigest[:])
+	payload.Write(highWater.SchedulerTermID[:])
+}
+
+func vnextMarshalOwnerSchedulerProof(
+	payload *bytes.Buffer,
+	proof vnextOwnerSchedulerProof,
+) {
+	payload.Write(proof.TermID[:])
+	payload.Write(proof.MutationDigest[:])
+	payload.Write(proof.Receipt[:])
+}
+
+func vnextParseOwnerSchedulerProof(
+	decoder *vnextDecoder,
+) (vnextOwnerSchedulerProof, error) {
+	var proof vnextOwnerSchedulerProof
+	termID, err := decoder.bytes(uint64(len(proof.TermID)))
+	if err != nil {
+		return proof, err
+	}
+	copy(proof.TermID[:], termID)
+	mutationDigest, err := decoder.bytes(uint64(len(proof.MutationDigest)))
+	if err != nil {
+		return proof, err
+	}
+	copy(proof.MutationDigest[:], mutationDigest)
+	receipt, err := decoder.bytes(uint64(len(proof.Receipt)))
+	if err != nil {
+		return proof, err
+	}
+	copy(proof.Receipt[:], receipt)
+	if proof != (vnextOwnerSchedulerProof{}) && !proof.valid() {
+		return vnextOwnerSchedulerProof{}, fmt.Errorf(
+			"Owner Scheduler proof is partial: %w", errVNextCorrupt)
+	}
+	return proof, nil
+}
+
+func vnextParseOwnerSchedulerHighWater(
+	decoder *vnextDecoder,
+) (vnextOwnerSchedulerHighWater, error) {
+	var highWater vnextOwnerSchedulerHighWater
+	initialized, err := decoder.u8()
+	if err != nil {
+		return highWater, err
+	}
+	reserved, err := decoder.bytes(7)
+	if err != nil {
+		return highWater, err
+	}
+	if initialized > 1 || !vnextAllZero(reserved) {
+		return highWater, fmt.Errorf(
+			"Owner Scheduler high-water presence encoding is invalid: %w",
+			errVNextWrongFormat)
+	}
+	highWater.Initialized = initialized == 1
+	leaderKeyDigest, err := decoder.bytes(uint64(len(highWater.LeaderKeyDigest)))
+	if err != nil {
+		return highWater, err
+	}
+	copy(highWater.LeaderKeyDigest[:], leaderKeyDigest)
+	if highWater.ClusterID, err = decoder.u64(); err != nil {
+		return highWater, err
+	}
+	if highWater.CreateRevision, err = decoder.u64(); err != nil {
+		return highWater, err
+	}
+	if highWater.ModRevision, err = decoder.u64(); err != nil {
+		return highWater, err
+	}
+	if highWater.LeaseID, err = decoder.u64(); err != nil {
+		return highWater, err
+	}
+	leaderValueDigest, err := decoder.bytes(uint64(len(highWater.LeaderValueDigest)))
+	if err != nil {
+		return highWater, err
+	}
+	copy(highWater.LeaderValueDigest[:], leaderValueDigest)
+	publicKeyDigest, err := decoder.bytes(uint64(len(highWater.PublicKeyDigest)))
+	if err != nil {
+		return highWater, err
+	}
+	copy(highWater.PublicKeyDigest[:], publicKeyDigest)
+	termID, err := decoder.bytes(uint64(len(highWater.SchedulerTermID)))
+	if err != nil {
+		return highWater, err
+	}
+	copy(highWater.SchedulerTermID[:], termID)
+	if err := highWater.validate(); err != nil {
+		return vnextOwnerSchedulerHighWater{}, err
+	}
+	return highWater, nil
 }
 
 func parseVNextOwnerJournal(
@@ -253,6 +395,10 @@ func parseVNextOwnerJournal(
 		return nil, err
 	}
 	ownerEpoch, err := decoder.u64()
+	if err != nil {
+		return nil, err
+	}
+	schedulerHighWater, err := vnextParseOwnerSchedulerHighWater(decoder)
 	if err != nil {
 		return nil, err
 	}
@@ -309,6 +455,7 @@ func parseVNextOwnerJournal(
 	journal := &vnextOwnerJournal{
 		OwnerID:                ownerID,
 		OwnerEpoch:             ownerEpoch,
+		SchedulerHighWater:     schedulerHighWater,
 		AdmissionState:         vnextOwnerAdmissionState(admissionState),
 		AdmissionSequence:      admissionSequence,
 		AdmissionTransitions:   transitions,
@@ -361,6 +508,10 @@ func vnextParseOwnerAdmissionTransition(
 		return vnextOwnerAdmissionTransitionRecord{}, err
 	}
 	copy(transition.RequestDigest[:], digest)
+	transition.SchedulerProof, err = vnextParseOwnerSchedulerProof(decoder)
+	if err != nil {
+		return vnextOwnerAdmissionTransitionRecord{}, err
+	}
 	from, err := decoder.u8()
 	if err != nil {
 		return vnextOwnerAdmissionTransitionRecord{}, err
@@ -399,7 +550,12 @@ func vnextParseOwnerTransaction(decoder *vnextDecoder) (*vnextOwnerTransaction, 
 		return nil, err
 	}
 	transaction.State = vnextOwnerTransactionState(state)
-	reserved, err := decoder.bytes(7)
+	abortOrigin, err := decoder.u8()
+	if err != nil {
+		return nil, err
+	}
+	transaction.AbortOrigin = vnextOwnerAbortOrigin(abortOrigin)
+	reserved, err := decoder.bytes(6)
 	if err != nil {
 		return nil, err
 	}
@@ -433,6 +589,18 @@ func vnextParseOwnerTransaction(decoder *vnextDecoder) (*vnextOwnerTransaction, 
 		return nil, err
 	}
 	copy(transaction.RequestDigest[:], digest)
+	transaction.SchedulerReserveProof, err = vnextParseOwnerSchedulerProof(decoder)
+	if err != nil {
+		return nil, err
+	}
+	transaction.SchedulerCommitProof, err = vnextParseOwnerSchedulerProof(decoder)
+	if err != nil {
+		return nil, err
+	}
+	transaction.SchedulerAbortProof, err = vnextParseOwnerSchedulerProof(decoder)
+	if err != nil {
+		return nil, err
+	}
 	contentCount, err := decoder.u32()
 	if err != nil {
 		return nil, err
@@ -578,7 +746,8 @@ func vnextParseProducerCapabilityRecord(
 	if !vnextAllZero(reserved) {
 		return nil, fmt.Errorf("Producer capability operation reserved bytes are non-zero: %w", errVNextWrongFormat)
 	}
-	if record.SchedulerTerm, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+	record.IssueSchedulerProof, err = vnextParseOwnerSchedulerProof(decoder)
+	if err != nil {
 		return nil, err
 	}
 	if record.IssuedAtUnixNano, err = decoder.u64(); err != nil {
@@ -610,7 +779,8 @@ func vnextParseProducerCapabilityRecord(
 	if record.RevokedByPrincipal, err = decoder.string(vnextMaxIdentityBytes); err != nil {
 		return nil, err
 	}
-	if record.RevokeSchedulerTerm, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+	record.RevokeSchedulerProof, err = vnextParseOwnerSchedulerProof(decoder)
+	if err != nil {
 		return nil, err
 	}
 	if record.RevokedAtUnixNano, err = decoder.u64(); err != nil {
@@ -626,6 +796,15 @@ func (journal *vnextOwnerJournal) validate(attachedDevices map[string]*vnextPers
 	if journal.OwnerEpoch == 0 || journal.OwnerEpoch > uint64(math.MaxInt64) {
 		return fmt.Errorf("Owner journal epoch %d is outside the signed ABI: %w",
 			journal.OwnerEpoch, errVNextWrongFormat)
+	}
+	if err := journal.SchedulerHighWater.validate(); err != nil {
+		return err
+	}
+	if (len(journal.Transactions) != 0 || len(journal.AdmissionTransitions) != 0) &&
+		!journal.SchedulerHighWater.Initialized {
+		return fmt.Errorf(
+			"Owner journal has Scheduler-authorized records without a fencing high-water: %w",
+			errVNextCorrupt)
 	}
 	if err := validateVNextOwnerAdmissionJournal(journal); err != nil {
 		return err
@@ -692,6 +871,38 @@ func vnextValidateOwnerTransaction(
 		!transaction.State.valid() || transaction.TotalPages == 0 ||
 		transaction.TotalPages > uint64(math.MaxInt64) || transaction.MaxExtents == 0 {
 		return fmt.Errorf("Owner transaction %d has invalid identity/state: %w",
+			transaction.AllocationRecordID, errVNextCorrupt)
+	}
+	if !transaction.SchedulerReserveProof.valid() {
+		return fmt.Errorf("Owner transaction %d lacks its Scheduler Reserve proof: %w",
+			transaction.AllocationRecordID, errVNextCorrupt)
+	}
+	commitProofRequired := transaction.State == vnextOwnerCommitting ||
+		transaction.State == vnextOwnerCommitted ||
+		transaction.State == vnextOwnerReclaiming ||
+		transaction.State == vnextOwnerReclaimed
+	if commitProofRequired != transaction.SchedulerCommitProof.valid() {
+		return fmt.Errorf("Owner transaction %d has inconsistent Scheduler Commit proof: %w",
+			transaction.AllocationRecordID, errVNextCorrupt)
+	}
+	abortState := transaction.State == vnextOwnerAborting ||
+		transaction.State == vnextOwnerAborted
+	if !abortState {
+		if transaction.AbortOrigin != vnextOwnerAbortNone ||
+			transaction.SchedulerAbortProof != (vnextOwnerSchedulerProof{}) {
+			return fmt.Errorf("Owner transaction %d has abort metadata outside an abort state: %w",
+				transaction.AllocationRecordID, errVNextCorrupt)
+		}
+	} else if !transaction.AbortOrigin.valid() {
+		return fmt.Errorf("Owner transaction %d lacks a durable abort origin: %w",
+			transaction.AllocationRecordID, errVNextCorrupt)
+	} else if transaction.AbortOrigin == vnextOwnerAbortByScheduler {
+		if !transaction.SchedulerAbortProof.valid() {
+			return fmt.Errorf("Owner transaction %d lacks its Scheduler Abort proof: %w",
+				transaction.AllocationRecordID, errVNextCorrupt)
+		}
+	} else if transaction.SchedulerAbortProof != (vnextOwnerSchedulerProof{}) {
+		return fmt.Errorf("Owner transaction %d attributes a non-Scheduler abort to Scheduler: %w",
 			transaction.AllocationRecordID, errVNextCorrupt)
 	}
 	negativeTombstone := transaction.State == vnextOwnerRejectedNoSpace

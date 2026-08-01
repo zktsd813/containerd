@@ -63,16 +63,14 @@ type vnextProducerCapabilityProof struct {
 }
 
 type vnextOwnerIssueProducerCapabilityRequest struct {
-	RequestID         string
-	Operation         vnextOwnerOperationIdentity
-	ProducerPrincipal string
-	AllowedOperations vnextProducerCapabilityOperations
-	// SchedulerTerm is an opaque, exact session/term tuple bound into the
-	// capability. This version does not order terms or prove leader freshness;
-	// that requires a separately installed authoritative term/lease contract.
-	SchedulerTerm      string
+	RequestID          string
+	Operation          vnextOwnerOperationIdentity
+	ProducerPrincipal  string
+	AllowedOperations  vnextProducerCapabilityOperations
 	RequestedTTLMillis uint64
 	Nonce              [vnextProducerCapabilityTokenBytes]byte
+	SchedulerReceipt   [vnextOwnerSchedulerDigestBytes]byte
+	SchedulerAuthority vnextOwnerSchedulerAuthority
 }
 
 type vnextOwnerIssueProducerCapabilityResponse struct {
@@ -81,26 +79,27 @@ type vnextOwnerIssueProducerCapabilityResponse struct {
 	Operation         vnextOwnerOperationIdentity
 	ProducerPrincipal string
 	AllowedOperations vnextProducerCapabilityOperations
-	SchedulerTerm     string
 	IssuedAtUnixNano  uint64
 	ExpiresAtUnixNano uint64
 	Replayed          bool
+	SchedulerProof    vnextOwnerSchedulerProof
 }
 
 type vnextOwnerRevokeProducerCapabilityRequest struct {
-	RequestID     string
-	Operation     vnextOwnerOperationIdentity
-	CapabilityID  string
-	SchedulerTerm string
+	RequestID          string
+	Operation          vnextOwnerOperationIdentity
+	CapabilityID       string
+	SchedulerReceipt   [vnextOwnerSchedulerDigestBytes]byte
+	SchedulerAuthority vnextOwnerSchedulerAuthority
 }
 
 type vnextOwnerRevokeProducerCapabilityResponse struct {
 	RequestID         string
 	CapabilityID      string
 	Operation         vnextOwnerOperationIdentity
-	SchedulerTerm     string
 	RevokedAtUnixNano uint64
 	Replayed          bool
+	SchedulerProof    vnextOwnerSchedulerProof
 }
 
 // vnextProducerCapabilityRecord is Owner control metadata. In the
@@ -109,24 +108,24 @@ type vnextOwnerRevokeProducerCapabilityResponse struct {
 // be secret: TokenDigest is a one-way, scope-bound verifier and the 32-byte
 // nonce/bearer is not stored.
 type vnextProducerCapabilityRecord struct {
-	IssueRequestID     string
-	IssueRequestDigest [32]byte
-	CapabilityID       string
-	TokenDigest        [32]byte
-	ScopeDigest        [32]byte
-	ProducerPrincipal  string
-	IssuerPrincipal    string
-	AllowedOperations  vnextProducerCapabilityOperations
-	SchedulerTerm      string
-	IssuedAtUnixNano   uint64
-	ExpiresAtUnixNano  uint64
+	IssueRequestID      string
+	IssueRequestDigest  [32]byte
+	CapabilityID        string
+	TokenDigest         [32]byte
+	ScopeDigest         [32]byte
+	ProducerPrincipal   string
+	IssuerPrincipal     string
+	AllowedOperations   vnextProducerCapabilityOperations
+	IssueSchedulerProof vnextOwnerSchedulerProof
+	IssuedAtUnixNano    uint64
+	ExpiresAtUnixNano   uint64
 
-	Revoked             bool
-	RevokeRequestID     string
-	RevokeRequestDigest [32]byte
-	RevokedByPrincipal  string
-	RevokeSchedulerTerm string
-	RevokedAtUnixNano   uint64
+	Revoked              bool
+	RevokeRequestID      string
+	RevokeRequestDigest  [32]byte
+	RevokedByPrincipal   string
+	RevokeSchedulerProof vnextOwnerSchedulerProof
+	RevokedAtUnixNano    uint64
 }
 
 func vnextOwnerUnixPrincipal(role vnextOwnerCallerRole, uid uint32) (string, error) {
@@ -200,8 +199,8 @@ func validateVNextOwnerIssueProducerCapabilityRequest(
 	if !request.AllowedOperations.valid() {
 		return errors.New("Producer capability allowed operations are invalid")
 	}
-	if request.SchedulerTerm == "" || len(request.SchedulerTerm) > vnextMaxIdentityBytes {
-		return errors.New("Producer capability Scheduler term is empty or too long")
+	if vnextAllZero(request.SchedulerReceipt[:]) {
+		return errors.New("Producer capability Scheduler receipt is zero")
 	}
 	if request.RequestedTTLMillis == 0 ||
 		request.RequestedTTLMillis > uint64(vnextProducerCapabilityMaxLifetime/time.Millisecond) ||
@@ -264,7 +263,7 @@ func vnextProducerCapabilityIssueDigest(
 	vnextWriteString(&buffer, request.RequestID)
 	vnextWriteString(&buffer, issuerPrincipal)
 	vnextWriteString(&buffer, request.ProducerPrincipal)
-	vnextWriteString(&buffer, request.SchedulerTerm)
+	buffer.Write(request.SchedulerReceipt[:])
 	vnextWriteU64(&buffer, request.RequestedTTLMillis)
 	buffer.WriteByte(byte(request.AllowedOperations))
 	buffer.Write(make([]byte, 7))
@@ -283,7 +282,7 @@ func vnextProducerCapabilityTokenDigest(
 	scopeDigest [32]byte,
 	producerPrincipal string,
 	operations vnextProducerCapabilityOperations,
-	schedulerTerm string,
+	schedulerReceipt [vnextOwnerSchedulerDigestBytes]byte,
 	expiresAtUnixNano uint64,
 ) [32]byte {
 	var buffer bytes.Buffer
@@ -294,7 +293,7 @@ func vnextProducerCapabilityTokenDigest(
 	vnextWriteString(&buffer, producerPrincipal)
 	buffer.WriteByte(byte(operations))
 	buffer.Write(make([]byte, 7))
-	vnextWriteString(&buffer, schedulerTerm)
+	buffer.Write(schedulerReceipt[:])
 	vnextWriteU64(&buffer, expiresAtUnixNano)
 	return sha256.Sum256(buffer.Bytes())
 }
@@ -314,7 +313,7 @@ func vnextProducerCapabilityRevokeDigest(
 	vnextWriteString(&buffer, request.Operation.OwnerID)
 	vnextWriteU64(&buffer, request.Operation.OwnerEpoch)
 	vnextWriteU64(&buffer, request.Operation.AllocationRecordID)
-	vnextWriteString(&buffer, request.SchedulerTerm)
+	buffer.Write(request.SchedulerReceipt[:])
 	return sha256.Sum256(buffer.Bytes())
 }
 
@@ -326,15 +325,23 @@ func unixNanoForVNextProducerCapability(now time.Time) (uint64, error) {
 	return uint64(nanos), nil
 }
 
-func (group *vnextOwnerGroup) issueProducerCapability(
+func (group *vnextOwnerGroup) issueProducerCapabilityWithScheduler(
 	request vnextOwnerIssueProducerCapabilityRequest,
 	issuerPrincipal string,
 	nowUnixNano uint64,
+	authority *vnextOwnerSchedulerVerifiedAuthority,
 ) (vnextProducerCapabilityRecord, bool, error) {
 	group.mu.Lock()
 	defer group.mu.Unlock()
 	if err := group.checkUsableLocked(); err != nil {
 		return vnextProducerCapabilityRecord{}, false, err
+	}
+	if err := validateVNextOwnerVerifiedSchedulerAuthority(authority); err != nil {
+		return vnextProducerCapabilityRecord{}, false, err
+	}
+	if request.SchedulerReceipt != authority.Receipt {
+		return vnextProducerCapabilityRecord{}, false,
+			errVNextOwnerSchedulerReceiptConflict
 	}
 	if err := validateVNextOwnerPrincipal(issuerPrincipal); err != nil {
 		return vnextProducerCapabilityRecord{}, false, err
@@ -356,7 +363,7 @@ func (group *vnextOwnerGroup) issueProducerCapability(
 			scopeDigest,
 			request.ProducerPrincipal,
 			request.AllowedOperations,
-			request.SchedulerTerm,
+			request.SchedulerReceipt,
 			existing.ExpiresAtUnixNano)
 		if existing.IssueRequestID != request.RequestID ||
 			existing.IssueRequestDigest != issueDigest ||
@@ -366,6 +373,10 @@ func (group *vnextOwnerGroup) issueProducerCapability(
 			return vnextProducerCapabilityRecord{}, false, fmt.Errorf(
 				"Producer capability issue request conflicts with allocation %d: %w",
 				transaction.AllocationRecordID, errVNextProducerCapabilityConflict)
+		}
+		if existing.IssueSchedulerProof != authority.proof() {
+			return vnextProducerCapabilityRecord{}, false,
+				errVNextOwnerSchedulerReceiptConflict
 		}
 		// Persist-before-ack replay is an acknowledgement protocol, not a new
 		// authority decision. The Scheduler must be able to reconstruct the
@@ -395,16 +406,16 @@ func (group *vnextOwnerGroup) issueProducerCapability(
 		return vnextProducerCapabilityRecord{}, false, errors.New("Producer capability expiry overflows")
 	}
 	record := vnextProducerCapabilityRecord{
-		IssueRequestID:     request.RequestID,
-		IssueRequestDigest: issueDigest,
-		CapabilityID:       capabilityID,
-		ScopeDigest:        scopeDigest,
-		ProducerPrincipal:  request.ProducerPrincipal,
-		IssuerPrincipal:    issuerPrincipal,
-		AllowedOperations:  request.AllowedOperations,
-		SchedulerTerm:      request.SchedulerTerm,
-		IssuedAtUnixNano:   nowUnixNano,
-		ExpiresAtUnixNano:  expiresAtUnixNano,
+		IssueRequestID:      request.RequestID,
+		IssueRequestDigest:  issueDigest,
+		CapabilityID:        capabilityID,
+		ScopeDigest:         scopeDigest,
+		ProducerPrincipal:   request.ProducerPrincipal,
+		IssuerPrincipal:     issuerPrincipal,
+		AllowedOperations:   request.AllowedOperations,
+		IssueSchedulerProof: authority.proof(),
+		IssuedAtUnixNano:    nowUnixNano,
+		ExpiresAtUnixNano:   expiresAtUnixNano,
 	}
 	record.TokenDigest = vnextProducerCapabilityTokenDigest(
 		record.CapabilityID,
@@ -412,11 +423,14 @@ func (group *vnextOwnerGroup) issueProducerCapability(
 		record.ScopeDigest,
 		record.ProducerPrincipal,
 		record.AllowedOperations,
-		record.SchedulerTerm,
+		record.IssueSchedulerProof.Receipt,
 		record.ExpiresAtUnixNano)
 	candidate := group.journal.clone()
 	copied := record
 	candidate.Transactions[transaction.AllocationRecordID].ProducerCapability = &copied
+	if err := group.applySchedulerAuthorityLocked(candidate, authority); err != nil {
+		return vnextProducerCapabilityRecord{}, false, err
+	}
 	if err := group.persistJournalLocked(candidate); err != nil {
 		return vnextProducerCapabilityRecord{}, false, group.poisonLocked(fmt.Errorf(
 			"persist Producer capability issuance: %w", err))
@@ -424,18 +438,26 @@ func (group *vnextOwnerGroup) issueProducerCapability(
 	return record, false, nil
 }
 
-func (group *vnextOwnerGroup) revokeProducerCapability(
+func (group *vnextOwnerGroup) revokeProducerCapabilityWithScheduler(
 	request vnextOwnerRevokeProducerCapabilityRequest,
 	revokerPrincipal string,
 	nowUnixNano uint64,
+	authority *vnextOwnerSchedulerVerifiedAuthority,
 ) (vnextProducerCapabilityRecord, bool, error) {
 	group.mu.Lock()
 	defer group.mu.Unlock()
 	if err := group.checkUsableLocked(); err != nil {
 		return vnextProducerCapabilityRecord{}, false, err
 	}
+	if err := validateVNextOwnerVerifiedSchedulerAuthority(authority); err != nil {
+		return vnextProducerCapabilityRecord{}, false, err
+	}
+	if request.SchedulerReceipt != authority.Receipt {
+		return vnextProducerCapabilityRecord{}, false,
+			errVNextOwnerSchedulerReceiptConflict
+	}
 	if request.RequestID == "" || len(request.RequestID) > vnextMaxIdentityBytes ||
-		request.SchedulerTerm == "" || len(request.SchedulerTerm) > vnextMaxIdentityBytes ||
+		vnextAllZero(request.SchedulerReceipt[:]) ||
 		nowUnixNano == 0 || nowUnixNano > uint64(math.MaxInt64) {
 		return vnextProducerCapabilityRecord{}, false, errors.New(
 			"Producer capability revocation identity, term, or time is invalid")
@@ -469,10 +491,14 @@ func (group *vnextOwnerGroup) revokeProducerCapability(
 		if record.RevokeRequestID != request.RequestID ||
 			record.RevokeRequestDigest != revokeDigest ||
 			record.RevokedByPrincipal != revokerPrincipal ||
-			record.RevokeSchedulerTerm != request.SchedulerTerm {
+			record.RevokeSchedulerProof.Receipt != request.SchedulerReceipt {
 			return vnextProducerCapabilityRecord{}, false, fmt.Errorf(
 				"Producer capability revocation conflicts with durable history: %w",
 				errVNextProducerCapabilityConflict)
+		}
+		if record.RevokeSchedulerProof != authority.proof() {
+			return vnextProducerCapabilityRecord{}, false,
+				errVNextOwnerSchedulerReceiptConflict
 		}
 		return *record, true, nil
 	}
@@ -482,8 +508,11 @@ func (group *vnextOwnerGroup) revokeProducerCapability(
 	updated.RevokeRequestID = request.RequestID
 	updated.RevokeRequestDigest = revokeDigest
 	updated.RevokedByPrincipal = revokerPrincipal
-	updated.RevokeSchedulerTerm = request.SchedulerTerm
+	updated.RevokeSchedulerProof = authority.proof()
 	updated.RevokedAtUnixNano = nowUnixNano
+	if err := group.applySchedulerAuthorityLocked(candidate, authority); err != nil {
+		return vnextProducerCapabilityRecord{}, false, err
+	}
 	if err := group.persistJournalLocked(candidate); err != nil {
 		return vnextProducerCapabilityRecord{}, false, group.poisonLocked(fmt.Errorf(
 			"persist Producer capability revocation: %w", err))
@@ -551,7 +580,7 @@ func (group *vnextOwnerGroup) validateProducerCapabilityProofLocked(
 	scopeDigest := vnextProducerCapabilityScopeDigest(group.ownerID, group.ownerEpoch, transaction)
 	expectedTokenDigest := vnextProducerCapabilityTokenDigest(
 		record.CapabilityID, proof.Token, scopeDigest, record.ProducerPrincipal,
-		record.AllowedOperations, record.SchedulerTerm, record.ExpiresAtUnixNano)
+		record.AllowedOperations, record.IssueSchedulerProof.Receipt, record.ExpiresAtUnixNano)
 	principalMask := 0
 	if record.ProducerPrincipal == callerPrincipal {
 		principalMask = 1
@@ -628,7 +657,7 @@ func validateVNextProducerCapabilityRecord(
 		return fmt.Errorf("negative or missing allocation has a Producer capability: %w", errVNextCorrupt)
 	}
 	if record.IssueRequestID == "" || len(record.IssueRequestID) > vnextMaxIdentityBytes ||
-		record.SchedulerTerm == "" || len(record.SchedulerTerm) > vnextMaxIdentityBytes ||
+		!record.IssueSchedulerProof.valid() ||
 		!record.AllowedOperations.valid() ||
 		record.IssuedAtUnixNano == 0 || record.IssuedAtUnixNano > uint64(math.MaxInt64) ||
 		record.ExpiresAtUnixNano <= record.IssuedAtUnixNano ||
@@ -657,14 +686,15 @@ func validateVNextProducerCapabilityRecord(
 	}
 	if !record.Revoked {
 		if record.RevokeRequestID != "" || record.RevokeRequestDigest != ([32]byte{}) ||
-			record.RevokedByPrincipal != "" || record.RevokeSchedulerTerm != "" ||
+			record.RevokedByPrincipal != "" ||
+			record.RevokeSchedulerProof != (vnextOwnerSchedulerProof{}) ||
 			record.RevokedAtUnixNano != 0 {
 			return fmt.Errorf("active Producer capability has revocation metadata: %w", errVNextCorrupt)
 		}
 		return nil
 	}
 	if record.RevokeRequestID == "" || len(record.RevokeRequestID) > vnextMaxIdentityBytes ||
-		record.RevokeSchedulerTerm == "" || len(record.RevokeSchedulerTerm) > vnextMaxIdentityBytes ||
+		!record.RevokeSchedulerProof.valid() ||
 		vnextAllZero(record.RevokeRequestDigest[:]) ||
 		record.RevokedAtUnixNano < record.IssuedAtUnixNano ||
 		record.RevokedAtUnixNano > uint64(math.MaxInt64) {
@@ -684,8 +714,8 @@ func validateVNextProducerCapabilityRecord(
 				OwnerEpoch:         ownerEpoch,
 				AllocationRecordID: transaction.AllocationRecordID,
 			},
-			CapabilityID:  record.CapabilityID,
-			SchedulerTerm: record.RevokeSchedulerTerm,
+			CapabilityID:     record.CapabilityID,
+			SchedulerReceipt: record.RevokeSchedulerProof.Receipt,
 		},
 		record.RevokedByPrincipal)
 	if subtle.ConstantTimeCompare(

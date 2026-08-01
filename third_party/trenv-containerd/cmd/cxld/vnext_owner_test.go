@@ -945,7 +945,7 @@ func TestVNextOwnerRejectsZeroFragmentNonTombstone(t *testing.T) {
 	}
 	payload = append([]byte(nil), payload...)
 	stateOffset := 8 + 4 + len(fixture.group.ownerID) + 8 +
-		8 + 8 + 4 + 4 + 8 + 4 + 8
+		vnextOwnerSchedulerHighWaterEncodedBytes + 8 + 8 + 4 + 4 + 8 + 4 + 8
 	payload[stateOffset] = byte(vnextOwnerGranted)
 	malformed, err := vnextMarshalEnvelope(vnextOwnerJournalMagic, payload)
 	if err != nil {

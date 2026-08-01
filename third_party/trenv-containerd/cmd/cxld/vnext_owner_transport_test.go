@@ -316,10 +316,7 @@ func vnextOwnerTLSTestDaemonRequest(t *testing.T, id string) daemonRequest {
 		},
 		MaxExtents: 1,
 	}
-	raw, err := json.Marshal(wire)
-	if err != nil {
-		t.Fatalf("marshal test Reserve payload: %v", err)
-	}
+	raw := marshalVNextOwnerRPCTestPayload(t, wire)
 	return daemonRequest{
 		CommandLabel:      "vnext-owner-tls-test",
 		TimeoutMillis:     0,
@@ -366,8 +363,9 @@ func TestVNextOwnerTLSReserveUsesRealMutualTLSFraming(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create strict VNext Owner client: %v", err)
 	}
-	response, err := client.Reserve(
-		context.Background(), vnextOwnerTLSTestReserveRequest("success"))
+	reserveRequest := vnextOwnerTLSTestReserveRequest("success")
+	vnextOwnerTestAuthorizeReserve(&reserveRequest)
+	response, err := client.Reserve(context.Background(), reserveRequest)
 	if err != nil {
 		t.Fatalf("Reserve over real VNext Owner mTLS framing: %v", err)
 	}
@@ -395,14 +393,16 @@ func TestVNextOwnerTLSCapabilityBindsExactProducerURISAN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reserved, err := scheduler.Reserve(
-		context.Background(), vnextOwnerTLSTestReserveRequest("capability-uri-san"))
+	reserveRequest := vnextOwnerTLSTestReserveRequest("capability-uri-san")
+	vnextOwnerTestAuthorizeReserve(&reserveRequest)
+	reserved, err := scheduler.Reserve(context.Background(), reserveRequest)
 	if err != nil {
 		t.Fatalf("reserve over Scheduler TLS identity: %v", err)
 	}
 	issueRequest := vnextOwnerTestCapabilityIssueRequest(
 		reserved.Operation, vnextProducerCapabilityAbort)
 	issueRequest.ProducerPrincipal = testVNextOwnerTLSProducerURI
+	vnextOwnerTestAuthorizeIssue(&issueRequest)
 	issued, err := scheduler.IssueProducerCapability(context.Background(), issueRequest)
 	if err != nil {
 		t.Fatalf("issue exact TLS Producer capability: %v", err)

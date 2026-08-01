@@ -504,6 +504,47 @@ func TestRunDedupPublicationPublishesValidatedV5Atomically(t *testing.T) {
 	}
 }
 
+func TestEnvExactDefaultPreservesSchedulerAuthorityWhitespaceForRejection(t *testing.T) {
+	const name = "CXLD_TEST_EXACT_AUTHORITY_VALUE"
+	t.Setenv(name, " https://etcd.test:2379 ")
+	if got := envExactDefault(name, "fallback"); got != " https://etcd.test:2379 " {
+		t.Fatalf("exact environment boundary changed %q", got)
+	}
+}
+
+func TestVNextOwnerStartupExclusivityRejectsAuthorityOnGatewayOnlyDaemon(t *testing.T) {
+	authority := vnextOwnerTestSchedulerAuthorityConfig()
+	gateway := vnextOwnerGatewayConfig{
+		RouteFilePath: "/etc/cxld/vnext-owner-routes.json",
+	}
+	if err := validateVNextOwnerStartupExclusivity(
+		daemonConfig{DedupCheckpointMode: "off"},
+		vnextOwnerRuntimeConfig{SchedulerAuthority: authority},
+		gateway,
+	); err == nil || !strings.Contains(err.Error(), "gateway-only") {
+		t.Fatalf("gateway-only Scheduler authority configuration was accepted: %v", err)
+	}
+	if err := validateVNextOwnerStartupExclusivity(
+		daemonConfig{DedupCheckpointMode: "off"},
+		vnextOwnerRuntimeConfig{},
+		gateway,
+	); err != nil {
+		t.Fatalf("gateway-only daemon with no local etcd authority was rejected: %v", err)
+	}
+	if err := validateVNextOwnerStartupExclusivity(
+		daemonConfig{DedupCheckpointMode: "off"},
+		vnextOwnerRuntimeConfig{
+			ControlFilePath:    "/var/lib/cxld/owner-control",
+			ControlSlotBytes:   4096,
+			DAXDeviceList:      "/dev/dax0.0",
+			SchedulerAuthority: authority,
+		},
+		vnextOwnerGatewayConfig{},
+	); err != nil {
+		t.Fatalf("complete local Owner Scheduler authority was rejected: %v", err)
+	}
+}
+
 func TestResolveMetadataPropagatesPersistentDedupRejection(t *testing.T) {
 	outcome := dedupRunStatus{
 		CheckpointID: "ckpt-rejected",

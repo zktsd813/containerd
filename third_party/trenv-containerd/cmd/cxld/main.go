@@ -1126,6 +1126,13 @@ func envDefault(name, fallback string) string {
 	return fallback
 }
 
+func envExactDefault(name, fallback string) string {
+	if value, configured := os.LookupEnv(name); configured {
+		return value
+	}
+	return fallback
+}
+
 func envDefaultBool(name string, fallback bool) bool {
 	value := strings.TrimSpace(os.Getenv(name))
 	if value == "" {
@@ -2282,8 +2289,16 @@ func validateVNextOwnerStartupExclusivity(
 	runtime vnextOwnerRuntimeConfig,
 	gateway vnextOwnerGatewayConfig,
 ) error {
-	runtimeConfigured := strings.TrimSpace(runtime.ControlFilePath) != "" ||
+	runtimeStorageConfigured := strings.TrimSpace(runtime.ControlFilePath) != "" ||
 		runtime.ControlSlotBytes != 0 || strings.TrimSpace(runtime.DAXDeviceList) != ""
+	authorityConfigured :=
+		vnextOwnerSchedulerAuthorityConfiguredFields(runtime.SchedulerAuthority) != 0
+	if !runtimeStorageConfigured && authorityConfigured {
+		return errors.New(
+			"Scheduler-authority etcd settings require a local VNext Owner; " +
+				"a gateway-only daemon must configure none")
+	}
+	runtimeConfigured := runtimeStorageConfigured || authorityConfigured
 	gatewayConfigured := strings.TrimSpace(gateway.RouteFilePath) != "" ||
 		strings.TrimSpace(gateway.SchedulerClientCertificatePath) != "" ||
 		strings.TrimSpace(gateway.SchedulerClientPrivateKeyPath) != "" ||
@@ -2689,6 +2704,20 @@ func main() {
 		fmt.Fprintf(os.Stderr, "invalid Scheduler control UID environment: %v\n", err)
 		os.Exit(1)
 	}
+	vnextOwnerSchedulerEtcdDialTimeoutMillisDefault, err := envStrictInt64(
+		"CXLD_VNEXT_OWNER_SCHEDULER_ETCD_DIAL_TIMEOUT_MILLIS", 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"invalid VNext Owner Scheduler etcd dial timeout environment: %v\n", err)
+		os.Exit(1)
+	}
+	vnextOwnerSchedulerEtcdReadTimeoutMillisDefault, err := envStrictInt64(
+		"CXLD_VNEXT_OWNER_SCHEDULER_ETCD_READ_TIMEOUT_MILLIS", 0)
+	if err != nil {
+		fmt.Fprintf(os.Stderr,
+			"invalid VNext Owner Scheduler etcd read timeout environment: %v\n", err)
+		os.Exit(1)
+	}
 	socketPath := flag.String("socket-path", envDefault("CXLD_SOCKET_PATH", defaultSocketPath), "Unix socket path")
 	schedulerControlSocketPath := flag.String(
 		"scheduler-control-socket-path",
@@ -2737,6 +2766,38 @@ func main() {
 		"vnext-owner-dax-devices",
 		envDefault("CXLD_VNEXT_OWNER_DAX_DEVICES", ""),
 		"comma-separated existing TRCXL006 devdax paths owned by this cxld")
+	vnextOwnerSchedulerEtcdEndpoints := flag.String(
+		"vnext-owner-scheduler-etcd-endpoints",
+		envExactDefault("CXLD_VNEXT_OWNER_SCHEDULER_ETCD_ENDPOINTS", ""),
+		"comma-separated canonical HTTPS etcd endpoints for local Owner Scheduler fencing")
+	vnextOwnerSchedulerLeaderKey := flag.String(
+		"vnext-owner-scheduler-leader-key",
+		envExactDefault("CXLD_VNEXT_OWNER_SCHEDULER_LEADER_KEY", ""),
+		"exact immutable-lease Scheduler leader key read by the local Owner")
+	vnextOwnerSchedulerEtcdClusterID := flag.String(
+		"vnext-owner-scheduler-etcd-cluster-id",
+		envExactDefault("CXLD_VNEXT_OWNER_SCHEDULER_ETCD_CLUSTER_ID", ""),
+		"exact nonzero etcd cluster ID as 16 lower-case hexadecimal digits")
+	vnextOwnerSchedulerEtcdCA := flag.String(
+		"vnext-owner-scheduler-etcd-ca",
+		envExactDefault("CXLD_VNEXT_OWNER_SCHEDULER_ETCD_CA", ""),
+		"PEM CA used by the local Owner to authenticate Scheduler-authority etcd")
+	vnextOwnerSchedulerEtcdClientCertificate := flag.String(
+		"vnext-owner-scheduler-etcd-client-cert",
+		envExactDefault("CXLD_VNEXT_OWNER_SCHEDULER_ETCD_CLIENT_CERT", ""),
+		"PEM client certificate used by the local Owner for Scheduler-authority etcd")
+	vnextOwnerSchedulerEtcdClientPrivateKey := flag.String(
+		"vnext-owner-scheduler-etcd-client-key",
+		envExactDefault("CXLD_VNEXT_OWNER_SCHEDULER_ETCD_CLIENT_KEY", ""),
+		"PEM client private key used by the local Owner for Scheduler-authority etcd")
+	vnextOwnerSchedulerEtcdDialTimeoutMillis := flag.Int64(
+		"vnext-owner-scheduler-etcd-dial-timeout-millis",
+		vnextOwnerSchedulerEtcdDialTimeoutMillisDefault,
+		"positive etcd dial timeout in milliseconds for local Owner Scheduler fencing")
+	vnextOwnerSchedulerEtcdReadTimeoutMillis := flag.Int64(
+		"vnext-owner-scheduler-etcd-read-timeout-millis",
+		vnextOwnerSchedulerEtcdReadTimeoutMillisDefault,
+		"positive exact leader-read timeout in milliseconds for local Owner Scheduler fencing")
 	vnextOwnerTLSListen := flag.String(
 		"vnext-owner-tls-listen",
 		envDefault("CXLD_VNEXT_OWNER_TLS_LISTEN", ""),
@@ -2786,6 +2847,21 @@ func main() {
 		envDefault("CXLD_VNEXT_OWNER_GATEWAY_SERVER_CA", ""),
 		"PEM CA used to authenticate outbound VNext Owner gateway servers")
 	flag.Parse()
+	vnextSchedulerAuthorityConfig, err := parseVNextOwnerSchedulerAuthorityInput(
+		vnextOwnerSchedulerAuthorityInput{
+			Endpoints:         *vnextOwnerSchedulerEtcdEndpoints,
+			LeaderKey:         *vnextOwnerSchedulerLeaderKey,
+			ExpectedCluster:   *vnextOwnerSchedulerEtcdClusterID,
+			CAFile:            *vnextOwnerSchedulerEtcdCA,
+			ClientCertFile:    *vnextOwnerSchedulerEtcdClientCertificate,
+			ClientKeyFile:     *vnextOwnerSchedulerEtcdClientPrivateKey,
+			DialTimeoutMillis: *vnextOwnerSchedulerEtcdDialTimeoutMillis,
+			ReadTimeoutMillis: *vnextOwnerSchedulerEtcdReadTimeoutMillis,
+		})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid VNext Owner Scheduler authority: %v\n", err)
+		os.Exit(1)
+	}
 	if *publicationSchemaVersion != uint64(trenvpub.Version) {
 		fmt.Fprintf(
 			os.Stderr,
@@ -2880,9 +2956,10 @@ func main() {
 	}
 
 	vnextRuntimeConfig := vnextOwnerRuntimeConfig{
-		ControlFilePath:  *vnextOwnerControlFile,
-		ControlSlotBytes: *vnextOwnerControlSlotBytes,
-		DAXDeviceList:    *vnextOwnerDAXDevices,
+		ControlFilePath:    *vnextOwnerControlFile,
+		ControlSlotBytes:   *vnextOwnerControlSlotBytes,
+		DAXDeviceList:      *vnextOwnerDAXDevices,
+		SchedulerAuthority: vnextSchedulerAuthorityConfig,
 	}
 	vnextGatewayConfig := vnextOwnerGatewayConfig{
 		RouteFilePath:                  *vnextOwnerGatewayRoutes,

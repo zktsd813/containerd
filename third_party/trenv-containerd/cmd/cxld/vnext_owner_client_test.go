@@ -81,6 +81,7 @@ func TestVNextOwnerClientReserveSealCommitThroughDaemonRoundTrip(t *testing.T) {
 			CapacityPages: content.PageCount,
 		}
 	}
+	vnextOwnerTestAuthorizeReserve(&reserveRequest)
 	reserved, err := client.Reserve(context.Background(), reserveRequest)
 	if err != nil {
 		t.Fatalf("reserve through strict Owner client: %v", err)
@@ -92,6 +93,7 @@ func TestVNextOwnerClientReserveSealCommitThroughDaemonRoundTrip(t *testing.T) {
 	}
 	capabilityRequest := vnextOwnerTestCapabilityIssueRequest(
 		reserved.Operation, vnextProducerCapabilityAll)
+	vnextOwnerTestAuthorizeIssue(&capabilityRequest)
 	issued, err := client.IssueProducerCapability(
 		context.Background(), capabilityRequest)
 	if err != nil {
@@ -141,7 +143,10 @@ func TestVNextOwnerClientReserveSealCommitThroughDaemonRoundTrip(t *testing.T) {
 		sealed.Root.ContractID != cxlcheckpoint.V6CompatibilityID {
 		t.Fatalf("client returned wrong candidate root: %#v", sealed.Root)
 	}
-	if err := client.CommitVNextCheckpoint(context.Background(), sealed.Operation); err != nil {
+	commitAuthority := vnextOwnerTestSchedulerAuthority(
+		vnextOwnerRPCOperationCommit, sealed.Operation)
+	if err := client.CommitVNextCheckpoint(
+		context.Background(), sealed.Operation, commitAuthority); err != nil {
 		t.Fatalf("Scheduler commit through strict Owner client: %v", err)
 	}
 	transaction = environment.ownerFixture.group.journal.Transactions[reserved.Operation.AllocationRecordID]
@@ -209,11 +214,12 @@ func TestVNextOwnerClientRevokeAndProducerAbortUseDistinctWireOperations(t *test
 			t.Fatal(err)
 		}
 		request := vnextOwnerRevokeProducerCapabilityRequest{
-			RequestID:     "client-revoke-capability",
-			Operation:     environment.reserve.Operation,
-			CapabilityID:  environment.capability.CapabilityID,
-			SchedulerTerm: "client-scheduler/session-1/term-2",
+			RequestID:        "client-revoke-capability",
+			Operation:        environment.reserve.Operation,
+			CapabilityID:     environment.capability.CapabilityID,
+			SchedulerReceipt: [vnextOwnerSchedulerDigestBytes]byte{2},
 		}
+		vnextOwnerTestAuthorizeRevoke(&request)
 		response, err := client.RevokeProducerCapability(context.Background(), request)
 		if err != nil {
 			t.Fatalf("Scheduler Revoke through strict Owner client: %v", err)
@@ -245,7 +251,7 @@ func TestVNextOwnerClientRejectsCapabilityTimesOutsideSignedABI(t *testing.T) {
 		Operation:          identity,
 		ProducerPrincipal:  vnextOwnerTestProducerCaller.Principal,
 		AllowedOperations:  vnextProducerCapabilityAll,
-		SchedulerTerm:      "client-scheduler/session-1/term-1",
+		SchedulerReceipt:   [vnextOwnerSchedulerDigestBytes]byte{1},
 		RequestedTTLMillis: 1,
 		Nonce:              [vnextProducerCapabilityTokenBytes]byte{1},
 	}
@@ -278,7 +284,6 @@ func TestVNextOwnerClientRejectsCapabilityTimesOutsideSignedABI(t *testing.T) {
 				},
 				ProducerPrincipal: issueRequest.ProducerPrincipal,
 				AllowedOperations: uint8(issueRequest.AllowedOperations),
-				SchedulerTerm:     issueRequest.SchedulerTerm,
 				IssuedAtUnixNano:  test.issuedAt,
 				ExpiresAtUnixNano: test.expiresAt,
 				Replayed:          false,
@@ -306,10 +311,10 @@ func TestVNextOwnerClientRejectsCapabilityTimesOutsideSignedABI(t *testing.T) {
 	}
 
 	revokeRequest := vnextOwnerRevokeProducerCapabilityRequest{
-		RequestID:     "client-capability-time-revoke",
-		Operation:     identity,
-		CapabilityID:  "00000000000000000000000000000001",
-		SchedulerTerm: "client-scheduler/session-1/term-2",
+		RequestID:        "client-capability-time-revoke",
+		Operation:        identity,
+		CapabilityID:     "00000000000000000000000000000001",
+		SchedulerReceipt: [vnextOwnerSchedulerDigestBytes]byte{2},
 	}
 	revokeWire := vnextOwnerRPCRevokeProducerCapabilityResponse{
 		Protocol:          vnextOwnerRPCProtocol,
@@ -317,7 +322,6 @@ func TestVNextOwnerClientRejectsCapabilityTimesOutsideSignedABI(t *testing.T) {
 		RequestID:         revokeRequest.RequestID,
 		Identity:          vnextOwnerRPCIdentityFromInternal(identity),
 		CapabilityID:      revokeRequest.CapabilityID,
-		SchedulerTerm:     revokeRequest.SchedulerTerm,
 		RevokedAtUnixNano: uint64(math.MaxInt64) + 1,
 		Replayed:          false,
 	}
@@ -401,7 +405,7 @@ func TestVNextOwnerClientInventoryRoundTripsExactReadOnlyRequest(t *testing.T) {
 	}
 }
 
-func TestVNextOwnerClientAdmissionV2RoundTripsExactStatusAndTransition(t *testing.T) {
+func TestVNextOwnerClientAdmissionV4RoundTripsExactStatusAndTransition(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
 		UUID: "client-admission", Size: 256 << 10,
 	}})
@@ -434,6 +438,7 @@ func TestVNextOwnerClientAdmissionV2RoundTripsExactStatusAndTransition(t *testin
 		Target:           vnextOwnerAdmissionReadOnly,
 		ExpectedSequence: 1,
 	}
+	vnextOwnerTestAuthorizeSetAdmission(&transition)
 	closed, err := client.SetAdmission(context.Background(), transition)
 	if err != nil {
 		t.Fatalf("client set admission: %v", err)
@@ -571,6 +576,7 @@ func TestVNextOwnerClientAdmissionRejectsMalformedProofs(t *testing.T) {
 		Target:           vnextOwnerAdmissionReadOnly,
 		ExpectedSequence: 1,
 	}
+	vnextOwnerTestAuthorizeSetAdmission(&transition)
 	internal := vnextOwnerAdmissionTransitionRequest{
 		RequestID:        transition.RequestID,
 		OwnerID:          transition.OwnerID,
@@ -629,20 +635,23 @@ func TestVNextOwnerClientAdmissionPreservesConflictCodes(t *testing.T) {
 		Target:           vnextOwnerAdmissionReadOnly,
 		ExpectedSequence: 1,
 	}
+	vnextOwnerTestAuthorizeSetAdmission(&transition)
 	if _, err := client.SetAdmission(context.Background(), transition); err != nil {
 		t.Fatal(err)
 	}
 	requestConflict := transition
 	requestConflict.Target = vnextOwnerAdmissionFenced
+	vnextOwnerTestAuthorizeSetAdmission(&requestConflict)
 	_, err = client.SetAdmission(context.Background(), requestConflict)
 	var remote *vnextOwnerClientRemoteError
 	if !errors.As(err, &remote) ||
-		remote.ErrorCode != string(vnextOwnerServiceAdmissionRequestConflict) {
+		remote.ErrorCode != string(vnextOwnerServiceConflict) {
 		t.Fatalf("client request conflict returned %#v / %v", remote, err)
 	}
 	stale := transition
 	stale.RequestID = "client-admission-sequence-conflict"
 	stale.Target = vnextOwnerAdmissionFenced
+	vnextOwnerTestAuthorizeSetAdmission(&stale)
 	_, err = client.SetAdmission(context.Background(), stale)
 	remote = nil
 	if !errors.As(err, &remote) ||
@@ -663,6 +672,7 @@ func TestVNextOwnerClientReservationStatusRecoversExactLostGrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := vnextOwnerStatusTestRequest("client", 2)
+	vnextOwnerTestAuthorizeReserve(&request)
 	missing, err := client.ReservationStatus(context.Background(), request)
 	if err != nil || missing.State != vnextOwnerReservationNotFound ||
 		missing.Identity.AllocationRecordID != 0 || missing.Grant != nil {
@@ -673,9 +683,11 @@ func TestVNextOwnerClientReservationStatusRecoversExactLostGrant(t *testing.T) {
 		t.Fatalf("client Reserve before response loss: %v", err)
 	}
 	recovered, err := client.ReservationStatus(context.Background(), request)
+	comparableReserved := reserved
+	comparableReserved.SchedulerProof = vnextOwnerSchedulerProof{}
 	if err != nil || recovered.State != vnextOwnerReservationGranted ||
 		recovered.Grant == nil ||
-		!reflect.DeepEqual(*recovered.Grant, reserved) {
+		!reflect.DeepEqual(*recovered.Grant, comparableReserved) {
 		t.Fatalf("client recovered grant: %#v, want %#v / %v", recovered, reserved, err)
 	}
 	if len(transport.requests) != 3 ||
@@ -701,18 +713,157 @@ func TestVNextOwnerClientReservationStatusAcceptsDurableNoSpace(t *testing.T) {
 	}
 	capacity := fixture.devices[0].superblock.Geometry.DataPageCount
 	request := vnextOwnerStatusTestRequest("client-no-space", capacity)
-	if _, err := client.Reserve(context.Background(), request); err == nil {
-		t.Fatal("client no-space Reserve unexpectedly succeeded")
-	} else {
-		var remote *vnextOwnerClientRemoteError
-		if !errors.As(err, &remote) || remote.ErrorCode != string(vnextOwnerServiceNoSpace) {
-			t.Fatalf("client no-space Reserve returned %v", err)
-		}
+	vnextOwnerTestAuthorizeReserve(&request)
+	rejected, err := client.Reserve(context.Background(), request)
+	if err != nil || rejected.State != vnextOwnerReservationRejectedNoSpace ||
+		rejected.Operation.AllocationRecordID == 0 || rejected.TotalPages != 0 ||
+		len(rejected.Contents) != 0 || len(rejected.Extents) != 0 ||
+		len(rejected.Devices) != 0 || rejected.Replayed {
+		t.Fatalf("client no-space Reserve result = %#v / %v", rejected, err)
 	}
 	status, err := client.ReservationStatus(context.Background(), request)
 	if err != nil || status.State != vnextOwnerReservationRejectedNoSpace ||
 		status.Identity.AllocationRecordID == 0 || status.Grant != nil {
 		t.Fatalf("client REJECTED_NO_SPACE status: %#v / %v", status, err)
+	}
+}
+
+func TestVNextOwnerClientReserveArraysAndSchedulerProofAreStrict(t *testing.T) {
+	type validResponse struct {
+		request vnextOwnerReserveRequest
+		raw     []byte
+	}
+	build := func(t *testing.T, noSpace bool) validResponse {
+		t.Helper()
+		fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
+			UUID: "client-reserve-strict", Size: 256 << 10,
+		}})
+		rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
+		transport := &vnextOwnerClientRecordingTransport{rpc: rpc}
+		client, err := newVNextOwnerClient(transport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages := uint64(1)
+		if noSpace {
+			pages = fixture.devices[0].superblock.Geometry.DataPageCount
+		}
+		request := vnextOwnerStatusTestRequest("strict-arrays", pages)
+		vnextOwnerTestAuthorizeReserve(&request)
+		response, err := client.Reserve(context.Background(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantState := vnextOwnerReservationGranted
+		if noSpace {
+			wantState = vnextOwnerReservationRejectedNoSpace
+		}
+		if response.State != wantState || len(transport.requests) != 1 {
+			t.Fatalf("unexpected seed Reserve response: %#v", response)
+		}
+		wireResponse := runCommandWithVNextOwnerRPCTestRole(transport.requests[0], rpc)
+		if !wireResponse.Ok || wireResponse.Operation != vnextOwnerRPCOperationReserve {
+			t.Fatalf("replay strict Reserve response: %#v", wireResponse)
+		}
+		return validResponse{request: request, raw: []byte(wireResponse.Stdout)}
+	}
+	call := func(t *testing.T, response validResponse, raw []byte) error {
+		t.Helper()
+		client, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+			func(context.Context, daemonRequest) (execResponse, error) {
+				return execResponse{
+					Ok: true, Operation: vnextOwnerRPCOperationReserve, Stdout: string(raw),
+				}, nil
+			}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = client.Reserve(context.Background(), response.request)
+		return err
+	}
+
+	noSpace := build(t, true)
+	var noSpaceFields map[string]json.RawMessage
+	if err := json.Unmarshal(noSpace.raw, &noSpaceFields); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"contents", "extents", "devices"} {
+		if !bytes.Equal(bytes.TrimSpace(noSpaceFields[field]), []byte("[]")) {
+			t.Fatalf("REJECTED_NO_SPACE %s is not the exact empty-array form: %s",
+				field, noSpaceFields[field])
+		}
+	}
+	if err := call(t, noSpace, noSpace.raw); err != nil {
+		t.Fatalf("canonical REJECTED_NO_SPACE empty arrays were rejected: %v", err)
+	}
+
+	granted := build(t, false)
+	for _, response := range []struct {
+		name  string
+		value validResponse
+	}{
+		{name: "no-space", value: noSpace},
+		{name: "granted", value: granted},
+	} {
+		for _, field := range []string{"contents", "extents", "devices"} {
+			for _, form := range []string{"null", "omitted"} {
+				t.Run(response.name+"-"+field+"-"+form, func(t *testing.T) {
+					object := vnextOwnerClientJSONMap(t, response.value.raw)
+					if form == "null" {
+						object[field] = nil
+					} else {
+						delete(object, field)
+					}
+					if err := call(t, response.value,
+						vnextOwnerClientMarshalJSON(t, object)); err == nil {
+						t.Fatal("non-array or omitted mandatory placement field was accepted")
+					}
+				})
+			}
+		}
+	}
+
+	for _, field := range []string{"termId", "mutationDigest", "receipt"} {
+		t.Run("tampered-proof-"+field, func(t *testing.T) {
+			object := vnextOwnerClientJSONMap(t, granted.raw)
+			proof := object["schedulerProof"].(map[string]interface{})
+			value := proof[field].(string)
+			replacement := byte('0')
+			if value[0] == replacement {
+				replacement = '1'
+			}
+			proof[field] = string(replacement) + value[1:]
+			if err := call(t, granted,
+				vnextOwnerClientMarshalJSON(t, object)); err == nil {
+				t.Fatal("tampered Scheduler response proof was accepted")
+			}
+		})
+	}
+	for _, form := range []string{"missing", "null", "duplicate"} {
+		t.Run("proof-"+form, func(t *testing.T) {
+			var raw []byte
+			switch form {
+			case "missing", "null":
+				object := vnextOwnerClientJSONMap(t, granted.raw)
+				if form == "missing" {
+					delete(object, "schedulerProof")
+				} else {
+					object["schedulerProof"] = nil
+				}
+				raw = vnextOwnerClientMarshalJSON(t, object)
+			case "duplicate":
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(granted.raw, &fields); err != nil {
+					t.Fatal(err)
+				}
+				raw = append([]byte(`{"schedulerProof":`), fields["schedulerProof"]...)
+				raw = append(raw, ',')
+				raw = append(raw, granted.raw[1:]...)
+			}
+			if err := call(t, granted, raw); err == nil {
+				t.Fatal("missing, null, or duplicate Scheduler response proof was accepted")
+			}
+		})
 	}
 }
 
@@ -1035,7 +1186,7 @@ func TestVNextOwnerClientRejectsNonCanonicalResponses(t *testing.T) {
 		{
 			name: "duplicate-field",
 			mutate: func(raw []byte) []byte {
-				prefix := []byte(`{"protocol":"cxld.vnext-owner.v3",`)
+				prefix := []byte(`{"protocol":"cxld.vnext-owner.v4",`)
 				return append(prefix, raw[1:]...)
 			},
 		},
@@ -1128,7 +1279,8 @@ func TestVNextOwnerClientPreservesRemoteErrorCodeAndMandatoryRequest(t *testing.
 	if err != nil {
 		t.Fatalf("create remote-error client: %v", err)
 	}
-	err = client.CommitVNextCheckpoint(context.Background(), identity)
+	err = client.CommitVNextCheckpoint(
+		context.Background(), identity, vnextOwnerSchedulerAuthority{})
 	var remote *vnextOwnerClientRemoteError
 	if !errors.As(err, &remote) || remote.ErrorCode != string(vnextOwnerServiceNoSpace) ||
 		remote.Message != "Owner has no free content pages" {
@@ -1169,7 +1321,8 @@ func TestVNextOwnerClientCancellationAndTransportFailure(t *testing.T) {
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if err := client.AbortVNextCheckpoint(ctx, identity); !errors.Is(err, context.Canceled) {
+		if err := client.AbortVNextCheckpoint(
+			ctx, identity, vnextOwnerSchedulerAuthority{}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("pre-cancelled client returned %v", err)
 		}
 		if calls != 0 {
@@ -1197,7 +1350,8 @@ func TestVNextOwnerClientCancellationAndTransportFailure(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := client.AbortVNextCheckpoint(ctx, identity); !errors.Is(err, context.Canceled) {
+		if err := client.AbortVNextCheckpoint(
+			ctx, identity, vnextOwnerSchedulerAuthority{}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("mid-flight cancellation returned %v", err)
 		}
 	})
@@ -1212,7 +1366,8 @@ func TestVNextOwnerClientCancellationAndTransportFailure(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := client.CommitVNextCheckpoint(
-			context.Background(), identity); !errors.Is(err, transportFailure) {
+			context.Background(), identity,
+			vnextOwnerSchedulerAuthority{}); !errors.Is(err, transportFailure) {
 			t.Fatalf("transport error was not preserved: %v", err)
 		}
 	})
@@ -1246,7 +1401,8 @@ func TestVNextOwnerClientRejectsOutgoingIdentityBeforeTransport(t *testing.T) {
 			run: func(client *vnextOwnerClient) error {
 				identity := validIdentity
 				identity.ProducerID = string([]byte{0xff})
-				return client.CommitVNextCheckpoint(context.Background(), identity)
+				return client.CommitVNextCheckpoint(
+					context.Background(), identity, vnextOwnerSchedulerAuthority{})
 			},
 		},
 		{
@@ -1310,6 +1466,24 @@ func TestVNextOwnerClientRejectsOutgoingIdentityBeforeTransport(t *testing.T) {
 	}
 }
 
+func TestVNextOwnerClientIdentityUnicodeWhitespaceBoundaryIsPinned(t *testing.T) {
+	for name, character := range map[string]rune{
+		"nbsp":         '\u00a0',
+		"nel":          '\u0085',
+		"figure-space": '\u2007',
+		"narrow-nbsp":  '\u202f',
+	} {
+		for _, value := range []string{string(character) + "identity", "identity" + string(character)} {
+			if err := validateVNextOwnerClientText(name, value); err == nil {
+				t.Fatalf("%s boundary whitespace %q was accepted", name, value)
+			}
+		}
+	}
+	if err := validateVNextOwnerClientText("internal NBSP", "identity\u00a0part"); err != nil {
+		t.Fatalf("internal non-control NBSP was rejected: %v", err)
+	}
+}
+
 func TestVNextOwnerClientReserveRejectsAdjacentSameDeviceExtents(t *testing.T) {
 	request := vnextOwnerReserveRequest{
 		RequestID:    "client-adjacent-request",
@@ -1333,13 +1507,22 @@ func TestVNextOwnerClientReserveRejectsAdjacentSameDeviceExtents(t *testing.T) {
 		},
 		MaxExtents: 2,
 	}
+	vnextOwnerTestAuthorizeReserve(&request)
 	internal, err := request.internal()
 	if err != nil {
 		t.Fatalf("build adjacent-extent request: %v", err)
 	}
+	expectedProof := vnextOwnerTestVerifiedAuthority(
+		vnextOwnerRPCOperationReserve, request).proof()
+	proofWire, err := vnextOwnerRPCSchedulerProofWire(expectedProof)
+	if err != nil {
+		t.Fatal(err)
+	}
 	wire := vnextOwnerRPCReserveResponse{
-		Protocol:  vnextOwnerRPCProtocol,
-		Operation: vnextOwnerRPCOperationReserve,
+		Protocol:       vnextOwnerRPCProtocol,
+		Operation:      vnextOwnerRPCOperationReserve,
+		State:          string(vnextOwnerReservationGranted),
+		SchedulerProof: proofWire,
 		Identity: vnextOwnerRPCOperationIdentity{
 			RequestID:          request.RequestID,
 			CheckpointID:       request.CheckpointID,
@@ -1386,7 +1569,7 @@ func TestVNextOwnerClientReserveRejectsAdjacentSameDeviceExtents(t *testing.T) {
 		}},
 	}
 	if _, err := convertVNextOwnerClientReserveResponse(
-		request, internal, wire); err == nil ||
+		request, internal, wire, true); err == nil ||
 		!strings.Contains(err.Error(), "not coalesced") {
 		t.Fatalf("adjacent same-device extents returned %v", err)
 	}

@@ -53,6 +53,36 @@ func vnextOwnerRPCTestUnixPipe(t *testing.T) (net.Conn, net.Conn) {
 
 func marshalVNextOwnerRPCTestPayload(t *testing.T, value interface{}) json.RawMessage {
 	t.Helper()
+	unsigned, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal unsigned VNext Owner RPC test payload: %v", err)
+	}
+	switch wire := value.(type) {
+	case vnextOwnerRPCReserveRequest:
+		if mutation, decodeErr := decodeVNextOwnerRPCReserveRequest(unsigned); decodeErr == nil {
+			wire.SchedulerAuthority = vnextOwnerTestSchedulerAuthority(
+				vnextOwnerRPCOperationReserve, mutation)
+			value = wire
+		}
+	case vnextOwnerRPCSetAdmissionRequest:
+		if mutation, decodeErr := decodeVNextOwnerRPCSetAdmissionRequest(unsigned); decodeErr == nil {
+			wire.SchedulerAuthority = vnextOwnerTestSchedulerAuthority(
+				vnextOwnerRPCOperationSetAdmission, mutation)
+			value = wire
+		}
+	case vnextOwnerRPCIssueProducerCapabilityRequest:
+		if mutation, decodeErr := decodeVNextOwnerRPCIssueProducerCapabilityRequest(unsigned); decodeErr == nil {
+			wire.SchedulerAuthority = vnextOwnerTestSchedulerAuthority(
+				vnextOwnerRPCOperationIssueProducerCapability, mutation)
+			value = wire
+		}
+	case vnextOwnerRPCRevokeProducerCapabilityRequest:
+		if mutation, decodeErr := decodeVNextOwnerRPCRevokeProducerCapabilityRequest(unsigned); decodeErr == nil {
+			wire.SchedulerAuthority = vnextOwnerTestSchedulerAuthority(
+				vnextOwnerRPCOperationRevokeProducerCapability, mutation)
+			value = wire
+		}
+	}
 	payload, err := json.Marshal(value)
 	if err != nil {
 		t.Fatalf("marshal VNext Owner RPC test payload: %v", err)
@@ -147,6 +177,17 @@ func vnextOwnerRPCTestReserveRequest(ownerID string) vnextOwnerRPCReserveRequest
 			},
 		},
 		MaxExtents: 2,
+	}
+}
+
+func vnextOwnerRPCTestReservationStatusRequest(
+	reserve vnextOwnerRPCReserveRequest,
+) vnextOwnerRPCReservationStatusRequest {
+	return vnextOwnerRPCReservationStatusRequest{
+		Protocol: reserve.Protocol, RequestID: reserve.RequestID,
+		CheckpointID: reserve.CheckpointID, ProducerID: reserve.ProducerID,
+		OwnerID: reserve.OwnerID, OwnerEpoch: reserve.OwnerEpoch,
+		Contents: reserve.Contents, MaxExtents: reserve.MaxExtents,
 	}
 }
 
@@ -260,7 +301,7 @@ func TestVNextOwnerRPCInventoryUsesStrictDaemonFrameAndMinimalResponse(t *testin
 	}
 }
 
-func TestVNextOwnerRPCV2AdmissionStatusAndPersistedTransitionAreStrict(t *testing.T) {
+func TestVNextOwnerRPCV4AdmissionStatusAndPersistedTransitionAreStrict(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
 		UUID: "rpc-admission", Size: 256 << 10,
 	}})
@@ -327,7 +368,7 @@ func TestVNextOwnerRPCV2AdmissionStatusAndPersistedTransitionAreStrict(t *testin
 		[]byte(set.Stdout),
 		"protocol", "operation", "requestId", "requestDigest", "ownerId", "ownerEpoch",
 		"fromState", "targetState", "expectedAdmissionSequence",
-		"resultAdmissionSequence", "replayed")
+		"resultAdmissionSequence", "replayed", "schedulerProof")
 	var setWire vnextOwnerRPCSetAdmissionResponse
 	if err := decodeStrictVNextOwnerRPC([]byte(set.Stdout), &setWire); err != nil {
 		t.Fatal(err)
@@ -388,7 +429,7 @@ func TestVNextOwnerRPCV2AdmissionStatusAndPersistedTransitionAreStrict(t *testin
 		VNextOwnerSetAdmission: marshalVNextOwnerRPCTestPayload(t, requestConflict),
 	})
 	if conflict.Ok ||
-		conflict.ErrorCode != string(vnextOwnerServiceAdmissionRequestConflict) {
+		conflict.ErrorCode != string(vnextOwnerServiceConflict) {
 		t.Fatalf("RPC request-id conflict lacks its stable code: %#v", conflict)
 	}
 	stale := setRequest
@@ -426,10 +467,11 @@ func TestVNextOwnerRPCReservationNotFoundCarriesAtomicClosedAdmissionEvidence(t 
 		t.Fatalf("close admission: %#v", set)
 	}
 	reserveRequest := vnextOwnerRPCTestReserveRequest("owner-0")
-	raw := marshalVNextOwnerRPCTestPayload(t, reserveRequest)
+	statusRaw := marshalVNextOwnerRPCTestPayload(
+		t, vnextOwnerRPCTestReservationStatusRequest(reserveRequest))
 	status := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
 		Operation:                   vnextOwnerRPCOperationReservationStatus,
-		VNextOwnerReservationStatus: raw,
+		VNextOwnerReservationStatus: statusRaw,
 	})
 	if !status.Ok {
 		t.Fatalf("closed NOT_FOUND status: %#v", status)
@@ -444,9 +486,10 @@ func TestVNextOwnerRPCReservationNotFoundCarriesAtomicClosedAdmissionEvidence(t 
 	}
 	beforeSequence := fixture.group.journal.SnapshotSequence
 	beforeHighWater := fixture.group.journal.NextAllocationRecordID
+	reserveRaw := marshalVNextOwnerRPCTestPayload(t, reserveRequest)
 	reserve := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
 		Operation:         vnextOwnerRPCOperationReserve,
-		VNextOwnerReserve: raw,
+		VNextOwnerReserve: reserveRaw,
 	})
 	if reserve.Ok || reserve.ErrorCode != string(vnextOwnerServiceAdmissionClosed) ||
 		!strings.Contains(reserve.Error, "admission state=READ_ONLY sequence=2") {
@@ -458,7 +501,7 @@ func TestVNextOwnerRPCReservationNotFoundCarriesAtomicClosedAdmissionEvidence(t 
 	}
 }
 
-func TestVNextOwnerRPCV1AndMalformedAdmissionRequestsFailClosed(t *testing.T) {
+func TestVNextOwnerRPCPriorGenerationAndMalformedAdmissionRequestsFailClosed(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
 		UUID: "rpc-admission-strict", Size: 256 << 10,
 	}})
@@ -468,12 +511,12 @@ func TestVNextOwnerRPCV1AndMalformedAdmissionRequestsFailClosed(t *testing.T) {
 		`"expectedAdmissionSequence":1`
 	for name, raw := range map[string]string{
 		"v2":        `{"protocol":"cxld.vnext-owner.v2",` + base + `}`,
-		"unknown":   `{"protocol":"cxld.vnext-owner.v3",` + base + `,"extra":true}`,
-		"duplicate": `{"protocol":"cxld.vnext-owner.v3","requestId":"a",` + base + `}`,
-		"reopen": `{"protocol":"cxld.vnext-owner.v3","requestId":"reopen",` +
+		"unknown":   `{"protocol":"cxld.vnext-owner.v4",` + base + `,"extra":true}`,
+		"duplicate": `{"protocol":"cxld.vnext-owner.v4","requestId":"a",` + base + `}`,
+		"reopen": `{"protocol":"cxld.vnext-owner.v4","requestId":"reopen",` +
 			`"expectedOwnerId":"owner-0","expectedOwnerEpoch":7,` +
 			`"fromState":"READ_ONLY","targetState":"ACTIVE","expectedAdmissionSequence":2}`,
-		"impossible-sequence-state": `{"protocol":"cxld.vnext-owner.v3",` +
+		"impossible-sequence-state": `{"protocol":"cxld.vnext-owner.v4",` +
 			`"requestId":"impossible-sequence-state","expectedOwnerId":"owner-0",` +
 			`"expectedOwnerEpoch":7,"fromState":"ACTIVE","targetState":"FENCED",` +
 			`"expectedAdmissionSequence":2}`,
@@ -503,8 +546,9 @@ func TestVNextOwnerRPCReservationStatusUsesCompleteReserveIdentityAndExactGrant(
 	wire := vnextOwnerRPCTestReserveRequest("owner-0")
 	statusRequest := daemonRequest{
 		CommandLabel: "rpc-status-test", TimeoutMillis: 0,
-		Operation:                   vnextOwnerRPCOperationReservationStatus,
-		VNextOwnerReservationStatus: marshalVNextOwnerRPCTestPayload(t, wire),
+		Operation: vnextOwnerRPCOperationReservationStatus,
+		VNextOwnerReservationStatus: marshalVNextOwnerRPCTestPayload(
+			t, vnextOwnerRPCTestReservationStatusRequest(wire)),
 	}
 	beforeSequence := fixture.group.journal.SnapshotSequence
 	missing := vnextOwnerRPCTestRoundTrip(t, rpc, statusRequest)
@@ -592,8 +636,9 @@ func TestVNextOwnerRPCReservationStatusRejectsImpossibleAdmissionHeadPairs(t *te
 			rpc := newVNextOwnerRPC(newVNextOwnerServiceForFixture(t, fixture))
 			wire := vnextOwnerRPCTestReserveRequest("owner-0")
 			response := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
-				Operation:                   vnextOwnerRPCOperationReservationStatus,
-				VNextOwnerReservationStatus: marshalVNextOwnerRPCTestPayload(t, wire),
+				Operation: vnextOwnerRPCOperationReservationStatus,
+				VNextOwnerReservationStatus: marshalVNextOwnerRPCTestPayload(
+					t, vnextOwnerRPCTestReservationStatusRequest(wire)),
 			})
 			if response.Ok || response.ErrorCode != string(vnextOwnerServiceUnavailable) {
 				t.Fatalf("impossible admission head was exposed: %#v", response)
@@ -614,18 +659,30 @@ func TestVNextOwnerRPCReservationStatusCarriesDurableNoSpaceWithoutGrant(t *test
 	request.ProducerID = "rpc-no-space-producer"
 	request.Contents[0].ByteLength = capacity * vnextContentPageSize
 	request.Contents[0].CapacityPages = capacity
-	raw := marshalVNextOwnerRPCTestPayload(t, request)
+	reserveRaw := marshalVNextOwnerRPCTestPayload(t, request)
+	statusRaw := marshalVNextOwnerRPCTestPayload(
+		t, vnextOwnerRPCTestReservationStatusRequest(request))
 	reserve := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
 		Operation:         vnextOwnerRPCOperationReserve,
-		VNextOwnerReserve: raw,
+		VNextOwnerReserve: reserveRaw,
 	})
-	if reserve.Ok || reserve.ErrorCode != string(vnextOwnerServiceNoSpace) {
-		t.Fatalf("RPC no-space Reserve did not return definitive no-space: %#v", reserve)
+	if !reserve.Ok || reserve.ErrorCode != "" {
+		t.Fatalf("RPC no-space Reserve did not return a typed durable result: %#v", reserve)
+	}
+	var rejected vnextOwnerRPCReserveResponse
+	if err := decodeStrictVNextOwnerRPC([]byte(reserve.Stdout), &rejected); err != nil {
+		t.Fatalf("decode typed no-space Reserve: %v", err)
+	}
+	if rejected.State != string(vnextOwnerReservationRejectedNoSpace) ||
+		rejected.Replayed || rejected.Identity.AllocationRecordID == 0 ||
+		rejected.TotalPages != 0 || len(rejected.Contents) != 0 ||
+		len(rejected.Extents) != 0 || len(rejected.Devices) != 0 {
+		t.Fatalf("typed no-space Reserve is not canonical: %#v", rejected)
 	}
 	beforeSequence := fixture.group.journal.SnapshotSequence
 	status := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
 		Operation:                   vnextOwnerRPCOperationReservationStatus,
-		VNextOwnerReservationStatus: raw,
+		VNextOwnerReservationStatus: statusRaw,
 	})
 	if !status.Ok {
 		t.Fatalf("RPC REJECTED_NO_SPACE status failed: %#v", status)
@@ -693,6 +750,8 @@ func TestVNextOwnerRPCReserveUsesActualDaemonFrameAndReturnsPortablePlacement(t 
 	abortPayload := marshalVNextOwnerRPCTestPayload(t, vnextOwnerRPCLifecycleRequest{
 		Protocol: vnextOwnerRPCProtocol,
 		Identity: placement.Identity,
+		SchedulerAuthority: vnextOwnerTestSchedulerAuthority(
+			vnextOwnerRPCOperationAbort, placement.Identity.internal()),
 	})
 	for attempt := 0; attempt < 2; attempt++ {
 		aborted := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{
@@ -720,7 +779,7 @@ func TestVNextOwnerRPCStrictlyRejectsUnknownAndTrailingJSON(t *testing.T) {
 	unknown := runCommandWithVNextOwnerRPCTestRole(daemonRequest{
 		Operation: vnextOwnerRPCOperationReserve,
 		VNextOwnerReserve: json.RawMessage(`{
-			"protocol":"cxld.vnext-owner.v3",
+			"protocol":"cxld.vnext-owner.v4",
 			"unknownMandatoryField":true
 		}`),
 	}, rpc)
@@ -836,7 +895,7 @@ func TestVNextOwnerRPCRejectsDuplicateCaseVariantAndMixedEnvelopeBeforeTypedDeco
 	}{
 		{
 			name: "duplicate protocol",
-			raw: `{"protocol":"cxld.vnext-owner.v3","protocol":"cxld.vnext-owner.v3",` +
+			raw: `{"protocol":"cxld.vnext-owner.v4","protocol":"cxld.vnext-owner.v4",` +
 				`"requestId":"r","checkpointId":"c","producerId":"p","ownerId":"o",` +
 				`"ownerEpoch":1,"contents":[],"maxExtents":1}`,
 			target:  &vnextOwnerRPCReserveRequest{},
@@ -844,19 +903,19 @@ func TestVNextOwnerRPCRejectsDuplicateCaseVariantAndMixedEnvelopeBeforeTypedDeco
 		},
 		{
 			name:    "case variant protocol",
-			raw:     `{"Protocol":"cxld.vnext-owner.v3"}`,
+			raw:     `{"Protocol":"cxld.vnext-owner.v4"}`,
 			target:  &vnextOwnerRPCReserveRequest{},
 			contain: "unknown field",
 		},
 		{
 			name:    "repeated contents",
-			raw:     `{"protocol":"cxld.vnext-owner.v3","contents":[],"contents":[]}`,
+			raw:     `{"protocol":"cxld.vnext-owner.v4","contents":[],"contents":[]}`,
 			target:  &vnextOwnerRPCReserveRequest{},
 			contain: "duplicate field",
 		},
 		{
 			name: "duplicate nested identity",
-			raw: `{"protocol":"cxld.vnext-owner.v3","identity":{` +
+			raw: `{"protocol":"cxld.vnext-owner.v4","identity":{` +
 				`"requestId":"a","requestId":"b"}}`,
 			target:  &vnextOwnerRPCLifecycleRequest{},
 			contain: "duplicate field",
@@ -894,7 +953,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "seal external CRC array",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v3",
+				"protocol":"cxld.vnext-owner.v4",
 				"identity":{
 					"requestId":"r","checkpointId":"c","producerId":"p",
 					"ownerId":"o","ownerEpoch":1,"allocationRecordId":1
@@ -940,7 +999,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "reserve content capacity",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v3",
+				"protocol":"cxld.vnext-owner.v4",
 				"requestId":"r","checkpointId":"c","producerId":"p","ownerId":"o",
 				"ownerEpoch":1,
 				"contents":[{"kind":"memory","objectId":1,"byteLength":4096}],
@@ -952,7 +1011,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "lifecycle allocation identity",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v3",
+				"protocol":"cxld.vnext-owner.v4",
 				"identity":{
 					"requestId":"r","checkpointId":"c","producerId":"p",
 					"ownerId":"o","ownerEpoch":1
@@ -964,7 +1023,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "inventory expected Owner epoch",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v3",
+				"protocol":"cxld.vnext-owner.v4",
 				"requestId":"r",
 				"expectedOwnerId":"owner-a"
 			}`),
@@ -974,7 +1033,7 @@ func TestVNextOwnerRPCRequiresEveryNestedPayloadField(t *testing.T) {
 		{
 			name: "inventory response device array",
 			raw: []byte(`{
-				"protocol":"cxld.vnext-owner.v3",
+				"protocol":"cxld.vnext-owner.v4",
 				"operation":"vnextOwnerInventory",
 				"requestId":"r",
 				"ownerId":"owner-a",
@@ -1360,7 +1419,8 @@ func TestVNextOwnerRPCSealReturnsCompleteCandidateRoot(t *testing.T) {
 	fixture := newVNextExternalSealTestFixture(t, vnextCRCCopyEngineCPU)
 	// RootVersion is the publication sequence, not the PageMap version.
 	fixture.publication.Root.PublicationSequence = 11
-	service, err := newVNextOwnerService(fixture.owner.group, fixture.directory)
+	service, err := newVNextOwnerServiceWithSchedulerAuthority(
+		fixture.owner.group, fixture.directory, vnextOwnerTestSchedulerVerifier{})
 	if err != nil {
 		t.Fatalf("build RPC seal service: %v", err)
 	}
@@ -1471,6 +1531,8 @@ func TestVNextOwnerRPCSealReturnsCompleteCandidateRoot(t *testing.T) {
 	commitPayload := marshalVNextOwnerRPCTestPayload(t, vnextOwnerRPCLifecycleRequest{
 		Protocol: vnextOwnerRPCProtocol,
 		Identity: vnextOwnerRPCIdentityFromInternal(vnextOwnerServiceIdentity(fixture.grant)),
+		SchedulerAuthority: vnextOwnerTestSchedulerAuthority(
+			vnextOwnerRPCOperationCommit, vnextOwnerServiceIdentity(fixture.grant)),
 	})
 	for attempt := 0; attempt < 2; attempt++ {
 		committed := vnextOwnerRPCTestRoundTrip(t, rpc, daemonRequest{

@@ -36,7 +36,7 @@ func vnextOwnerTestCapabilityIssueRequest(
 		Operation:          identity,
 		ProducerPrincipal:  vnextOwnerTestProducerCaller.Principal,
 		AllowedOperations:  operations,
-		SchedulerTerm:      "test-scheduler/session-1/term-1",
+		SchedulerReceipt:   [vnextOwnerSchedulerDigestBytes]byte{1},
 		RequestedTTLMillis: 60 * 60 * 1000,
 		Nonce:              nonce,
 	}
@@ -144,7 +144,6 @@ func TestVNextProducerCapabilityIssueReplayRestartAndNoBearerLeak(t *testing.T) 
 		issued.Operation != reserved.Operation ||
 		issued.ProducerPrincipal != request.ProducerPrincipal ||
 		issued.AllowedOperations != request.AllowedOperations ||
-		issued.SchedulerTerm != request.SchedulerTerm ||
 		issued.IssuedAtUnixNano != wantIssuedAt || issued.ExpiresAtUnixNano != wantExpiry ||
 		issued.Capability.Token != request.Nonce {
 		t.Fatalf("unexpected issued capability: %#v", issued)
@@ -225,9 +224,6 @@ func TestVNextProducerCapabilityIssueReplayRestartAndNoBearerLeak(t *testing.T) 
 		},
 		"operation": func(conflict *vnextOwnerIssueProducerCapabilityRequest) {
 			conflict.AllowedOperations = vnextProducerCapabilitySeal
-		},
-		"Scheduler term": func(conflict *vnextOwnerIssueProducerCapabilityRequest) {
-			conflict.SchedulerTerm = "test-scheduler/other-session/term-0"
 		},
 	} {
 		t.Run("conflicting "+name, func(t *testing.T) {
@@ -349,10 +345,10 @@ func TestVNextProducerCapabilityIssueReplaySurvivesLifecycleProgress(t *testing.
 		now = now.Add(time.Second)
 		if _, err := service.revokeProducerCapability(
 			vnextOwnerRevokeProducerCapabilityRequest{
-				RequestID:     "capability-replay-revoked-request",
-				Operation:     reserved.Operation,
-				CapabilityID:  issued.Capability.CapabilityID,
-				SchedulerTerm: "test-scheduler/session-1/term-2",
+				RequestID:        "capability-replay-revoked-request",
+				Operation:        reserved.Operation,
+				CapabilityID:     issued.Capability.CapabilityID,
+				SchedulerReceipt: [vnextOwnerSchedulerDigestBytes]byte{2},
 			},
 			vnextOwnerTestSchedulerCaller); err != nil {
 			t.Fatalf("revoke before issue replay: %v", err)
@@ -505,10 +501,10 @@ func TestVNextProducerCapabilityRevocationIsDurableAndFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	revokeRequest := vnextOwnerRevokeProducerCapabilityRequest{
-		RequestID:     "test-revoke-capability",
-		Operation:     reserved.Operation,
-		CapabilityID:  issued.Capability.CapabilityID,
-		SchedulerTerm: "test-scheduler/session-1/term-2",
+		RequestID:        "test-revoke-capability",
+		Operation:        reserved.Operation,
+		CapabilityID:     issued.Capability.CapabilityID,
+		SchedulerReceipt: [vnextOwnerSchedulerDigestBytes]byte{2},
 	}
 	now = now.Add(time.Second)
 	revoked, err := service.revokeProducerCapability(
@@ -519,7 +515,6 @@ func TestVNextProducerCapabilityRevocationIsDurableAndFailClosed(t *testing.T) {
 	if revoked.Replayed || revoked.RequestID != revokeRequest.RequestID ||
 		revoked.Operation != reserved.Operation ||
 		revoked.CapabilityID != issued.Capability.CapabilityID ||
-		revoked.SchedulerTerm != revokeRequest.SchedulerTerm ||
 		revoked.RevokedAtUnixNano != uint64(now.UnixNano()) {
 		t.Fatalf("unexpected revoke proof: %#v", revoked)
 	}
@@ -552,7 +547,7 @@ func TestVNextProducerCapabilityRevocationIsDurableAndFailClosed(t *testing.T) {
 	}
 
 	conflict := revokeRequest
-	conflict.SchedulerTerm = "test-scheduler/other-session/term-0"
+	conflict.RequestID += "-other"
 	_, err = service.revokeProducerCapability(conflict, vnextOwnerTestSchedulerCaller)
 	requireVNextOwnerServiceCode(t, err, vnextOwnerServiceCapabilityConflict)
 	rollbackNow := time.Unix(0, int64(issued.IssuedAtUnixNano-1))
@@ -656,10 +651,10 @@ func TestVNextProducerCapabilityRequiredBeforeOwnerMutation(t *testing.T) {
 
 	if _, err := service.revokeProducerCapability(
 		vnextOwnerRevokeProducerCapabilityRequest{
-			RequestID:     "capability-aborted-revoke",
-			Operation:     reserved.Operation,
-			CapabilityID:  capability.CapabilityID,
-			SchedulerTerm: "test-scheduler/session-1/term-2",
+			RequestID:        "capability-aborted-revoke",
+			Operation:        reserved.Operation,
+			CapabilityID:     capability.CapabilityID,
+			SchedulerReceipt: [vnextOwnerSchedulerDigestBytes]byte{2},
 		},
 		vnextOwnerTestSchedulerCaller); err != nil {
 		t.Fatalf("revoke terminal Producer capability: %v", err)

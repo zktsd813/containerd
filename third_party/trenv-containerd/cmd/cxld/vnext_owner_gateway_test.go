@@ -100,10 +100,7 @@ func vnextOwnerGatewayTestReserveDaemonRequest(
 	wire vnextOwnerRPCReserveRequest,
 ) daemonRequest {
 	t.Helper()
-	raw, err := json.Marshal(wire)
-	if err != nil {
-		t.Fatalf("marshal gateway Reserve request: %v", err)
-	}
+	raw := marshalVNextOwnerRPCTestPayload(t, wire)
 	return daemonRequest{
 		CommandLabel:      "scheduler-gateway-test",
 		Operation:         vnextOwnerRPCOperationReserve,
@@ -120,7 +117,12 @@ func vnextOwnerGatewayTestReservationStatusDaemonRequest(
 	if err != nil {
 		t.Fatalf("validate gateway reservation-status request: %v", err)
 	}
-	raw, err := json.Marshal(wire)
+	raw, err := json.Marshal(vnextOwnerRPCReservationStatusRequest{
+		Protocol: wire.Protocol, RequestID: wire.RequestID,
+		CheckpointID: wire.CheckpointID, ProducerID: wire.ProducerID,
+		OwnerID: wire.OwnerID, OwnerEpoch: wire.OwnerEpoch,
+		Contents: wire.Contents, MaxExtents: wire.MaxExtents,
+	})
 	if err != nil {
 		t.Fatalf("marshal gateway reservation-status request: %v", err)
 	}
@@ -156,6 +158,13 @@ func vnextOwnerGatewayTestLifecycleDaemonRequest(
 				CapabilityID: "00000000000000000000000000000001",
 				Token:        bytes.Repeat([]byte{1}, vnextProducerCapabilityTokenBytes),
 			},
+		}
+	} else {
+		body = vnextOwnerRPCLifecycleRequest{
+			Protocol: vnextOwnerRPCProtocol,
+			Identity: identity,
+			SchedulerAuthority: vnextOwnerTestSchedulerAuthority(
+				operation, identity.internal()),
 		}
 	}
 	raw, err := json.Marshal(body)
@@ -328,12 +337,32 @@ func TestVNextOwnerGatewayPreservesRoleAndUsesDistinctCredentials(t *testing.T) 
 					request daemonRequest,
 				) (execResponse, error) {
 					calls[role]++
-					response := marshalVNextOwnerRPCResponse(
-						vnextOwnerRPCLifecycleResponse{
-							Protocol:  vnextOwnerRPCProtocol,
-							Operation: request.Operation,
-							State:     "ABORTED",
-						})
+					var response execResponse
+					if request.Operation == vnextOwnerRPCOperationProducerAbort {
+						response = marshalVNextOwnerRPCResponse(
+							vnextOwnerRPCProducerAbortResponse{
+								Protocol: vnextOwnerRPCProtocol, Operation: request.Operation,
+								State: "ABORTED",
+							})
+					} else {
+						var lifecycle vnextOwnerRPCLifecycleRequest
+						if err := decodeStrictVNextOwnerRPC(
+							request.VNextOwnerAbort, &lifecycle); err != nil {
+							return execResponse{}, err
+						}
+						proof := vnextOwnerTestVerifiedAuthority(
+							request.Operation, lifecycle.Identity.internal()).proof()
+						wireProof, err := vnextOwnerRPCSchedulerProofWire(proof)
+						if err != nil {
+							return execResponse{}, err
+						}
+						response = marshalVNextOwnerRPCResponse(
+							vnextOwnerRPCLifecycleResponse{
+								Protocol: vnextOwnerRPCProtocol, Operation: request.Operation,
+								State: "ABORTED", Identity: lifecycle.Identity,
+								SchedulerProof: wireProof,
+							})
+					}
 					response.Operation = request.Operation
 					response.DurationMicros = 1
 					return response, nil
@@ -609,7 +638,7 @@ func TestVNextOwnerGatewayRoutesAdmissionStatusAndTransitionByExactIncarnation(t
 		vnextOwnerGatewayTestRouteFile("remote-owner", 9, "127.0.0.1:1"),
 		localRPC,
 		vnextOwnerGatewayTestInventoryTransport(&calls, nil, nil))
-	setRaw, err := json.Marshal(vnextOwnerRPCSetAdmissionRequest{
+	setRaw := marshalVNextOwnerRPCTestPayload(t, vnextOwnerRPCSetAdmissionRequest{
 		Protocol:                  vnextOwnerRPCProtocol,
 		RequestID:                 "gateway-admission-close",
 		ExpectedOwnerID:           "owner-0",
@@ -618,9 +647,6 @@ func TestVNextOwnerGatewayRoutesAdmissionStatusAndTransitionByExactIncarnation(t
 		TargetState:               "READ_ONLY",
 		ExpectedAdmissionSequence: 1,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	set := vnextOwnerGatewayUnixRoundTrip(t, localRPC, gateway, daemonRequest{
 		CommandLabel:           "scheduler-gateway-test",
 		Operation:              vnextOwnerRPCOperationSetAdmission,

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -22,9 +23,10 @@ import (
 type vnextOwnerService struct {
 	mu sync.Mutex
 
-	group     *vnextOwnerGroup
-	directory *vnextLocalDAXDirectory
-	now       func() time.Time
+	group              *vnextOwnerGroup
+	directory          *vnextLocalDAXDirectory
+	now                func() time.Time
+	schedulerAuthority vnextOwnerSchedulerAuthorityVerifier
 }
 
 type vnextOwnerServiceErrorCode string
@@ -107,6 +109,11 @@ type vnextOwnerOperationIdentity struct {
 	AllocationRecordID uint64
 }
 
+type vnextOwnerSchedulerLifecycleRequest struct {
+	Operation          vnextOwnerOperationIdentity
+	SchedulerAuthority vnextOwnerSchedulerAuthority
+}
+
 // The portable content-kind values intentionally match the strict V6 content
 // ABI, while remaining separate from cxld's allocator implementation type.
 type vnextOwnerServiceContentKind uint8
@@ -166,13 +173,14 @@ type vnextOwnerReserveContent struct {
 }
 
 type vnextOwnerReserveRequest struct {
-	RequestID    string
-	CheckpointID string
-	ProducerID   string
-	OwnerID      string
-	OwnerEpoch   uint64
-	Contents     []vnextOwnerReserveContent
-	MaxExtents   uint32
+	RequestID          string
+	CheckpointID       string
+	ProducerID         string
+	OwnerID            string
+	OwnerEpoch         uint64
+	Contents           []vnextOwnerReserveContent
+	MaxExtents         uint32
+	SchedulerAuthority vnextOwnerSchedulerAuthority
 }
 
 type vnextOwnerPortableContentSegment struct {
@@ -201,11 +209,14 @@ type vnextOwnerPortableDevice struct {
 // stable UUID. Extents are ordered by LogicalPageStart and exactly cover
 // TotalPages. ContentRegionBase is portable device geometry, not a host path.
 type vnextOwnerReserveResponse struct {
-	Operation  vnextOwnerOperationIdentity
-	TotalPages uint64
-	Contents   []vnextOwnerPortableContentSegment
-	Extents    []vnextOwnerPortableExtent
-	Devices    []vnextOwnerPortableDevice
+	State          vnextOwnerReservationState
+	Replayed       bool
+	SchedulerProof vnextOwnerSchedulerProof
+	Operation      vnextOwnerOperationIdentity
+	TotalPages     uint64
+	Contents       []vnextOwnerPortableContentSegment
+	Extents        []vnextOwnerPortableExtent
+	Devices        []vnextOwnerPortableDevice
 }
 
 // vnextOwnerInventoryRequest names the exact Owner incarnation whose live
@@ -226,7 +237,10 @@ type vnextOwnerInventoryResponse struct {
 }
 
 // Admission status is an atomic read of one exact Owner incarnation. RequestID
-// is correlation only and is not persisted in the Owner journal.
+// is correlation only and is not persisted in the Owner journal. LastTransition
+// proves only the current head; it is not complete-history evidence. Its absence
+// or a different RequestID must not be interpreted as a generic NOT_APPLIED
+// proof for an older SetAdmission request.
 type vnextOwnerAdmissionStatusRequest struct {
 	RequestID  string
 	OwnerID    string
@@ -248,12 +262,13 @@ type vnextOwnerAdmissionStatusResponse struct {
 // Owner epoch. The Owner computes RequestDigest from this complete request and
 // persists it with the transition proof.
 type vnextOwnerSetAdmissionRequest struct {
-	RequestID        string
-	OwnerID          string
-	OwnerEpoch       uint64
-	From             vnextOwnerAdmissionState
-	Target           vnextOwnerAdmissionState
-	ExpectedSequence uint64
+	RequestID          string
+	OwnerID            string
+	OwnerEpoch         uint64
+	From               vnextOwnerAdmissionState
+	Target             vnextOwnerAdmissionState
+	ExpectedSequence   uint64
+	SchedulerAuthority vnextOwnerSchedulerAuthority
 }
 
 type vnextOwnerSetAdmissionResponse struct {
@@ -266,6 +281,13 @@ type vnextOwnerSetAdmissionResponse struct {
 	ExpectedSequence uint64
 	ResultSequence   uint64
 	Replayed         bool
+	SchedulerProof   vnextOwnerSchedulerProof
+}
+
+type vnextOwnerSchedulerLifecycleResponse struct {
+	Operation      vnextOwnerOperationIdentity
+	Replayed       bool
+	SchedulerProof vnextOwnerSchedulerProof
 }
 
 type vnextOwnerReservationState string
@@ -355,6 +377,14 @@ func newVNextOwnerService(
 	group *vnextOwnerGroup,
 	directory *vnextLocalDAXDirectory,
 ) (*vnextOwnerService, error) {
+	return newVNextOwnerServiceWithSchedulerAuthority(group, directory, nil)
+}
+
+func newVNextOwnerServiceWithSchedulerAuthority(
+	group *vnextOwnerGroup,
+	directory *vnextLocalDAXDirectory,
+	schedulerAuthority vnextOwnerSchedulerAuthorityVerifier,
+) (*vnextOwnerService, error) {
 	const operation = "initialize"
 	if group == nil || directory == nil || len(directory.byUUID) == 0 {
 		return nil, vnextOwnerServiceFailure(
@@ -390,7 +420,82 @@ func newVNextOwnerService(
 				errVNextAuthority)
 		}
 	}
-	return &vnextOwnerService{group: group, directory: directory, now: time.Now}, nil
+	return &vnextOwnerService{
+		group:              group,
+		directory:          directory,
+		now:                time.Now,
+		schedulerAuthority: schedulerAuthority,
+	}, nil
+}
+
+func (service *vnextOwnerService) prepareSchedulerMutation(
+	operation string,
+	mutation interface{},
+	authority vnextOwnerSchedulerAuthority,
+) (vnextOwnerSchedulerVerifiedAuthority, error) {
+	if service == nil || service.group == nil || service.schedulerAuthority == nil {
+		return vnextOwnerSchedulerVerifiedAuthority{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable,
+			"Scheduler authority verifier is not configured", nil)
+	}
+	verified, err := service.schedulerAuthority.Prepare(operation, mutation, authority)
+	if err != nil {
+		return vnextOwnerSchedulerVerifiedAuthority{}, vnextOwnerServiceWrap(operation, err)
+	}
+	return verified, nil
+}
+
+func (service *vnextOwnerService) verifyCurrentSchedulerMutation(
+	operation string,
+	verified vnextOwnerSchedulerVerifiedAuthority,
+) error {
+	if err := service.schedulerAuthority.VerifyCurrent(context.Background(), verified); err != nil {
+		return vnextOwnerServiceWrap(operation, err)
+	}
+	return nil
+}
+
+func (service *vnextOwnerService) authorizePreparedSchedulerMutation(
+	operation string,
+	rpcOperation string,
+	mutation interface{},
+	verified vnextOwnerSchedulerVerifiedAuthority,
+) (vnextOwnerSchedulerProof, bool, error) {
+	proof, status := service.group.schedulerProofStatus(
+		rpcOperation, mutation, verified.Receipt)
+	switch status {
+	case vnextOwnerSchedulerReceiptExact:
+		return proof, true, nil
+	case vnextOwnerSchedulerReceiptConflict:
+		return vnextOwnerSchedulerProof{}, false, vnextOwnerServiceWrap(
+			operation, errVNextOwnerSchedulerReceiptConflict)
+	case vnextOwnerSchedulerReceiptMissing:
+		if err := service.verifyCurrentSchedulerMutation(operation, verified); err != nil {
+			return vnextOwnerSchedulerProof{}, false, err
+		}
+		return vnextOwnerSchedulerProof{}, false, nil
+	default:
+		return vnextOwnerSchedulerProof{}, false, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable,
+			"Scheduler receipt status is invalid", errVNextCorrupt)
+	}
+}
+
+func (service *vnextOwnerService) durableSchedulerProof(
+	operation string,
+	rpcOperation string,
+	mutation interface{},
+	verified vnextOwnerSchedulerVerifiedAuthority,
+) (vnextOwnerSchedulerProof, error) {
+	proof, status := service.group.schedulerProofStatus(
+		rpcOperation, mutation, verified.Receipt)
+	if status != vnextOwnerSchedulerReceiptExact || !proof.valid() ||
+		proof != verified.proof() {
+		return vnextOwnerSchedulerProof{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable,
+			"durable Scheduler proof does not match the verified mutation", errVNextCorrupt)
+	}
+	return proof, nil
 }
 
 func (service *vnextOwnerService) capabilityNowUnixNano(
@@ -408,7 +513,7 @@ func (service *vnextOwnerService) capabilityNowUnixNano(
 	return now, nil
 }
 
-func (service *vnextOwnerService) issueProducerCapability(
+func (service *vnextOwnerService) issueProducerCapabilityScheduler(
 	request vnextOwnerIssueProducerCapabilityRequest,
 	caller vnextOwnerCallerContext,
 ) (vnextOwnerIssueProducerCapabilityResponse, error) {
@@ -420,29 +525,49 @@ func (service *vnextOwnerService) issueProducerCapability(
 			operation, vnextOwnerServicePermissionDenied,
 			"only an authenticated Scheduler may issue Producer capabilities", err)
 	}
+	verified, err := service.prepareSchedulerMutation(
+		vnextOwnerRPCOperationIssueProducerCapability, request, request.SchedulerAuthority)
+	if err != nil {
+		return vnextOwnerIssueProducerCapabilityResponse{}, err
+	}
+	request.SchedulerReceipt = verified.Receipt
+	_, _, err = service.authorizePreparedSchedulerMutation(
+		operation, vnextOwnerRPCOperationIssueProducerCapability, request, verified)
+	if err != nil {
+		return vnextOwnerIssueProducerCapabilityResponse{}, err
+	}
 	now, err := service.capabilityNowUnixNano(operation)
 	if err != nil {
 		return vnextOwnerIssueProducerCapabilityResponse{}, err
 	}
-	record, replayed, err := service.group.issueProducerCapability(
-		request, caller.Principal, now)
+	issuer := vnextOwnerSchedulerPrincipal(verified)
+	record, replayed, err := service.group.issueProducerCapabilityWithScheduler(
+		request, issuer, now, &verified)
 	if err != nil {
 		return vnextOwnerIssueProducerCapabilityResponse{}, vnextOwnerServiceWrap(operation, err)
 	}
+	durableProof, err := service.durableSchedulerProof(
+		operation, vnextOwnerRPCOperationIssueProducerCapability, request, verified)
+	if err != nil {
+		return vnextOwnerIssueProducerCapabilityResponse{}, err
+	}
 	return vnextOwnerIssueProducerCapabilityResponse{
-		RequestID:         request.RequestID,
-		Capability:        vnextProducerCapabilityProof{CapabilityID: record.CapabilityID, Token: request.Nonce},
+		RequestID: request.RequestID,
+		Capability: vnextProducerCapabilityProof{
+			CapabilityID: record.CapabilityID,
+			Token:        request.Nonce,
+		},
 		Operation:         request.Operation,
 		ProducerPrincipal: record.ProducerPrincipal,
 		AllowedOperations: record.AllowedOperations,
-		SchedulerTerm:     record.SchedulerTerm,
 		IssuedAtUnixNano:  record.IssuedAtUnixNano,
 		ExpiresAtUnixNano: record.ExpiresAtUnixNano,
 		Replayed:          replayed,
+		SchedulerProof:    durableProof,
 	}, nil
 }
 
-func (service *vnextOwnerService) revokeProducerCapability(
+func (service *vnextOwnerService) revokeProducerCapabilityScheduler(
 	request vnextOwnerRevokeProducerCapabilityRequest,
 	caller vnextOwnerCallerContext,
 ) (vnextOwnerRevokeProducerCapabilityResponse, error) {
@@ -454,22 +579,39 @@ func (service *vnextOwnerService) revokeProducerCapability(
 			operation, vnextOwnerServicePermissionDenied,
 			"only an authenticated Scheduler may revoke Producer capabilities", err)
 	}
+	verified, err := service.prepareSchedulerMutation(
+		vnextOwnerRPCOperationRevokeProducerCapability, request, request.SchedulerAuthority)
+	if err != nil {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, err
+	}
+	request.SchedulerReceipt = verified.Receipt
+	_, _, err = service.authorizePreparedSchedulerMutation(
+		operation, vnextOwnerRPCOperationRevokeProducerCapability, request, verified)
+	if err != nil {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, err
+	}
 	now, err := service.capabilityNowUnixNano(operation)
 	if err != nil {
 		return vnextOwnerRevokeProducerCapabilityResponse{}, err
 	}
-	record, replayed, err := service.group.revokeProducerCapability(
-		request, caller.Principal, now)
+	revoker := vnextOwnerSchedulerPrincipal(verified)
+	record, replayed, err := service.group.revokeProducerCapabilityWithScheduler(
+		request, revoker, now, &verified)
 	if err != nil {
 		return vnextOwnerRevokeProducerCapabilityResponse{}, vnextOwnerServiceWrap(operation, err)
+	}
+	durableProof, err := service.durableSchedulerProof(
+		operation, vnextOwnerRPCOperationRevokeProducerCapability, request, verified)
+	if err != nil {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, err
 	}
 	return vnextOwnerRevokeProducerCapabilityResponse{
 		RequestID:         request.RequestID,
 		CapabilityID:      record.CapabilityID,
 		Operation:         request.Operation,
-		SchedulerTerm:     record.RevokeSchedulerTerm,
 		RevokedAtUnixNano: record.RevokedAtUnixNano,
 		Replayed:          replayed,
+		SchedulerProof:    durableProof,
 	}, nil
 }
 
@@ -563,10 +705,12 @@ func (service *vnextOwnerService) admissionStatus(
 	}, nil
 }
 
-func (service *vnextOwnerService) setAdmission(
+func (service *vnextOwnerService) setAdmissionScheduler(
 	request vnextOwnerSetAdmissionRequest,
 ) (vnextOwnerSetAdmissionResponse, error) {
 	const operation = "set-admission"
+	service.mu.Lock()
+	defer service.mu.Unlock()
 	if service == nil || service.group == nil {
 		return vnextOwnerSetAdmissionResponse{}, vnextOwnerServiceFailure(
 			operation, vnextOwnerServiceUnavailable, "Owner group is not configured", nil)
@@ -583,9 +727,24 @@ func (service *vnextOwnerService) setAdmission(
 		return vnextOwnerSetAdmissionResponse{}, vnextOwnerServiceFailure(
 			operation, vnextOwnerServiceInvalidRequest, err.Error(), err)
 	}
-	result, err := service.group.setAdmission(internal)
+	verified, err := service.prepareSchedulerMutation(
+		vnextOwnerRPCOperationSetAdmission, request, request.SchedulerAuthority)
+	if err != nil {
+		return vnextOwnerSetAdmissionResponse{}, err
+	}
+	_, _, err = service.authorizePreparedSchedulerMutation(
+		operation, vnextOwnerRPCOperationSetAdmission, request, verified)
+	if err != nil {
+		return vnextOwnerSetAdmissionResponse{}, err
+	}
+	result, err := service.group.setAdmissionWithScheduler(internal, &verified)
 	if err != nil {
 		return vnextOwnerSetAdmissionResponse{}, vnextOwnerServiceWrap(operation, err)
+	}
+	durableProof, err := service.durableSchedulerProof(
+		operation, vnextOwnerRPCOperationSetAdmission, request, verified)
+	if err != nil {
+		return vnextOwnerSetAdmissionResponse{}, err
 	}
 	record := result.Record
 	return vnextOwnerSetAdmissionResponse{
@@ -598,6 +757,7 @@ func (service *vnextOwnerService) setAdmission(
 		ExpectedSequence: record.ExpectedSequence,
 		ResultSequence:   record.ResultSequence,
 		Replayed:         result.Replayed,
+		SchedulerProof:   durableProof,
 	}, nil
 }
 
@@ -732,31 +892,83 @@ func (service *vnextOwnerService) reservationStatus(
 			"durable placement cannot be represented",
 			err)
 	}
+	portable.SchedulerProof = transaction.SchedulerReserveProof
 	response.Grant = &portable
 	return response, nil
 }
 
-func (service *vnextOwnerService) reserve(
+func (service *vnextOwnerService) reserveScheduler(
 	request vnextOwnerReserveRequest,
 ) (vnextOwnerReserveResponse, error) {
 	const operation = "reserve"
 	service.mu.Lock()
 	defer service.mu.Unlock()
-
 	internal, err := request.internal()
 	if err != nil {
 		return vnextOwnerReserveResponse{}, vnextOwnerServiceFailure(
 			operation, vnextOwnerServiceInvalidRequest, err.Error(), err)
 	}
-	grant, err := service.group.reserve(internal)
+	verified, err := service.prepareSchedulerMutation(
+		vnextOwnerRPCOperationReserve, request, request.SchedulerAuthority)
 	if err != nil {
+		return vnextOwnerReserveResponse{}, err
+	}
+	_, exactReplay, err := service.authorizePreparedSchedulerMutation(
+		operation, vnextOwnerRPCOperationReserve, request, verified)
+	if err != nil {
+		return vnextOwnerReserveResponse{}, err
+	}
+	grant, err := service.group.reserveWithScheduler(internal, &verified)
+	if err != nil {
+		if errors.Is(err, errVNextNoSpace) {
+			durableProof, proofErr := service.durableSchedulerProof(
+				operation, vnextOwnerRPCOperationReserve, request, verified)
+			if proofErr != nil {
+				return vnextOwnerReserveResponse{}, proofErr
+			}
+			service.group.mu.Lock()
+			allocationID := service.group.journal.RequestIndex[request.RequestID]
+			transaction := service.group.journal.Transactions[allocationID]
+			if transaction == nil || transaction.State != vnextOwnerRejectedNoSpace {
+				service.group.mu.Unlock()
+				return vnextOwnerReserveResponse{}, vnextOwnerServiceFailure(
+					operation, vnextOwnerServiceUnavailable,
+					"durable no-space record is unavailable", errVNextCorrupt)
+			}
+			identity := vnextOwnerOperationIdentity{
+				RequestID:          transaction.RequestID,
+				CheckpointID:       transaction.CheckpointID,
+				ProducerID:         transaction.ProducerID,
+				OwnerID:            service.group.ownerID,
+				OwnerEpoch:         service.group.ownerEpoch,
+				AllocationRecordID: transaction.AllocationRecordID,
+			}
+			service.group.mu.Unlock()
+			return vnextOwnerReserveResponse{
+				State:          vnextOwnerReservationRejectedNoSpace,
+				Replayed:       exactReplay,
+				SchedulerProof: durableProof,
+				Operation:      identity,
+				Contents:       []vnextOwnerPortableContentSegment{},
+				Extents:        []vnextOwnerPortableExtent{},
+				Devices:        []vnextOwnerPortableDevice{},
+			}, nil
+		}
 		return vnextOwnerReserveResponse{}, vnextOwnerServiceWrap(operation, err)
+	}
+	durableProof, err := service.durableSchedulerProof(
+		operation, vnextOwnerRPCOperationReserve, request, verified)
+	if err != nil {
+		return vnextOwnerReserveResponse{}, err
 	}
 	response, err := service.reserveResponse(internal, grant)
 	if err != nil {
 		return vnextOwnerReserveResponse{}, vnextOwnerServiceFailure(
-			operation, vnextOwnerServiceUnavailable, "reserved placement cannot be represented", err)
+			operation, vnextOwnerServiceUnavailable,
+			"reserved placement cannot be represented", err)
 	}
+	response.Replayed = exactReplay
+	response.SchedulerProof = durableProof
 	return response, nil
 }
 
@@ -853,6 +1065,7 @@ func (service *vnextOwnerService) reserveResponse(
 	grant vnextOwnerWriteGrant,
 ) (vnextOwnerReserveResponse, error) {
 	response := vnextOwnerReserveResponse{
+		State: vnextOwnerReservationGranted,
 		Operation: vnextOwnerOperationIdentity{
 			RequestID:          grant.RequestID,
 			CheckpointID:       grant.CheckpointID,
@@ -1084,36 +1297,60 @@ func vnextOwnerServiceRequireSidecars(
 	return nil
 }
 
-func (service *vnextOwnerService) commit(identity vnextOwnerOperationIdentity) error {
-	const operation = "commit"
-	service.mu.Lock()
-	defer service.mu.Unlock()
-
-	grant, _, err := service.resolveOperation(
-		operation, identity, vnextOwnerGranted, true, vnextOwnerCommitted)
-	if err != nil {
-		return err
-	}
-	if err := service.group.commit(grant); err != nil {
-		return vnextOwnerServiceWrap(operation, err)
-	}
-	return nil
+func (service *vnextOwnerService) commitScheduler(
+	request vnextOwnerSchedulerLifecycleRequest,
+) (vnextOwnerSchedulerLifecycleResponse, error) {
+	return service.schedulerLifecycle(
+		"commit", vnextOwnerRPCOperationCommit, request,
+		vnextOwnerCommitted, service.group.commitWithScheduler)
 }
 
-func (service *vnextOwnerService) abort(identity vnextOwnerOperationIdentity) error {
-	const operation = "abort"
+func (service *vnextOwnerService) abortScheduler(
+	request vnextOwnerSchedulerLifecycleRequest,
+) (vnextOwnerSchedulerLifecycleResponse, error) {
+	return service.schedulerLifecycle(
+		"abort", vnextOwnerRPCOperationAbort, request,
+		vnextOwnerAborted, service.group.abortWithScheduler)
+}
+
+func (service *vnextOwnerService) schedulerLifecycle(
+	operation string,
+	rpcOperation string,
+	request vnextOwnerSchedulerLifecycleRequest,
+	terminalState vnextOwnerTransactionState,
+	currentApply func(vnextOwnerWriteGrant, *vnextOwnerSchedulerVerifiedAuthority) error,
+) (vnextOwnerSchedulerLifecycleResponse, error) {
 	service.mu.Lock()
 	defer service.mu.Unlock()
-
-	grant, _, err := service.resolveOperation(
-		operation, identity, vnextOwnerGranted, true, vnextOwnerAborted)
+	verified, err := service.prepareSchedulerMutation(
+		rpcOperation, request.Operation, request.SchedulerAuthority)
 	if err != nil {
-		return err
+		return vnextOwnerSchedulerLifecycleResponse{}, err
 	}
-	if err := service.group.abort(grant); err != nil {
-		return vnextOwnerServiceWrap(operation, err)
+	_, exactReplay, err := service.authorizePreparedSchedulerMutation(
+		operation, rpcOperation, request.Operation, verified)
+	if err != nil {
+		return vnextOwnerSchedulerLifecycleResponse{}, err
 	}
-	return nil
+	grant, _, err := service.resolveOperation(
+		operation, request.Operation, vnextOwnerGranted, true, terminalState)
+	if err != nil {
+		return vnextOwnerSchedulerLifecycleResponse{}, err
+	}
+	err = currentApply(grant, &verified)
+	if err != nil {
+		return vnextOwnerSchedulerLifecycleResponse{}, vnextOwnerServiceWrap(operation, err)
+	}
+	durableProof, err := service.durableSchedulerProof(
+		operation, rpcOperation, request.Operation, verified)
+	if err != nil {
+		return vnextOwnerSchedulerLifecycleResponse{}, err
+	}
+	return vnextOwnerSchedulerLifecycleResponse{
+		Operation:      request.Operation,
+		Replayed:       exactReplay,
+		SchedulerProof: durableProof,
+	}, nil
 }
 
 func (service *vnextOwnerService) producerAbort(
@@ -1168,7 +1405,8 @@ func (service *vnextOwnerService) producerAbort(
 	if err := group.requireReclaimSafetyLocked(operation); err != nil {
 		return vnextOwnerServiceWrap(operation, err)
 	}
-	if err := group.abortTransactionLocked(transaction); err != nil {
+	if err := group.abortTransactionLocked(
+		transaction, vnextOwnerAbortByProducer); err != nil {
 		return vnextOwnerServiceWrap(operation, group.poisonLocked(err))
 	}
 	return nil
@@ -1308,6 +1546,15 @@ func vnextOwnerServiceWrap(operation string, err error) error {
 			err)
 	}
 	switch {
+	case errors.Is(err, errVNextOwnerSchedulerAuthority),
+		errors.Is(err, errVNextOwnerSchedulerFenced):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServicePermissionDenied,
+			"Scheduler authority is invalid, stale, or unavailable", err)
+	case errors.Is(err, errVNextOwnerSchedulerReceiptConflict):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceConflict,
+			"Scheduler mutation conflicts with its durable authority proof", err)
 	case errors.Is(err, errVNextProducerCapabilityConflict):
 		return vnextOwnerServiceFailure(
 			operation, vnextOwnerServiceCapabilityConflict,

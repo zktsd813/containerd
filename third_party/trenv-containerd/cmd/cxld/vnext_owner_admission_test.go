@@ -577,6 +577,10 @@ func TestVNextOwnerFencedRestartNeverCompletesFreeingRecovery(t *testing.T) {
 			fixture.group.mu.Lock()
 			candidate := fixture.group.journal.clone()
 			candidate.Transactions[grant.AllocationRecordID].State = test.state
+			if test.state == vnextOwnerAborting {
+				candidate.Transactions[grant.AllocationRecordID].AbortOrigin =
+					vnextOwnerAbortByRecovery
+			}
 			err = fixture.group.persistJournalLocked(candidate)
 			fixture.group.mu.Unlock()
 			if err != nil {

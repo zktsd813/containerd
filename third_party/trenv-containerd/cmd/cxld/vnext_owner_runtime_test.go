@@ -4,10 +4,25 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"errors"
+	"math"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
+
+func vnextOwnerTestSchedulerAuthorityConfig() vnextOwnerSchedulerAuthorityConfig {
+	return vnextOwnerSchedulerAuthorityConfig{
+		Endpoints:       []string{"https://etcd.test:2379"},
+		LeaderKey:       "/openwhisk/cxl-checkpoint/global-orchestrator-leader",
+		ExpectedCluster: 0xfedcba9876543210,
+		CAFile:          "/test/cxld-etcd-ca.pem",
+		ClientCertFile:  "/test/cxld-etcd-client.pem",
+		ClientKeyFile:   "/test/cxld-etcd-client-key.pem",
+		DialTimeout:     10 * time.Second,
+		ReadTimeout:     5 * time.Second,
+	}
+}
 
 func vnextOwnerTestRuntimeDependencies() vnextOwnerRuntimeDependencies {
 	return vnextOwnerRuntimeDependencies{
@@ -29,6 +44,11 @@ func vnextOwnerTestRuntimeDependencies() vnextOwnerRuntimeDependencies {
 				close:  file.Close,
 			}, nil
 		},
+		openSchedulerAuthority: func(
+			config vnextOwnerSchedulerAuthorityConfig,
+		) (vnextOwnerSchedulerAuthorityVerifier, func() error, error) {
+			return &vnextOwnerSchedulerVerifier{}, func() error { return nil }, nil
+		},
 	}
 }
 
@@ -38,9 +58,10 @@ func vnextOwnerTestRuntimeConfig(fixture *vnextOwnerTestFixture) vnextOwnerRunti
 		paths[index] = file.Name()
 	}
 	return vnextOwnerRuntimeConfig{
-		ControlFilePath:  fixture.controlFile.Name(),
-		ControlSlotBytes: testVNextOwnerControlSlotBytes,
-		DAXDeviceList:    strings.Join(paths, ","),
+		ControlFilePath:    fixture.controlFile.Name(),
+		ControlSlotBytes:   testVNextOwnerControlSlotBytes,
+		DAXDeviceList:      strings.Join(paths, ","),
+		SchedulerAuthority: vnextOwnerTestSchedulerAuthorityConfig(),
 	}
 }
 
@@ -58,6 +79,22 @@ func TestVNextOwnerRuntimeDisabledAndPartialConfigurationFailClosed(t *testing.T
 		{
 			ControlFilePath:  "/tmp/owner-control",
 			ControlSlotBytes: testVNextOwnerControlSlotBytes,
+		},
+		{
+			ControlFilePath:  "/tmp/owner-control",
+			ControlSlotBytes: testVNextOwnerControlSlotBytes,
+			DAXDeviceList:    "/dev/dax0.0",
+		},
+		{
+			SchedulerAuthority: vnextOwnerTestSchedulerAuthorityConfig(),
+		},
+		{
+			ControlFilePath:  "/tmp/owner-control",
+			ControlSlotBytes: testVNextOwnerControlSlotBytes,
+			DAXDeviceList:    "/dev/dax0.0",
+			SchedulerAuthority: vnextOwnerSchedulerAuthorityConfig{
+				Endpoints: []string{"https://etcd.test:2379"},
+			},
 		},
 	}
 	for index, config := range partial {
@@ -135,9 +172,10 @@ func TestVNextOwnerRuntimeNeverFormatsBlankDeviceOnOpenFailure(t *testing.T) {
 	}
 	before := sha256.Sum256(blank)
 	config := vnextOwnerRuntimeConfig{
-		ControlFilePath:  fixture.controlFile.Name(),
-		ControlSlotBytes: testVNextOwnerControlSlotBytes,
-		DAXDeviceList:    blankPath,
+		ControlFilePath:    fixture.controlFile.Name(),
+		ControlSlotBytes:   testVNextOwnerControlSlotBytes,
+		DAXDeviceList:      blankPath,
+		SchedulerAuthority: vnextOwnerTestSchedulerAuthorityConfig(),
 	}
 	runtime, err := openVNextOwnerRuntimeWithDependencies(
 		config, vnextOwnerTestRuntimeDependencies())
@@ -331,22 +369,160 @@ func TestVNextOwnerRuntimeClosesEarlierResourcesWhenLaterDeviceOpenFails(t *test
 				},
 			}, nil
 		},
+		openSchedulerAuthority: vnextOwnerTestRuntimeDependencies().openSchedulerAuthority,
 	}
 	runtime, err := openVNextOwnerRuntimeWithDependencies(vnextOwnerRuntimeConfig{
-		ControlFilePath:  controlPath,
-		ControlSlotBytes: testVNextOwnerControlSlotBytes,
-		DAXDeviceList:    devicePath + "," + missingPath,
+		ControlFilePath:    controlPath,
+		ControlSlotBytes:   testVNextOwnerControlSlotBytes,
+		DAXDeviceList:      devicePath + "," + missingPath,
+		SchedulerAuthority: vnextOwnerTestSchedulerAuthorityConfig(),
 	}, dependencies)
 	if err == nil || runtime != nil {
 		t.Fatalf("partial device open unexpectedly succeeded: runtime=%#v err=%v", runtime, err)
 	}
 	if deviceCloseCount != 1 {
-		t.Fatalf("earlier device close count is %d, expected 1", deviceCloseCount)
+		t.Fatalf("earlier device close count is %d, expected 1; startup err=%v",
+			deviceCloseCount, err)
 	}
 	if openedControl == nil {
 		t.Fatal("control file was never opened")
 	}
 	if _, statErr := openedControl.Stat(); statErr == nil {
 		t.Fatal("control file remained open after partial startup failure")
+	}
+}
+
+func TestParseVNextOwnerSchedulerAuthorityInputPreservesExactConfiguration(t *testing.T) {
+	config, err := parseVNextOwnerSchedulerAuthorityInput(
+		vnextOwnerSchedulerAuthorityInput{
+			Endpoints:         "https://etcd-a.test:2379,https://etcd-b.test:2379",
+			LeaderKey:         "/openwhisk/cxl-checkpoint/global-orchestrator-leader",
+			ExpectedCluster:   "fedcba9876543210",
+			CAFile:            "/etc/cxld/etcd/ca.pem",
+			ClientCertFile:    "/etc/cxld/etcd/client.pem",
+			ClientKeyFile:     "/etc/cxld/etcd/client-key.pem",
+			DialTimeoutMillis: 10000,
+			ReadTimeoutMillis: 5000,
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Endpoints) != 2 ||
+		config.Endpoints[0] != "https://etcd-a.test:2379" ||
+		config.Endpoints[1] != "https://etcd-b.test:2379" ||
+		config.ExpectedCluster != 0xfedcba9876543210 ||
+		config.DialTimeout != 10*time.Second ||
+		config.ReadTimeout != 5*time.Second ||
+		vnextOwnerSchedulerAuthorityConfiguredFields(config) != 8 {
+		t.Fatalf("exact Scheduler authority input changed during parsing: %#v", config)
+	}
+	if err := validateVNextOwnerSchedulerAuthorityConfig(config, true); err != nil {
+		t.Fatalf("parsed exact Scheduler authority is invalid: %v", err)
+	}
+}
+
+func TestParseVNextOwnerSchedulerAuthorityInputRejectsNoncanonicalValues(t *testing.T) {
+	overflowMillis := int64(math.MaxInt64)/int64(time.Millisecond) + 1
+	tests := []vnextOwnerSchedulerAuthorityInput{
+		{Endpoints: " https://etcd.test:2379"},
+		{Endpoints: "https://etcd.test:2379,"},
+		{ExpectedCluster: "0000000000000000"},
+		{ExpectedCluster: "0123456789ABCDEf"},
+		{ExpectedCluster: "0123456789abcdef "},
+		{DialTimeoutMillis: -1},
+		{ReadTimeoutMillis: overflowMillis},
+	}
+	for index, input := range tests {
+		if config, err := parseVNextOwnerSchedulerAuthorityInput(input); err == nil {
+			t.Fatalf("noncanonical input %d was accepted as %#v", index, config)
+		}
+	}
+}
+
+func TestVNextOwnerRuntimeOpensAndClosesSchedulerAuthorityExactlyOnce(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
+		{UUID: "runtime-authority-device", Size: 128 << 10},
+	})
+	dependencies := vnextOwnerTestRuntimeDependencies()
+	openCount := 0
+	closeCount := 0
+	dependencies.openSchedulerAuthority = func(
+		config vnextOwnerSchedulerAuthorityConfig,
+	) (vnextOwnerSchedulerAuthorityVerifier, func() error, error) {
+		openCount++
+		if config.ExpectedCluster != 0xfedcba9876543210 {
+			t.Fatalf("authority opener received the wrong cluster: %#v", config)
+		}
+		return &vnextOwnerSchedulerVerifier{}, func() error {
+			closeCount++
+			return nil
+		}, nil
+	}
+	runtime, err := openVNextOwnerRuntimeWithDependencies(
+		vnextOwnerTestRuntimeConfig(fixture), dependencies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime == nil || runtime.service == nil ||
+		runtime.service.schedulerAuthority == nil || openCount != 1 {
+		t.Fatalf("Scheduler authority was not injected: runtime=%#v opens=%d",
+			runtime, openCount)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if closeCount != 1 {
+		t.Fatalf("Scheduler authority close count = %d, want 1", closeCount)
+	}
+}
+
+func TestVNextOwnerRuntimeAuthorityFailurePrecedesStorageOpen(t *testing.T) {
+	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{
+		{UUID: "runtime-authority-failure-device", Size: 128 << 10},
+	})
+	dependencies := vnextOwnerTestRuntimeDependencies()
+	controlOpenCount := 0
+	dependencies.openControlFile = func(path string) (*os.File, error) {
+		controlOpenCount++
+		return os.OpenFile(path, os.O_RDWR, 0)
+	}
+	authorityFailure := errors.New("injected authority open failure")
+	dependencies.openSchedulerAuthority = func(
+		config vnextOwnerSchedulerAuthorityConfig,
+	) (vnextOwnerSchedulerAuthorityVerifier, func() error, error) {
+		return nil, nil, authorityFailure
+	}
+	runtime, err := openVNextOwnerRuntimeWithDependencies(
+		vnextOwnerTestRuntimeConfig(fixture), dependencies)
+	if runtime != nil || !errors.Is(err, authorityFailure) {
+		t.Fatalf("authority failure was not preserved: runtime=%#v err=%v", runtime, err)
+	}
+	if controlOpenCount != 0 {
+		t.Fatalf("storage opened %d times after authority failure", controlOpenCount)
+	}
+}
+
+func TestVNextOwnerRuntimeAuthorityCloseFailureIsTerminal(t *testing.T) {
+	closeCount := 0
+	closeFailure := errors.New("injected authority close failure")
+	runtime := &vnextOwnerRuntime{
+		service: &vnextOwnerService{},
+		schedulerAuthorityClose: func() error {
+			closeCount++
+			return closeFailure
+		},
+	}
+	if err := runtime.Close(); !errors.Is(err, closeFailure) {
+		t.Fatalf("authority close failure was hidden: %v", err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("terminal authority close was retried: %v", err)
+	}
+	if closeCount != 1 || !runtime.closed || runtime.service != nil {
+		t.Fatalf("authority close state count=%d closed=%v service=%#v",
+			closeCount, runtime.closed, runtime.service)
 	}
 }

@@ -189,12 +189,16 @@ func openVNextOwnerGroup(
 	return group, nil
 }
 
-func (group *vnextOwnerGroup) reserve(
+func (group *vnextOwnerGroup) reserveWithScheduler(
 	request vnextCheckpointAllocationRequest,
+	authority *vnextOwnerSchedulerVerifiedAuthority,
 ) (vnextOwnerWriteGrant, error) {
 	group.mu.Lock()
 	defer group.mu.Unlock()
 	if err := group.checkUsableLocked(); err != nil {
+		return vnextOwnerWriteGrant{}, err
+	}
+	if err := validateVNextOwnerVerifiedSchedulerAuthority(authority); err != nil {
 		return vnextOwnerWriteGrant{}, err
 	}
 	segments, totalPages, digest, err := group.validateOwnerRequestLocked(request)
@@ -209,6 +213,9 @@ func (group *vnextOwnerGroup) reserve(
 			return vnextOwnerWriteGrant{}, fmt.Errorf(
 				"Owner request ID %q conflicts with allocation %d: %w",
 				request.RequestID, allocationID, errVNextAlreadyExists)
+		}
+		if transaction.SchedulerReserveProof != authority.proof() {
+			return vnextOwnerWriteGrant{}, errVNextOwnerSchedulerReceiptConflict
 		}
 		switch transaction.State {
 		case vnextOwnerGranted:
@@ -248,21 +255,25 @@ func (group *vnextOwnerGroup) reserve(
 			return vnextOwnerWriteGrant{}, err
 		}
 		transaction := &vnextOwnerTransaction{
-			AllocationRecordID: allocationID,
-			RequestID:          request.RequestID,
-			CheckpointID:       request.CheckpointID,
-			ProducerID:         request.ProducerID,
-			RequestDigest:      digest,
-			State:              vnextOwnerRejectedNoSpace,
-			TotalPages:         totalPages,
-			MaxExtents:         request.MaxExtents,
-			Contents:           append([]vnextContentSegment(nil), segments...),
+			AllocationRecordID:    allocationID,
+			RequestID:             request.RequestID,
+			CheckpointID:          request.CheckpointID,
+			ProducerID:            request.ProducerID,
+			RequestDigest:         digest,
+			SchedulerReserveProof: authority.proof(),
+			State:                 vnextOwnerRejectedNoSpace,
+			TotalPages:            totalPages,
+			MaxExtents:            request.MaxExtents,
+			Contents:              append([]vnextContentSegment(nil), segments...),
 		}
 		candidate := group.journal.clone()
 		candidate.Transactions[allocationID] = transaction
 		candidate.RequestIndex[request.RequestID] = allocationID
 		candidate.CheckpointIndex[request.CheckpointID] = allocationID
 		candidate.NextAllocationRecordID = allocationID + 1
+		if err := group.applySchedulerAuthorityLocked(candidate, authority); err != nil {
+			return vnextOwnerWriteGrant{}, err
+		}
 		if persistErr := group.persistJournalLocked(candidate); persistErr != nil {
 			return vnextOwnerWriteGrant{}, group.poisonLocked(fmt.Errorf(
 				"persist Owner REJECTED_NO_SPACE: %w", persistErr))
@@ -272,22 +283,26 @@ func (group *vnextOwnerGroup) reserve(
 			allocationID, errVNextNoSpace)
 	}
 	transaction := &vnextOwnerTransaction{
-		AllocationRecordID: allocationID,
-		RequestID:          request.RequestID,
-		CheckpointID:       request.CheckpointID,
-		ProducerID:         request.ProducerID,
-		RequestDigest:      digest,
-		State:              vnextOwnerPreparing,
-		TotalPages:         totalPages,
-		MaxExtents:         request.MaxExtents,
-		Contents:           append([]vnextContentSegment(nil), segments...),
-		Fragments:          plan.Fragments,
+		AllocationRecordID:    allocationID,
+		RequestID:             request.RequestID,
+		CheckpointID:          request.CheckpointID,
+		ProducerID:            request.ProducerID,
+		RequestDigest:         digest,
+		SchedulerReserveProof: authority.proof(),
+		State:                 vnextOwnerPreparing,
+		TotalPages:            totalPages,
+		MaxExtents:            request.MaxExtents,
+		Contents:              append([]vnextContentSegment(nil), segments...),
+		Fragments:             plan.Fragments,
 	}
 	candidate := group.journal.clone()
 	candidate.Transactions[allocationID] = transaction
 	candidate.RequestIndex[request.RequestID] = allocationID
 	candidate.CheckpointIndex[request.CheckpointID] = allocationID
 	candidate.NextAllocationRecordID = allocationID + 1
+	if err := group.applySchedulerAuthorityLocked(candidate, authority); err != nil {
+		return vnextOwnerWriteGrant{}, err
+	}
 	if err := group.persistJournalLocked(candidate); err != nil {
 		return vnextOwnerWriteGrant{}, group.poisonLocked(fmt.Errorf("persist Owner PREPARING: %w", err))
 	}
@@ -337,6 +352,24 @@ func (group *vnextOwnerGroup) reserve(
 	}
 	grant.fragmentGrants = fragmentGrants
 	return grant, nil
+}
+
+func (group *vnextOwnerGroup) applySchedulerAuthorityLocked(
+	candidate *vnextOwnerJournal,
+	authority *vnextOwnerSchedulerVerifiedAuthority,
+) error {
+	if candidate == nil || group.journal == nil {
+		return fmt.Errorf("Owner Scheduler authority candidate is unavailable: %w", errVNextCorrupt)
+	}
+	if err := validateVNextOwnerVerifiedSchedulerAuthority(authority); err != nil {
+		return err
+	}
+	if err := validateVNextOwnerSchedulerHighWaterAdvance(
+		group.journal.SchedulerHighWater, authority.HighWater); err != nil {
+		return err
+	}
+	candidate.SchedulerHighWater = authority.HighWater
+	return nil
 }
 
 func (group *vnextOwnerGroup) inventory(
@@ -475,10 +508,16 @@ func (group *vnextOwnerGroup) writePage(
 		globalLogicalPage, grant.AllocationRecordID)
 }
 
-func (group *vnextOwnerGroup) commit(grant vnextOwnerWriteGrant) error {
+func (group *vnextOwnerGroup) commitWithScheduler(
+	grant vnextOwnerWriteGrant,
+	authority *vnextOwnerSchedulerVerifiedAuthority,
+) error {
 	group.mu.Lock()
 	defer group.mu.Unlock()
 	if err := group.checkUsableLocked(); err != nil {
+		return err
+	}
+	if err := validateVNextOwnerVerifiedSchedulerAuthority(authority); err != nil {
 		return err
 	}
 	transaction := group.journal.Transactions[grant.AllocationRecordID]
@@ -488,6 +527,9 @@ func (group *vnextOwnerGroup) commit(grant vnextOwnerWriteGrant) error {
 		return fmt.Errorf("Owner commit grant identity mismatch: %w", errVNextAuthority)
 	}
 	if transaction.State == vnextOwnerCommitted {
+		if transaction.SchedulerCommitProof != authority.proof() {
+			return errVNextOwnerSchedulerReceiptConflict
+		}
 		return nil
 	}
 	transaction, err := group.validateGrantLocked(grant, vnextOwnerGranted)
@@ -502,6 +544,10 @@ func (group *vnextOwnerGroup) commit(grant vnextOwnerWriteGrant) error {
 	}
 	candidate := group.journal.clone()
 	candidate.Transactions[transaction.AllocationRecordID].State = vnextOwnerCommitting
+	candidate.Transactions[transaction.AllocationRecordID].SchedulerCommitProof = authority.proof()
+	if err := group.applySchedulerAuthorityLocked(candidate, authority); err != nil {
+		return err
+	}
 	if err := group.persistJournalLocked(candidate); err != nil {
 		return group.poisonLocked(fmt.Errorf("persist Owner COMMITTING: %w", err))
 	}
@@ -516,10 +562,16 @@ func (group *vnextOwnerGroup) commit(grant vnextOwnerWriteGrant) error {
 	return nil
 }
 
-func (group *vnextOwnerGroup) abort(grant vnextOwnerWriteGrant) error {
+func (group *vnextOwnerGroup) abortWithScheduler(
+	grant vnextOwnerWriteGrant,
+	authority *vnextOwnerSchedulerVerifiedAuthority,
+) error {
 	group.mu.Lock()
 	defer group.mu.Unlock()
 	if err := group.checkUsableLocked(); err != nil {
+		return err
+	}
+	if err := validateVNextOwnerVerifiedSchedulerAuthority(authority); err != nil {
 		return err
 	}
 	transaction := group.journal.Transactions[grant.AllocationRecordID]
@@ -529,6 +581,10 @@ func (group *vnextOwnerGroup) abort(grant vnextOwnerWriteGrant) error {
 		return fmt.Errorf("Owner abort grant does not name an allocation: %w", errVNextAuthority)
 	}
 	if transaction.State == vnextOwnerAborted {
+		if transaction.AbortOrigin != vnextOwnerAbortByScheduler ||
+			transaction.SchedulerAbortProof != authority.proof() {
+			return errVNextOwnerSchedulerReceiptConflict
+		}
 		return nil
 	}
 	if transaction.State != vnextOwnerGranted {
@@ -541,7 +597,7 @@ func (group *vnextOwnerGroup) abort(grant vnextOwnerWriteGrant) error {
 	if err := group.requireReclaimSafetyLocked("abort"); err != nil {
 		return err
 	}
-	if err := group.abortTransactionLocked(transaction); err != nil {
+	if err := group.abortTransactionWithSchedulerLocked(transaction, authority); err != nil {
 		return group.poisonLocked(err)
 	}
 	return nil
@@ -999,17 +1055,61 @@ func (group *vnextOwnerGroup) handlePrepareFailureLocked(
 	transaction *vnextOwnerTransaction,
 	cause error,
 ) error {
-	if err := group.abortTransactionLocked(transaction); err != nil {
+	if err := group.abortTransactionLocked(transaction, vnextOwnerAbortByRecovery); err != nil {
 		return group.poisonLocked(fmt.Errorf("prepare failed (%v), cleanup failed: %w", cause, err))
 	}
 	return cause
 }
 
-func (group *vnextOwnerGroup) abortTransactionLocked(transaction *vnextOwnerTransaction) error {
+func (group *vnextOwnerGroup) abortTransactionLocked(
+	transaction *vnextOwnerTransaction,
+	origin vnextOwnerAbortOrigin,
+) error {
+	if origin != vnextOwnerAbortByProducer && origin != vnextOwnerAbortByRecovery {
+		return fmt.Errorf("internal Owner abort origin is invalid: %w", errVNextCorrupt)
+	}
+	return group.beginAbortTransactionLocked(transaction, origin, nil)
+}
+
+func (group *vnextOwnerGroup) abortTransactionWithSchedulerLocked(
+	transaction *vnextOwnerTransaction,
+	authority *vnextOwnerSchedulerVerifiedAuthority,
+) error {
+	if err := validateVNextOwnerVerifiedSchedulerAuthority(authority); err != nil {
+		return err
+	}
+	return group.beginAbortTransactionLocked(
+		transaction, vnextOwnerAbortByScheduler, authority)
+}
+
+func (group *vnextOwnerGroup) beginAbortTransactionLocked(
+	transaction *vnextOwnerTransaction,
+	origin vnextOwnerAbortOrigin,
+	authority *vnextOwnerSchedulerVerifiedAuthority,
+) error {
 	candidate := group.journal.clone()
 	candidate.Transactions[transaction.AllocationRecordID].State = vnextOwnerAborting
+	candidate.Transactions[transaction.AllocationRecordID].AbortOrigin = origin
+	if origin == vnextOwnerAbortByScheduler {
+		candidate.Transactions[transaction.AllocationRecordID].SchedulerAbortProof =
+			authority.proof()
+		if err := group.applySchedulerAuthorityLocked(candidate, authority); err != nil {
+			return err
+		}
+	}
 	if err := group.persistJournalLocked(candidate); err != nil {
 		return fmt.Errorf("persist Owner ABORTING: %w", err)
+	}
+	return group.completeAbortTransactionLocked(
+		group.journal.Transactions[transaction.AllocationRecordID])
+}
+
+func (group *vnextOwnerGroup) completeAbortTransactionLocked(
+	transaction *vnextOwnerTransaction,
+) error {
+	if transaction == nil || transaction.State != vnextOwnerAborting ||
+		!transaction.AbortOrigin.valid() {
+		return fmt.Errorf("Owner ABORTING record is invalid: %w", errVNextCorrupt)
 	}
 	for _, fragment := range transaction.Fragments {
 		if err := group.callFaultHookLocked(vnextOwnerFailDuringAbort, fragment.DeviceUUID); err != nil {
@@ -1020,7 +1120,7 @@ func (group *vnextOwnerGroup) abortTransactionLocked(transaction *vnextOwnerTran
 			return fmt.Errorf("abort fragment %q: %w", fragment.DeviceUUID, err)
 		}
 	}
-	candidate = group.journal.clone()
+	candidate := group.journal.clone()
 	candidate.Transactions[transaction.AllocationRecordID].State = vnextOwnerAborted
 	if err := group.persistJournalLocked(candidate); err != nil {
 		return fmt.Errorf("persist Owner ABORTED: %w", err)
@@ -1070,7 +1170,14 @@ func (group *vnextOwnerGroup) recoverTransactionsLocked() error {
 					allocationID,
 					err)
 			}
-			if err := group.abortTransactionLocked(transaction); err != nil {
+			if transaction.State == vnextOwnerPreparing {
+				if err := group.abortTransactionLocked(
+					transaction, vnextOwnerAbortByRecovery); err != nil {
+					return fmt.Errorf("recover Owner abort %d: %w", allocationID, err)
+				}
+				continue
+			}
+			if err := group.completeAbortTransactionLocked(transaction); err != nil {
 				return fmt.Errorf("recover Owner abort %d: %w", allocationID, err)
 			}
 		case vnextOwnerCommitting:

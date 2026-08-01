@@ -3,10 +3,12 @@ package main
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 )
 
@@ -14,9 +16,76 @@ import (
 // the VNext Owner RPC unavailable; a partial or invalid configuration aborts
 // daemon startup. It never creates or formats a device or Owner journal.
 type vnextOwnerRuntimeConfig struct {
-	ControlFilePath  string
-	ControlSlotBytes uint64
-	DAXDeviceList    string
+	ControlFilePath    string
+	ControlSlotBytes   uint64
+	DAXDeviceList      string
+	SchedulerAuthority vnextOwnerSchedulerAuthorityConfig
+}
+
+type vnextOwnerSchedulerAuthorityInput struct {
+	Endpoints         string
+	LeaderKey         string
+	ExpectedCluster   string
+	CAFile            string
+	ClientCertFile    string
+	ClientKeyFile     string
+	DialTimeoutMillis int64
+	ReadTimeoutMillis int64
+}
+
+func parseVNextOwnerSchedulerAuthorityInput(
+	input vnextOwnerSchedulerAuthorityInput,
+) (vnextOwnerSchedulerAuthorityConfig, error) {
+	var config vnextOwnerSchedulerAuthorityConfig
+	if input.Endpoints != "" {
+		if strings.TrimSpace(input.Endpoints) != input.Endpoints {
+			return config, errors.New(
+				"Scheduler authority etcd endpoints have surrounding whitespace")
+		}
+		config.Endpoints = strings.Split(input.Endpoints, ",")
+		for index, endpoint := range config.Endpoints {
+			if endpoint == "" {
+				return vnextOwnerSchedulerAuthorityConfig{}, fmt.Errorf(
+					"Scheduler authority etcd endpoint %d is empty", index)
+			}
+		}
+	}
+	config.LeaderKey = input.LeaderKey
+	if input.ExpectedCluster != "" {
+		cluster, err := decodeVNextOwnerSchedulerHexU64(
+			"Scheduler authority expected cluster ID",
+			input.ExpectedCluster,
+			false)
+		if err != nil {
+			return vnextOwnerSchedulerAuthorityConfig{}, err
+		}
+		config.ExpectedCluster = cluster
+	}
+	config.CAFile = input.CAFile
+	config.ClientCertFile = input.ClientCertFile
+	config.ClientKeyFile = input.ClientKeyFile
+	var err error
+	config.DialTimeout, err = vnextOwnerSchedulerTimeoutFromMillis(
+		"Scheduler authority etcd dial timeout", input.DialTimeoutMillis)
+	if err != nil {
+		return vnextOwnerSchedulerAuthorityConfig{}, err
+	}
+	config.ReadTimeout, err = vnextOwnerSchedulerTimeoutFromMillis(
+		"Scheduler authority etcd read timeout", input.ReadTimeoutMillis)
+	if err != nil {
+		return vnextOwnerSchedulerAuthorityConfig{}, err
+	}
+	return config, nil
+}
+
+func vnextOwnerSchedulerTimeoutFromMillis(
+	name string,
+	value int64,
+) (time.Duration, error) {
+	if value < 0 || value > int64(math.MaxInt64)/int64(time.Millisecond) {
+		return 0, fmt.Errorf("%s milliseconds are outside the duration ABI", name)
+	}
+	return time.Duration(value) * time.Millisecond, nil
 }
 
 type vnextOwnerOpenedDevice struct {
@@ -25,17 +94,21 @@ type vnextOwnerOpenedDevice struct {
 }
 
 type vnextOwnerRuntimeDependencies struct {
-	openControlFile func(string) (*os.File, error)
-	openDevice      func(string) (vnextOwnerOpenedDevice, error)
+	openControlFile        func(string) (*os.File, error)
+	openDevice             func(string) (vnextOwnerOpenedDevice, error)
+	openSchedulerAuthority func(
+		vnextOwnerSchedulerAuthorityConfig,
+	) (vnextOwnerSchedulerAuthorityVerifier, func() error, error)
 }
 
 type vnextOwnerRuntime struct {
-	mu           sync.Mutex
-	service      *vnextOwnerService
-	controlFile  *os.File
-	controlClose func() error
-	devices      []vnextOwnerOpenedDevice
-	closed       bool
+	mu                      sync.Mutex
+	service                 *vnextOwnerService
+	schedulerAuthorityClose func() error
+	controlFile             *os.File
+	controlClose            func() error
+	devices                 []vnextOwnerOpenedDevice
+	closed                  bool
 }
 
 type vnextOwnerRuntimeCloseErrors struct {
@@ -90,6 +163,15 @@ func openVNextOwnerRuntime(config vnextOwnerRuntimeConfig) (*vnextOwnerRuntime, 
 				close:  device.closeStorage,
 			}, nil
 		},
+		openSchedulerAuthority: func(
+			config vnextOwnerSchedulerAuthorityConfig,
+		) (vnextOwnerSchedulerAuthorityVerifier, func() error, error) {
+			verifier, closeAuthority, err := openVNextOwnerSchedulerAuthority(config)
+			if err != nil {
+				return nil, nil, err
+			}
+			return verifier, closeAuthority, nil
+		},
 	})
 }
 
@@ -99,24 +181,31 @@ func openVNextOwnerRuntimeWithDependencies(
 ) (_ *vnextOwnerRuntime, returnErr error) {
 	controlPath := strings.TrimSpace(config.ControlFilePath)
 	deviceList := strings.TrimSpace(config.DAXDeviceList)
-	configuredFields := 0
+	runtimeConfiguredFields := 0
 	if controlPath != "" {
-		configuredFields++
+		runtimeConfiguredFields++
 	}
 	if config.ControlSlotBytes != 0 {
-		configuredFields++
+		runtimeConfiguredFields++
 	}
 	if deviceList != "" {
-		configuredFields++
+		runtimeConfiguredFields++
 	}
-	if configuredFields == 0 {
+	authorityConfiguredFields := vnextOwnerSchedulerAuthorityConfiguredFields(
+		config.SchedulerAuthority)
+	if runtimeConfiguredFields == 0 && authorityConfiguredFields == 0 {
 		return nil, nil
 	}
-	if configuredFields != 3 {
+	if runtimeConfiguredFields != 3 {
 		return nil, errors.New(
 			"VNext Owner requires control file, control slot bytes, and DAX devices together")
 	}
-	if dependencies.openControlFile == nil || dependencies.openDevice == nil {
+	if authorityConfiguredFields != 8 {
+		return nil, errors.New(
+			"local VNext Owner requires all eight Scheduler-authority etcd settings together")
+	}
+	if dependencies.openControlFile == nil || dependencies.openDevice == nil ||
+		dependencies.openSchedulerAuthority == nil {
 		return nil, errors.New("VNext Owner runtime open dependencies are incomplete")
 	}
 	if err := validateVNextOwnerRuntimePath(controlPath, "control file"); err != nil {
@@ -125,6 +214,10 @@ func openVNextOwnerRuntimeWithDependencies(
 	devicePaths, err := parseVNextOwnerDevicePaths(deviceList)
 	if err != nil {
 		return nil, err
+	}
+	if err := validateVNextOwnerSchedulerAuthorityConfig(
+		config.SchedulerAuthority, true); err != nil {
+		return nil, fmt.Errorf("validate VNext Owner Scheduler authority: %w", err)
 	}
 
 	runtime := &vnextOwnerRuntime{}
@@ -137,6 +230,19 @@ func openVNextOwnerRuntimeWithDependencies(
 			}
 		}
 	}()
+
+	schedulerAuthority, closeSchedulerAuthority, err :=
+		dependencies.openSchedulerAuthority(config.SchedulerAuthority)
+	if err != nil {
+		return nil, fmt.Errorf("open VNext Owner Scheduler authority: %w", err)
+	}
+	if closeSchedulerAuthority != nil {
+		runtime.schedulerAuthorityClose = closeSchedulerAuthority
+	}
+	if schedulerAuthority == nil || closeSchedulerAuthority == nil {
+		return nil, errors.New(
+			"VNext Owner Scheduler authority opener returned incomplete state")
+	}
 
 	controlFile, err := dependencies.openControlFile(controlPath)
 	if err != nil {
@@ -181,9 +287,10 @@ func openVNextOwnerRuntimeWithDependencies(
 	}
 	group, err := openVNextOwnerGroup(controlFile, config.ControlSlotBytes, devices)
 	if err != nil {
-		return nil, fmt.Errorf("open existing TROWN008 Owner group: %w", err)
+		return nil, fmt.Errorf("open existing TROWN009 Owner group: %w", err)
 	}
-	service, err := newVNextOwnerService(group, directory)
+	service, err := newVNextOwnerServiceWithSchedulerAuthority(
+		group, directory, schedulerAuthority)
 	if err != nil {
 		return nil, fmt.Errorf("initialize VNext Owner service: %w", err)
 	}
@@ -215,6 +322,37 @@ func parseVNextOwnerDevicePaths(value string) ([]string, error) {
 	return paths, nil
 }
 
+func vnextOwnerSchedulerAuthorityConfiguredFields(
+	config vnextOwnerSchedulerAuthorityConfig,
+) int {
+	configured := 0
+	if len(config.Endpoints) != 0 {
+		configured++
+	}
+	if config.LeaderKey != "" {
+		configured++
+	}
+	if config.ExpectedCluster != 0 {
+		configured++
+	}
+	if config.CAFile != "" {
+		configured++
+	}
+	if config.ClientCertFile != "" {
+		configured++
+	}
+	if config.ClientKeyFile != "" {
+		configured++
+	}
+	if config.DialTimeout != 0 {
+		configured++
+	}
+	if config.ReadTimeout != 0 {
+		configured++
+	}
+	return configured
+}
+
 func validateVNextOwnerRuntimePath(path string, role string) error {
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path ||
 		strings.IndexFunc(path, unicode.IsSpace) >= 0 {
@@ -237,6 +375,17 @@ func (runtime *vnextOwnerRuntime) Close() error {
 	// Close call.
 	runtime.service = nil
 	var closeErr error
+	if runtime.schedulerAuthorityClose != nil {
+		// clientv3.Client.Close is terminal even when it reports an error.
+		// Never call it twice and obscure the first shutdown diagnosis.
+		closeSchedulerAuthority := runtime.schedulerAuthorityClose
+		runtime.schedulerAuthorityClose = nil
+		if err := closeSchedulerAuthority(); err != nil {
+			closeErr = appendVNextOwnerRuntimeCloseError(
+				closeErr,
+				fmt.Errorf("close VNext Owner Scheduler authority: %w", err))
+		}
+	}
 	for index := len(runtime.devices) - 1; index >= 0; index-- {
 		if runtime.devices[index].close == nil {
 			continue
