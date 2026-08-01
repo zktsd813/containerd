@@ -136,17 +136,29 @@ func vnextOwnerGatewayTestLifecycleDaemonRequest(
 	operation string,
 ) daemonRequest {
 	t.Helper()
-	raw, err := json.Marshal(vnextOwnerRPCLifecycleRequest{
+	identity := vnextOwnerRPCOperationIdentity{
+		RequestID:          "gateway-lifecycle-request",
+		CheckpointID:       "gateway-lifecycle-checkpoint",
+		ProducerID:         "gateway-lifecycle-producer",
+		OwnerID:            "owner-0",
+		OwnerEpoch:         7,
+		AllocationRecordID: 1,
+	}
+	var body interface{} = vnextOwnerRPCLifecycleRequest{
 		Protocol: vnextOwnerRPCProtocol,
-		Identity: vnextOwnerRPCOperationIdentity{
-			RequestID:          "gateway-lifecycle-request",
-			CheckpointID:       "gateway-lifecycle-checkpoint",
-			ProducerID:         "gateway-lifecycle-producer",
-			OwnerID:            "owner-0",
-			OwnerEpoch:         7,
-			AllocationRecordID: 1,
-		},
-	})
+		Identity: identity,
+	}
+	if operation == vnextOwnerRPCOperationProducerAbort {
+		body = vnextOwnerRPCProducerAbortRequest{
+			Protocol: vnextOwnerRPCProtocol,
+			Identity: identity,
+			Capability: vnextOwnerRPCProducerCapabilityProof{
+				CapabilityID: "00000000000000000000000000000001",
+				Token:        bytes.Repeat([]byte{1}, vnextProducerCapabilityTokenBytes),
+			},
+		}
+	}
+	raw, err := json.Marshal(body)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,6 +171,8 @@ func vnextOwnerGatewayTestLifecycleDaemonRequest(
 		request.VNextOwnerCommit = raw
 	case vnextOwnerRPCOperationAbort:
 		request.VNextOwnerAbort = raw
+	case vnextOwnerRPCOperationProducerAbort:
+		request.VNextOwnerProducerAbort = raw
 	default:
 		t.Fatalf("unsupported lifecycle test operation %q", operation)
 	}
@@ -337,14 +351,17 @@ func TestVNextOwnerGatewayPreservesRoleAndUsesDistinctCredentials(t *testing.T) 
 			config.ProducerClientCertificatePath {
 		t.Fatalf("role transport configs = %#v", configs)
 	}
-	abort := vnextOwnerGatewayTestLifecycleDaemonRequest(
-		t, vnextOwnerRPCOperationAbort)
-	for _, role := range []vnextOwnerCallerRole{
-		vnextOwnerCallerScheduler, vnextOwnerCallerProducer,
+	for _, call := range []struct {
+		role      vnextOwnerCallerRole
+		operation string
+	}{
+		{vnextOwnerCallerScheduler, vnextOwnerRPCOperationAbort},
+		{vnextOwnerCallerProducer, vnextOwnerRPCOperationProducerAbort},
 	} {
-		response := gateway.dispatch(abort, role)
+		request := vnextOwnerGatewayTestLifecycleDaemonRequest(t, call.operation)
+		response := gateway.dispatch(request, call.role)
 		if !response.Ok {
-			t.Fatalf("%s Abort response = %#v", role, response)
+			t.Fatalf("%s %s response = %#v", call.role, call.operation, response)
 		}
 	}
 	if calls[vnextOwnerCallerScheduler] != 1 ||

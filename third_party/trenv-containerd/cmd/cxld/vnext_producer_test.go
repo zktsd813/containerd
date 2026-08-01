@@ -16,9 +16,8 @@ import (
 type vnextProducerCountingOwnerClient struct {
 	delegate vnextProducerOwnerClient
 
-	sealCalls   int
-	commitCalls int
-	abortCalls  int
+	sealCalls  int
+	abortCalls int
 }
 
 func (client *vnextProducerCountingOwnerClient) SealVNextCheckpoint(
@@ -29,20 +28,13 @@ func (client *vnextProducerCountingOwnerClient) SealVNextCheckpoint(
 	return client.delegate.SealVNextCheckpoint(ctx, request)
 }
 
-func (client *vnextProducerCountingOwnerClient) CommitVNextCheckpoint(
+func (client *vnextProducerCountingOwnerClient) ProducerAbortVNextCheckpoint(
 	ctx context.Context,
 	identity vnextOwnerOperationIdentity,
-) error {
-	client.commitCalls++
-	return client.delegate.CommitVNextCheckpoint(ctx, identity)
-}
-
-func (client *vnextProducerCountingOwnerClient) AbortVNextCheckpoint(
-	ctx context.Context,
-	identity vnextOwnerOperationIdentity,
+	capability vnextProducerCapabilityProof,
 ) error {
 	client.abortCalls++
-	return client.delegate.AbortVNextCheckpoint(ctx, identity)
+	return client.delegate.ProducerAbortVNextCheckpoint(ctx, identity, capability)
 }
 
 type vnextProducerTestEnvironment struct {
@@ -54,6 +46,7 @@ type vnextProducerTestEnvironment struct {
 	publication  cxlcheckpoint.Publication
 	payloads     map[uint64][]byte
 	sidecars     map[uint32][]byte
+	capability   vnextProducerCapabilityProof
 }
 
 func newVNextProducerTestEnvironment(t *testing.T) *vnextProducerTestEnvironment {
@@ -309,8 +302,13 @@ func newVNextProducerTestEnvironment(t *testing.T) *vnextProducerTestEnvironment
 		binary.LittleEndian.PutUint32(data[offset+28:offset+32], checksum)
 	}
 
+	capability := issueVNextOwnerTestCapability(
+		t, service, reserved.Operation, vnextProducerCapabilityAll)
 	client := &vnextProducerCountingOwnerClient{
-		delegate: vnextOwnerServiceProducerClient{service: service},
+		delegate: vnextOwnerServiceProducerClient{
+			service: service,
+			caller:  vnextOwnerTestProducerCaller,
+		},
 	}
 	producer, err := newVNextFileBackedProducer(service.directory, client)
 	if err != nil {
@@ -325,12 +323,14 @@ func newVNextProducerTestEnvironment(t *testing.T) *vnextProducerTestEnvironment
 		publication:  publication,
 		payloads:     payloads,
 		sidecars:     sidecars,
+		capability:   capability,
 	}
 }
 
 func (environment *vnextProducerTestEnvironment) request() vnextProducerSealRequest {
 	return vnextProducerSealRequest{
 		Reserve:            cloneVNextProducerReserve(environment.reserve),
+		Capability:         environment.capability,
 		Publication:        environment.publication,
 		CRCPageSidecars:    cloneVNextProducerSidecars(environment.sidecars),
 		ExternalCopyEngine: vnextCRCCopyEngineCPU,
@@ -349,7 +349,7 @@ func TestVNextFileBackedProducerTwoDAXSealThenSeparateCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seal two-DAX producer checkpoint: %v", err)
 	}
-	if environment.client.sealCalls != 1 || environment.client.commitCalls != 0 ||
+	if environment.client.sealCalls != 1 ||
 		environment.client.abortCalls != 0 {
 		t.Fatalf("unexpected lifecycle calls after seal: %#v", environment.client)
 	}
@@ -381,11 +381,8 @@ func TestVNextFileBackedProducerTwoDAXSealThenSeparateCommit(t *testing.T) {
 		t.Fatal("artifact final page was not written with exact zero padding")
 	}
 
-	if err := environment.producer.Commit(context.Background(), sealed); err != nil {
-		t.Fatalf("commit separately sealed producer checkpoint: %v", err)
-	}
-	if environment.client.commitCalls != 1 {
-		t.Fatalf("commit call count is %d, want 1", environment.client.commitCalls)
+	if err := environment.service.commit(sealed.Operation); err != nil {
+		t.Fatalf("Scheduler commit of separately sealed checkpoint: %v", err)
 	}
 	transaction = environment.ownerFixture.group.journal.Transactions[environment.reserve.Operation.AllocationRecordID]
 	if transaction == nil || transaction.State != vnextOwnerCommitted {
@@ -451,17 +448,18 @@ func TestVNextFileBackedProducerSourceFailuresNeverCommitAndRemainAbortable(t *t
 				!strings.Contains(err.Error(), test.want) {
 				t.Fatalf("seal error is %v, want text %q", err, test.want)
 			}
-			if environment.client.commitCalls != 0 || environment.client.sealCalls != 0 {
-				t.Fatalf("failed producer called seal/commit: seal=%d commit=%d",
-					environment.client.sealCalls, environment.client.commitCalls)
+			if environment.client.sealCalls != 0 {
+				t.Fatalf("failed producer called Owner seal: %d",
+					environment.client.sealCalls)
 			}
 			if err := environment.producer.Abort(
-				context.Background(), environment.reserve.Operation); err != nil {
+				context.Background(), environment.reserve.Operation,
+				environment.capability); err != nil {
 				t.Fatalf("abort failed producer reserve: %v", err)
 			}
-			if environment.client.abortCalls != 1 || environment.client.commitCalls != 0 {
-				t.Fatalf("abort/commit calls are %d/%d, want 1/0",
-					environment.client.abortCalls, environment.client.commitCalls)
+			if environment.client.abortCalls != 1 {
+				t.Fatalf("Producer abort calls are %d, want 1",
+					environment.client.abortCalls)
 			}
 			transaction := environment.ownerFixture.group.journal.Transactions[environment.reserve.Operation.AllocationRecordID]
 			if transaction == nil || transaction.State != vnextOwnerAborted {
@@ -509,12 +507,13 @@ func TestVNextFileBackedProducerRejectsUntrustedPlacementBeforeOwnerSeal(t *test
 			if _, err := environment.producer.Seal(context.Background(), request); err == nil {
 				t.Fatal("untrusted producer placement was accepted")
 			}
-			if environment.client.sealCalls != 0 || environment.client.commitCalls != 0 {
-				t.Fatalf("untrusted placement reached Owner: seal=%d commit=%d",
-					environment.client.sealCalls, environment.client.commitCalls)
+			if environment.client.sealCalls != 0 {
+				t.Fatalf("untrusted placement reached Owner seal: %d",
+					environment.client.sealCalls)
 			}
 			if err := environment.producer.Abort(
-				context.Background(), environment.reserve.Operation); err != nil {
+				context.Background(), environment.reserve.Operation,
+				environment.capability); err != nil {
 				t.Fatalf("abort original reserve identity: %v", err)
 			}
 		})
@@ -542,11 +541,12 @@ func TestVNextFileBackedProducerRejectsUntrustedPlacementBeforeOwnerSeal(t *test
 			!strings.Contains(err.Error(), "inspect VNext producer") {
 			t.Fatalf("missing local path returned %v", err)
 		}
-		if environment.client.sealCalls != 0 || environment.client.commitCalls != 0 {
+		if environment.client.sealCalls != 0 {
 			t.Fatal("missing local path reached Owner lifecycle")
 		}
 		if err := environment.producer.Abort(
-			context.Background(), environment.reserve.Operation); err != nil {
+			context.Background(), environment.reserve.Operation,
+			environment.capability); err != nil {
 			t.Fatalf("abort missing-path producer reserve: %v", err)
 		}
 	})
@@ -660,6 +660,5 @@ func vnextProducerReadLogicalPage(
 }
 
 func (client *vnextProducerCountingOwnerClient) String() string {
-	return fmt.Sprintf("seal=%d commit=%d abort=%d",
-		client.sealCalls, client.commitCalls, client.abortCalls)
+	return fmt.Sprintf("seal=%d abort=%d", client.sealCalls, client.abortCalls)
 }

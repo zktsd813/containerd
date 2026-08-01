@@ -207,6 +207,8 @@ func TestVNextOwnerServiceFencedRejectsCommitAndAbortButKeepsStatusReadable(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
+	capability := issueVNextOwnerTestCapability(
+		t, service, reserved.Operation, vnextProducerCapabilityAll)
 	if _, err := service.setAdmission(vnextOwnerSetAdmissionRequest{
 		RequestID:        "service-fence",
 		OwnerID:          "owner-0",
@@ -220,8 +222,9 @@ func TestVNextOwnerServiceFencedRejectsCommitAndAbortButKeepsStatusReadable(t *t
 	beforeFree := fixture.devices[0].allocator.freePages()
 	for name, operation := range map[string]func() error{
 		"seal": func() error {
-			_, err := service.sealExternal(vnextOwnerExternalSealRequest{
-				Operation: reserved.Operation,
+			_, err := sealVNextOwnerServiceForTest(t, service, vnextOwnerExternalSealRequest{
+				Operation:  reserved.Operation,
+				Capability: capability,
 			})
 			return err
 		},
@@ -1328,7 +1331,7 @@ func TestVNextOwnerServiceMultiPagePublicationCrossesDevicesAndRetriesAfterResta
 		},
 	}
 
-	sealed, err := service.sealExternal(vnextOwnerExternalSealRequest{
+	sealed, err := sealVNextOwnerServiceForTest(t, service, vnextOwnerExternalSealRequest{
 		Operation:               reserved.Operation,
 		PublicationEnvelope:     storage.ExactBytes,
 		CRCPageSidecars:         sidecars,
@@ -1363,7 +1366,7 @@ func TestVNextOwnerServiceMultiPagePublicationCrossesDevicesAndRetriesAfterResta
 
 	fixture.reopen(t)
 	restarted := newVNextOwnerServiceForFixture(t, fixture)
-	retried, err := restarted.sealExternal(vnextOwnerExternalSealRequest{
+	retried, err := sealVNextOwnerServiceForTest(t, restarted, vnextOwnerExternalSealRequest{
 		Operation:               reserved.Operation,
 		PublicationEnvelope:     storage.ExactBytes,
 		CRCPageSidecars:         sidecars,
@@ -1390,7 +1393,7 @@ func TestVNextOwnerServiceRestartResolvesSameIdentityForCommit(t *testing.T) {
 		t.Fatalf("encode strict external publication: %v", err)
 	}
 	identity := vnextOwnerServiceIdentity(fixture.grant)
-	sealed, err := service.sealExternal(vnextOwnerExternalSealRequest{
+	sealed, err := sealVNextOwnerServiceForTest(t, service, vnextOwnerExternalSealRequest{
 		Operation:               identity,
 		PublicationEnvelope:     envelope,
 		CRCPageSidecars:         fixture.cloneSidecars(),
@@ -1449,7 +1452,7 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("build Owner service: %v", err)
 		}
-		_, err = service.sealExternal(vnextOwnerExternalSealRequest{
+		_, err = sealVNextOwnerServiceForTest(t, service, vnextOwnerExternalSealRequest{
 			Operation:           vnextOwnerServiceIdentity(fixture.grant),
 			PublicationEnvelope: []byte("TRPUB005"),
 			CRCPageSidecars:     fixture.cloneSidecars(),
@@ -1470,7 +1473,7 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 		}
 		sidecars := fixture.cloneSidecars()
 		delete(sidecars, 8)
-		_, err = service.sealExternal(vnextOwnerExternalSealRequest{
+		_, err = sealVNextOwnerServiceForTest(t, service, vnextOwnerExternalSealRequest{
 			Operation:           vnextOwnerServiceIdentity(fixture.grant),
 			PublicationEnvelope: envelope,
 			CRCPageSidecars:     sidecars,
@@ -1494,7 +1497,7 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 		offset := vnextCRCPageSidecarHeaderSize + vnextCRCPageSidecarRecordSize
 		crc := binary.LittleEndian.Uint32(sidecars[8][offset+28 : offset+32])
 		binary.LittleEndian.PutUint32(sidecars[8][offset+28:offset+32], crc^1)
-		_, err = service.sealExternal(vnextOwnerExternalSealRequest{
+		_, err = sealVNextOwnerServiceForTest(t, service, vnextOwnerExternalSealRequest{
 			Operation:               vnextOwnerServiceIdentity(fixture.grant),
 			PublicationEnvelope:     envelope,
 			CRCPageSidecars:         sidecars,
@@ -1504,16 +1507,21 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 		fixture.assertAllocationDescriptorState(t, vnextDescriptorReserved)
 	})
 
-	t.Run("identity-mismatch", func(t *testing.T) {
+	t.Run("capability-scope-mismatch", func(t *testing.T) {
 		fixture := newVNextExternalSealTestFixture(t, vnextCRCCopyEngineCPU)
 		service, err := newVNextOwnerService(fixture.owner.group, fixture.directory)
 		if err != nil {
 			t.Fatalf("build Owner service: %v", err)
 		}
 		identity := vnextOwnerServiceIdentity(fixture.grant)
+		capability := issueVNextOwnerTestCapability(
+			t, service, identity, vnextProducerCapabilityAll)
 		identity.ProducerID = "different-producer"
-		_, err = service.sealExternal(vnextOwnerExternalSealRequest{Operation: identity})
-		requireVNextOwnerServiceCode(t, err, vnextOwnerServiceIdentityMismatch)
+		_, err = service.sealExternal(vnextOwnerExternalSealRequest{
+			Operation:  identity,
+			Capability: capability,
+		}, vnextOwnerTestProducerCaller)
+		requireVNextOwnerServiceCode(t, err, vnextOwnerServiceCapabilityDenied)
 		fixture.assertAllocationDescriptorState(t, vnextDescriptorReserved)
 	})
 
@@ -1529,7 +1537,7 @@ func TestVNextOwnerServiceSealAndCommitFailClosedCodes(t *testing.T) {
 		}
 		identity := vnextOwnerServiceIdentity(fixture.grant)
 		externalRecords := vnextPrepareCompleteExternalContent(t, fixture)
-		if _, err := service.sealExternal(vnextOwnerExternalSealRequest{
+		if _, err := sealVNextOwnerServiceForTest(t, service, vnextOwnerExternalSealRequest{
 			Operation:               identity,
 			PublicationEnvelope:     envelope,
 			CRCPageSidecars:         fixture.cloneSidecars(),
@@ -1558,7 +1566,7 @@ func TestVNextOwnerServiceUsesExactTRCRC006Bytes(t *testing.T) {
 	// Append one byte. The sidecar parser must reject it instead of accepting
 	// a prefix or silently choosing an older contiguous format.
 	sidecars[7] = append(sidecars[7], 0)
-	_, err = service.sealExternal(vnextOwnerExternalSealRequest{
+	_, err = sealVNextOwnerServiceForTest(t, service, vnextOwnerExternalSealRequest{
 		Operation:           vnextOwnerServiceIdentity(fixture.grant),
 		PublicationEnvelope: envelope,
 		CRCPageSidecars:     sidecars,
@@ -1706,7 +1714,7 @@ func TestVNextOwnerServiceCompleteExternalSealAndCommit(t *testing.T) {
 		t.Fatalf("encode complete external publication: %v", err)
 	}
 	identity := vnextOwnerServiceIdentity(fixture.grant)
-	sealed, err := service.sealExternal(vnextOwnerExternalSealRequest{
+	sealed, err := sealVNextOwnerServiceForTest(t, service, vnextOwnerExternalSealRequest{
 		Operation:               identity,
 		PublicationEnvelope:     envelope,
 		CRCPageSidecars:         fixture.cloneSidecars(),
@@ -1859,7 +1867,7 @@ func TestVNextOwnerServiceCompleteExternalSealFailsBeforeAnyDescriptorWrite(t *t
 			if err != nil {
 				t.Fatalf("encode complete external publication: %v", err)
 			}
-			_, err = service.sealExternal(vnextOwnerExternalSealRequest{
+			_, err = sealVNextOwnerServiceForTest(t, service, vnextOwnerExternalSealRequest{
 				Operation:               vnextOwnerServiceIdentity(fixture.grant),
 				PublicationEnvelope:     envelope,
 				CRCPageSidecars:         fixture.cloneSidecars(),

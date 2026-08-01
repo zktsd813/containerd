@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/cxlcheckpoint"
 )
@@ -51,7 +52,8 @@ func TestVNextOwnerClientReserveSealCommitThroughDaemonRoundTrip(t *testing.T) {
 	// publication. Abort it, then prove that this client's reserve is the
 	// operation that creates the allocation used below.
 	if err := environment.producer.Abort(
-		context.Background(), environment.reserve.Operation); err != nil {
+		context.Background(), environment.reserve.Operation,
+		environment.capability); err != nil {
 		t.Fatalf("abort seed producer allocation: %v", err)
 	}
 
@@ -88,6 +90,13 @@ func TestVNextOwnerClientReserveSealCommitThroughDaemonRoundTrip(t *testing.T) {
 		len(reserved.Extents) != 2 {
 		t.Fatalf("unexpected client reserve response: %#v", reserved)
 	}
+	capabilityRequest := vnextOwnerTestCapabilityIssueRequest(
+		reserved.Operation, vnextProducerCapabilityAll)
+	issued, err := client.IssueProducerCapability(
+		context.Background(), capabilityRequest)
+	if err != nil {
+		t.Fatalf("issue Producer capability through strict Owner client: %v", err)
+	}
 	// Close admission after GRANTED is durable. The already-started producer
 	// must still be able to finish its external seal and commit under READ_ONLY.
 	if _, err := environment.ownerFixture.group.setAdmission(
@@ -110,6 +119,7 @@ func TestVNextOwnerClientReserveSealCommitThroughDaemonRoundTrip(t *testing.T) {
 	}
 	sealed, err := producer.Seal(context.Background(), vnextProducerSealRequest{
 		Reserve:            reserved,
+		Capability:         issued.Capability,
 		Publication:        publication,
 		CRCPageSidecars:    sidecars,
 		ExternalCopyEngine: vnextCRCCopyEngineCPU,
@@ -131,8 +141,8 @@ func TestVNextOwnerClientReserveSealCommitThroughDaemonRoundTrip(t *testing.T) {
 		sealed.Root.ContractID != cxlcheckpoint.V6CompatibilityID {
 		t.Fatalf("client returned wrong candidate root: %#v", sealed.Root)
 	}
-	if err := producer.Commit(context.Background(), sealed); err != nil {
-		t.Fatalf("commit through strict Owner client: %v", err)
+	if err := client.CommitVNextCheckpoint(context.Background(), sealed.Operation); err != nil {
+		t.Fatalf("Scheduler commit through strict Owner client: %v", err)
 	}
 	transaction = environment.ownerFixture.group.journal.Transactions[reserved.Operation.AllocationRecordID]
 	if transaction == nil || transaction.State != vnextOwnerCommitted {
@@ -141,6 +151,7 @@ func TestVNextOwnerClientReserveSealCommitThroughDaemonRoundTrip(t *testing.T) {
 
 	wantOperations := []string{
 		vnextOwnerRPCOperationReserve,
+		vnextOwnerRPCOperationIssueProducerCapability,
 		vnextOwnerRPCOperationSeal,
 		vnextOwnerRPCOperationCommit,
 	}
@@ -152,6 +163,182 @@ func TestVNextOwnerClientReserveSealCommitThroughDaemonRoundTrip(t *testing.T) {
 			request.CommandLabel != "vnext-owner-client" || request.TimeoutMillis != 0 {
 			t.Fatalf("round trip %d has unexpected envelope: %#v", index, request)
 		}
+	}
+}
+
+func TestVNextOwnerClientRevokeAndProducerAbortUseDistinctWireOperations(t *testing.T) {
+	t.Run("Producer Abort", func(t *testing.T) {
+		environment := newVNextProducerTestEnvironment(t)
+		transport := &vnextOwnerClientRecordingTransport{
+			rpc: newVNextOwnerRPC(environment.service),
+		}
+		client, err := newVNextOwnerClient(transport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.ProducerAbortVNextCheckpoint(
+			context.Background(), environment.reserve.Operation,
+			environment.capability); err != nil {
+			t.Fatalf("Producer Abort through strict Owner client: %v", err)
+		}
+		if len(transport.requests) != 1 ||
+			transport.requests[0].Operation != vnextOwnerRPCOperationProducerAbort ||
+			len(transport.requests[0].VNextOwnerProducerAbort) == 0 ||
+			len(transport.requests[0].VNextOwnerAbort) != 0 {
+			t.Fatalf("Producer Abort used the wrong wire operation: %#v", transport.requests)
+		}
+		var wire vnextOwnerRPCProducerAbortRequest
+		if err := decodeStrictVNextOwnerRPC(
+			transport.requests[0].VNextOwnerProducerAbort, &wire); err != nil {
+			t.Fatal(err)
+		}
+		proof, err := wire.Capability.internal()
+		if err != nil || wire.Identity.internal() != environment.reserve.Operation ||
+			proof != environment.capability {
+			t.Fatalf("Producer Abort lost exact identity/capability: %#v / %v", wire, err)
+		}
+	})
+
+	t.Run("Scheduler Revoke", func(t *testing.T) {
+		environment := newVNextProducerTestEnvironment(t)
+		transport := &vnextOwnerClientRecordingTransport{
+			rpc: newVNextOwnerRPC(environment.service),
+		}
+		client, err := newVNextOwnerClient(transport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := vnextOwnerRevokeProducerCapabilityRequest{
+			RequestID:     "client-revoke-capability",
+			Operation:     environment.reserve.Operation,
+			CapabilityID:  environment.capability.CapabilityID,
+			SchedulerTerm: "client-scheduler/session-1/term-2",
+		}
+		response, err := client.RevokeProducerCapability(context.Background(), request)
+		if err != nil {
+			t.Fatalf("Scheduler Revoke through strict Owner client: %v", err)
+		}
+		if response.RequestID != request.RequestID ||
+			response.Operation != request.Operation ||
+			response.CapabilityID != request.CapabilityID || response.Replayed {
+			t.Fatalf("unexpected client Revoke response: %#v", response)
+		}
+		if len(transport.requests) != 1 ||
+			transport.requests[0].Operation != vnextOwnerRPCOperationRevokeProducerCapability ||
+			len(transport.requests[0].VNextOwnerRevokeProducerCapability) == 0 {
+			t.Fatalf("Scheduler Revoke used the wrong wire operation: %#v", transport.requests)
+		}
+	})
+}
+
+func TestVNextOwnerClientRejectsCapabilityTimesOutsideSignedABI(t *testing.T) {
+	identity := vnextOwnerOperationIdentity{
+		RequestID:          "client-capability-time-request",
+		CheckpointID:       "client-capability-time-checkpoint",
+		ProducerID:         "client-capability-time-producer",
+		OwnerID:            "owner-0",
+		OwnerEpoch:         7,
+		AllocationRecordID: 9,
+	}
+	issueRequest := vnextOwnerIssueProducerCapabilityRequest{
+		RequestID:          "client-capability-time-issue",
+		Operation:          identity,
+		ProducerPrincipal:  vnextOwnerTestProducerCaller.Principal,
+		AllowedOperations:  vnextProducerCapabilityAll,
+		SchedulerTerm:      "client-scheduler/session-1/term-1",
+		RequestedTTLMillis: 1,
+		Nonce:              [vnextProducerCapabilityTokenBytes]byte{1},
+	}
+	ttlNanos := uint64(time.Millisecond)
+	for _, test := range []struct {
+		name      string
+		issuedAt  uint64
+		expiresAt uint64
+	}{
+		{
+			name:      "issue time",
+			issuedAt:  uint64(math.MaxInt64) + 1,
+			expiresAt: uint64(math.MaxInt64) + 1 + ttlNanos,
+		},
+		{
+			name:      "expiry time",
+			issuedAt:  uint64(math.MaxInt64) - ttlNanos + 1,
+			expiresAt: uint64(math.MaxInt64) + 1,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wire := vnextOwnerRPCIssueProducerCapabilityResponse{
+				Protocol:  vnextOwnerRPCProtocol,
+				Operation: vnextOwnerRPCOperationIssueProducerCapability,
+				RequestID: issueRequest.RequestID,
+				Identity:  vnextOwnerRPCIdentityFromInternal(identity),
+				Capability: vnextOwnerRPCProducerCapabilityProof{
+					CapabilityID: "00000000000000000000000000000001",
+					Token:        append([]byte(nil), issueRequest.Nonce[:]...),
+				},
+				ProducerPrincipal: issueRequest.ProducerPrincipal,
+				AllowedOperations: uint8(issueRequest.AllowedOperations),
+				SchedulerTerm:     issueRequest.SchedulerTerm,
+				IssuedAtUnixNano:  test.issuedAt,
+				ExpiresAtUnixNano: test.expiresAt,
+				Replayed:          false,
+			}
+			raw, err := json.Marshal(wire)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+				func(context.Context, daemonRequest) (execResponse, error) {
+					return execResponse{
+						Ok:        true,
+						Operation: vnextOwnerRPCOperationIssueProducerCapability,
+						Stdout:    string(raw),
+					}, nil
+				}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.IssueProducerCapability(
+				context.Background(), issueRequest); err == nil {
+				t.Fatal("capability issue response outside signed ABI was accepted")
+			}
+		})
+	}
+
+	revokeRequest := vnextOwnerRevokeProducerCapabilityRequest{
+		RequestID:     "client-capability-time-revoke",
+		Operation:     identity,
+		CapabilityID:  "00000000000000000000000000000001",
+		SchedulerTerm: "client-scheduler/session-1/term-2",
+	}
+	revokeWire := vnextOwnerRPCRevokeProducerCapabilityResponse{
+		Protocol:          vnextOwnerRPCProtocol,
+		Operation:         vnextOwnerRPCOperationRevokeProducerCapability,
+		RequestID:         revokeRequest.RequestID,
+		Identity:          vnextOwnerRPCIdentityFromInternal(identity),
+		CapabilityID:      revokeRequest.CapabilityID,
+		SchedulerTerm:     revokeRequest.SchedulerTerm,
+		RevokedAtUnixNano: uint64(math.MaxInt64) + 1,
+		Replayed:          false,
+	}
+	raw, err := json.Marshal(revokeWire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := newVNextOwnerClient(vnextOwnerClientRoundTripFunc(
+		func(context.Context, daemonRequest) (execResponse, error) {
+			return execResponse{
+				Ok:        true,
+				Operation: vnextOwnerRPCOperationRevokeProducerCapability,
+				Stdout:    string(raw),
+			}, nil
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.RevokeProducerCapability(
+		context.Background(), revokeRequest); err == nil {
+		t.Fatal("capability revoke response outside signed ABI was accepted")
 	}
 }
 
@@ -848,7 +1035,7 @@ func TestVNextOwnerClientRejectsNonCanonicalResponses(t *testing.T) {
 		{
 			name: "duplicate-field",
 			mutate: func(raw []byte) []byte {
-				prefix := []byte(`{"protocol":"cxld.vnext-owner.v2",`)
+				prefix := []byte(`{"protocol":"cxld.vnext-owner.v3",`)
 				return append(prefix, raw[1:]...)
 			},
 		},

@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/cxlcheckpoint"
 )
@@ -23,6 +24,7 @@ type vnextOwnerService struct {
 
 	group     *vnextOwnerGroup
 	directory *vnextLocalDAXDirectory
+	now       func() time.Time
 }
 
 type vnextOwnerServiceErrorCode string
@@ -43,6 +45,10 @@ const (
 	vnextOwnerServiceSidecarInvalid            vnextOwnerServiceErrorCode = "crc_sidecar_invalid"
 	vnextOwnerServicePayloadMismatch           vnextOwnerServiceErrorCode = "payload_crc_mismatch"
 	vnextOwnerServicePermissionDenied          vnextOwnerServiceErrorCode = "permission_denied"
+	vnextOwnerServiceCapabilityConflict        vnextOwnerServiceErrorCode = "producer_capability_conflict"
+	vnextOwnerServiceCapabilityDenied          vnextOwnerServiceErrorCode = "producer_capability_denied"
+	vnextOwnerServiceCapabilityExpired         vnextOwnerServiceErrorCode = "producer_capability_expired"
+	vnextOwnerServiceCapabilityRevoked         vnextOwnerServiceErrorCode = "producer_capability_revoked"
 	vnextOwnerServiceUnavailable               vnextOwnerServiceErrorCode = "owner_unavailable"
 )
 
@@ -307,6 +313,7 @@ type vnextOwnerReservationStatusResponse struct {
 // it cannot name the Owner-written publication slot.
 type vnextOwnerExternalSealRequest struct {
 	Operation               vnextOwnerOperationIdentity
+	Capability              vnextProducerCapabilityProof
 	PublicationEnvelope     []byte
 	CRCPageSidecars         map[uint32][]byte
 	ExternalContentPageCRCs []vnextExternalContentPageCRC
@@ -383,7 +390,87 @@ func newVNextOwnerService(
 				errVNextAuthority)
 		}
 	}
-	return &vnextOwnerService{group: group, directory: directory}, nil
+	return &vnextOwnerService{group: group, directory: directory, now: time.Now}, nil
+}
+
+func (service *vnextOwnerService) capabilityNowUnixNano(
+	operation string,
+) (uint64, error) {
+	if service == nil || service.now == nil {
+		return 0, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable, "Owner capability clock is unavailable", nil)
+	}
+	now, err := unixNanoForVNextProducerCapability(service.now())
+	if err != nil {
+		return 0, vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable, "Owner capability clock is invalid", err)
+	}
+	return now, nil
+}
+
+func (service *vnextOwnerService) issueProducerCapability(
+	request vnextOwnerIssueProducerCapabilityRequest,
+	caller vnextOwnerCallerContext,
+) (vnextOwnerIssueProducerCapabilityResponse, error) {
+	const operation = "issue-producer-capability"
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if err := caller.validate(); err != nil || caller.Role != vnextOwnerCallerScheduler {
+		return vnextOwnerIssueProducerCapabilityResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServicePermissionDenied,
+			"only an authenticated Scheduler may issue Producer capabilities", err)
+	}
+	now, err := service.capabilityNowUnixNano(operation)
+	if err != nil {
+		return vnextOwnerIssueProducerCapabilityResponse{}, err
+	}
+	record, replayed, err := service.group.issueProducerCapability(
+		request, caller.Principal, now)
+	if err != nil {
+		return vnextOwnerIssueProducerCapabilityResponse{}, vnextOwnerServiceWrap(operation, err)
+	}
+	return vnextOwnerIssueProducerCapabilityResponse{
+		RequestID:         request.RequestID,
+		Capability:        vnextProducerCapabilityProof{CapabilityID: record.CapabilityID, Token: request.Nonce},
+		Operation:         request.Operation,
+		ProducerPrincipal: record.ProducerPrincipal,
+		AllowedOperations: record.AllowedOperations,
+		SchedulerTerm:     record.SchedulerTerm,
+		IssuedAtUnixNano:  record.IssuedAtUnixNano,
+		ExpiresAtUnixNano: record.ExpiresAtUnixNano,
+		Replayed:          replayed,
+	}, nil
+}
+
+func (service *vnextOwnerService) revokeProducerCapability(
+	request vnextOwnerRevokeProducerCapabilityRequest,
+	caller vnextOwnerCallerContext,
+) (vnextOwnerRevokeProducerCapabilityResponse, error) {
+	const operation = "revoke-producer-capability"
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if err := caller.validate(); err != nil || caller.Role != vnextOwnerCallerScheduler {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServicePermissionDenied,
+			"only an authenticated Scheduler may revoke Producer capabilities", err)
+	}
+	now, err := service.capabilityNowUnixNano(operation)
+	if err != nil {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, err
+	}
+	record, replayed, err := service.group.revokeProducerCapability(
+		request, caller.Principal, now)
+	if err != nil {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, vnextOwnerServiceWrap(operation, err)
+	}
+	return vnextOwnerRevokeProducerCapabilityResponse{
+		RequestID:         request.RequestID,
+		CapabilityID:      record.CapabilityID,
+		Operation:         request.Operation,
+		SchedulerTerm:     record.RevokeSchedulerTerm,
+		RevokedAtUnixNano: record.RevokedAtUnixNano,
+		Replayed:          replayed,
+	}, nil
 }
 
 // inventory is read-only. It intentionally does not take service.mu: the
@@ -849,10 +936,28 @@ func (service *vnextOwnerService) reserveResponse(
 // record slice is empty; there is no service-level memory-only fallback.
 func (service *vnextOwnerService) sealExternal(
 	request vnextOwnerExternalSealRequest,
+	caller vnextOwnerCallerContext,
 ) (vnextOwnerSealResponse, error) {
 	const operation = "seal"
 	service.mu.Lock()
 	defer service.mu.Unlock()
+	if err := caller.validate(); err != nil || caller.Role != vnextOwnerCallerProducer {
+		return vnextOwnerSealResponse{}, vnextOwnerServiceFailure(
+			operation, vnextOwnerServicePermissionDenied,
+			"only the authenticated Producer may seal a checkpoint", err)
+	}
+	now, err := service.capabilityNowUnixNano(operation)
+	if err != nil {
+		return vnextOwnerSealResponse{}, err
+	}
+	if err := service.group.validateProducerCapability(
+		request.Operation,
+		request.Capability,
+		caller.Principal,
+		vnextProducerCapabilitySeal,
+		now); err != nil {
+		return vnextOwnerSealResponse{}, vnextOwnerServiceWrap(operation, err)
+	}
 
 	grant, _, err := service.resolveOperation(
 		operation, request.Operation, vnextOwnerGranted, true)
@@ -1011,6 +1116,64 @@ func (service *vnextOwnerService) abort(identity vnextOwnerOperationIdentity) er
 	return nil
 }
 
+func (service *vnextOwnerService) producerAbort(
+	identity vnextOwnerOperationIdentity,
+	capability vnextProducerCapabilityProof,
+	caller vnextOwnerCallerContext,
+) error {
+	const operation = "producer-abort"
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if err := caller.validate(); err != nil || caller.Role != vnextOwnerCallerProducer {
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServicePermissionDenied,
+			"only the authenticated Producer may use Producer abort", err)
+	}
+
+	group := service.group
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	if err := group.checkUsableLocked(); err != nil {
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceUnavailable, "Owner group is not usable", err)
+	}
+	transaction, record, err := group.validateProducerCapabilityProofLocked(
+		identity, capability, caller.Principal, vnextProducerCapabilityAbort)
+	if err != nil {
+		return vnextOwnerServiceWrap(operation, err)
+	}
+
+	// Proof validation above is intentionally state-independent. Only an exact
+	// bearer may observe this terminal replay. ABORTED means every fragment was
+	// already cleared and freed durably, so replay is a read-only success even
+	// if the capability subsequently expired or was revoked.
+	if transaction.State == vnextOwnerAborted {
+		return nil
+	}
+	if transaction.State != vnextOwnerGranted {
+		return vnextOwnerServiceFailure(
+			operation,
+			vnextOwnerServiceTransactionState,
+			fmt.Sprintf("durable transaction is in state %d", transaction.State),
+			errVNextInvalidState)
+	}
+
+	now, err := service.capabilityNowUnixNano(operation)
+	if err != nil {
+		return err
+	}
+	if err := validateVNextProducerCapabilityLiveAuthority(record, now); err != nil {
+		return vnextOwnerServiceWrap(operation, err)
+	}
+	if err := group.requireReclaimSafetyLocked(operation); err != nil {
+		return vnextOwnerServiceWrap(operation, err)
+	}
+	if err := group.abortTransactionLocked(transaction); err != nil {
+		return vnextOwnerServiceWrap(operation, group.poisonLocked(err))
+	}
+	return nil
+}
+
 func (service *vnextOwnerService) resolveOperation(
 	operation string,
 	identity vnextOwnerOperationIdentity,
@@ -1145,6 +1308,22 @@ func vnextOwnerServiceWrap(operation string, err error) error {
 			err)
 	}
 	switch {
+	case errors.Is(err, errVNextProducerCapabilityConflict):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceCapabilityConflict,
+			"Producer capability request conflicts with durable state", err)
+	case errors.Is(err, errVNextProducerCapabilityRevoked):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceCapabilityRevoked,
+			"Producer capability is revoked", err)
+	case errors.Is(err, errVNextProducerCapabilityExpired):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceCapabilityExpired,
+			"Producer capability is expired", err)
+	case errors.Is(err, errVNextProducerCapabilityDenied):
+		return vnextOwnerServiceFailure(
+			operation, vnextOwnerServiceCapabilityDenied,
+			"Producer capability does not authorize this request", err)
 	case errors.Is(err, errVNextAuthority):
 		return vnextOwnerServiceFailure(
 			operation, vnextOwnerServiceIdentityMismatch, "Owner authority does not match", err)

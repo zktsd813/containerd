@@ -17,8 +17,9 @@ import (
 
 // vnextProducerOwnerClient is the narrow Owner lifecycle contract needed by
 // a checkpoint producer. Seal returns a candidate root but deliberately does
-// not commit the allocation. Commit remains a separate Scheduler-controlled
-// transition, and Abort remains available after any producer-side failure.
+// not commit the allocation. Commit remains outside this Producer interface
+// and is a separate Scheduler-only transition. Producer Abort is capability
+// gated and remains available after producer-side failure.
 //
 // A network adapter can implement this interface with the strict VNext Owner
 // RPC. The in-process adapter below is used by the file-backed integration
@@ -28,12 +29,16 @@ type vnextProducerOwnerClient interface {
 		context.Context,
 		vnextOwnerExternalSealRequest,
 	) (vnextOwnerSealResponse, error)
-	CommitVNextCheckpoint(context.Context, vnextOwnerOperationIdentity) error
-	AbortVNextCheckpoint(context.Context, vnextOwnerOperationIdentity) error
+	ProducerAbortVNextCheckpoint(
+		context.Context,
+		vnextOwnerOperationIdentity,
+		vnextProducerCapabilityProof,
+	) error
 }
 
 type vnextOwnerServiceProducerClient struct {
 	service *vnextOwnerService
+	caller  vnextOwnerCallerContext
 }
 
 func (client vnextOwnerServiceProducerClient) SealVNextCheckpoint(
@@ -46,12 +51,13 @@ func (client vnextOwnerServiceProducerClient) SealVNextCheckpoint(
 	if client.service == nil {
 		return vnextOwnerSealResponse{}, errors.New("VNext producer Owner service is unavailable")
 	}
-	return client.service.sealExternal(request)
+	return client.service.sealExternal(request, client.caller)
 }
 
-func (client vnextOwnerServiceProducerClient) CommitVNextCheckpoint(
+func (client vnextOwnerServiceProducerClient) ProducerAbortVNextCheckpoint(
 	ctx context.Context,
 	identity vnextOwnerOperationIdentity,
+	capability vnextProducerCapabilityProof,
 ) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -59,20 +65,7 @@ func (client vnextOwnerServiceProducerClient) CommitVNextCheckpoint(
 	if client.service == nil {
 		return errors.New("VNext producer Owner service is unavailable")
 	}
-	return client.service.commit(identity)
-}
-
-func (client vnextOwnerServiceProducerClient) AbortVNextCheckpoint(
-	ctx context.Context,
-	identity vnextOwnerOperationIdentity,
-) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if client.service == nil {
-		return errors.New("VNext producer Owner service is unavailable")
-	}
-	return client.service.abort(identity)
+	return client.service.producerAbort(identity, capability, client.caller)
 }
 
 // vnextProducerContentSource supplies the exact meaningful bytes for one
@@ -89,6 +82,9 @@ type vnextProducerContentSource struct {
 
 type vnextProducerSealRequest struct {
 	Reserve vnextOwnerReserveResponse
+	// Capability is issued by the exact Owner for this immutable Reserve scope
+	// and must authorize Seal for the authenticated Producer principal.
+	Capability vnextProducerCapabilityProof
 
 	// Publication must already contain the exact portable allocation returned
 	// by Reserve. Seal re-encodes it canonically; a caller cannot provide raw
@@ -114,8 +110,6 @@ type vnextProducerSealRequest struct {
 type vnextProducerSealedCheckpoint struct {
 	Operation vnextOwnerOperationIdentity
 	Root      vnextOwnerCheckpointRoot
-
-	sealComplete bool
 }
 
 // vnextFileBackedProducer is the regular-file/QEMU implementation of the
@@ -207,6 +201,7 @@ func (producer *vnextFileBackedProducer) Seal(
 		ctx,
 		vnextOwnerExternalSealRequest{
 			Operation:               prepared.reserve.Operation,
+			Capability:              request.Capability,
 			PublicationEnvelope:     append([]byte(nil), prepared.storage.ExactBytes...),
 			CRCPageSidecars:         cloneVNextProducerSidecars(prepared.sidecars),
 			ExternalContentPageCRCs: externalCRCs,
@@ -224,35 +219,9 @@ func (producer *vnextFileBackedProducer) Seal(
 			"Owner returned an invalid VNext candidate root: %w", err)
 	}
 	return vnextProducerSealedCheckpoint{
-		Operation:    prepared.reserve.Operation,
-		Root:         cloneVNextProducerRoot(response.Root),
-		sealComplete: true,
+		Operation: prepared.reserve.Operation,
+		Root:      cloneVNextProducerRoot(response.Root),
 	}, nil
-}
-
-// Commit is deliberately separate from Seal. The caller should persist the
-// candidate root in Scheduler COMMITTING state before invoking this method,
-// and may publish AVAILABLE only after this method returns nil.
-func (producer *vnextFileBackedProducer) Commit(
-	ctx context.Context,
-	sealed vnextProducerSealedCheckpoint,
-) error {
-	if producer == nil || producer.owner == nil {
-		return errors.New("VNext producer is unavailable")
-	}
-	if !sealed.sealComplete {
-		return errors.New("VNext checkpoint has not completed Owner seal")
-	}
-	if err := validateVNextProducerOperationIdentity(sealed.Operation); err != nil {
-		return err
-	}
-	if sealed.Root.ContractID != cxlcheckpoint.V6CompatibilityID ||
-		sealed.Root.RootID == "" || sealed.Root.RootVersion == 0 ||
-		sealed.Root.Locator.PublicationByteLength == 0 ||
-		len(sealed.Root.Locator.PageRuns) == 0 {
-		return errors.New("VNext sealed candidate root is incomplete")
-	}
-	return producer.owner.CommitVNextCheckpoint(ctx, sealed.Operation)
 }
 
 // Abort is valid for the reserve identity even when producer validation,
@@ -261,6 +230,7 @@ func (producer *vnextFileBackedProducer) Commit(
 func (producer *vnextFileBackedProducer) Abort(
 	ctx context.Context,
 	identity vnextOwnerOperationIdentity,
+	capability vnextProducerCapabilityProof,
 ) error {
 	if producer == nil || producer.owner == nil {
 		return errors.New("VNext producer is unavailable")
@@ -268,12 +238,18 @@ func (producer *vnextFileBackedProducer) Abort(
 	if err := validateVNextProducerOperationIdentity(identity); err != nil {
 		return err
 	}
-	return producer.owner.AbortVNextCheckpoint(ctx, identity)
+	if err := validateVNextProducerCapabilityProof(capability); err != nil {
+		return err
+	}
+	return producer.owner.ProducerAbortVNextCheckpoint(ctx, identity, capability)
 }
 
 func (producer *vnextFileBackedProducer) prepare(
 	request vnextProducerSealRequest,
 ) (vnextPreparedProducerSeal, error) {
+	if err := validateVNextProducerCapabilityProof(request.Capability); err != nil {
+		return vnextPreparedProducerSeal{}, err
+	}
 	if !request.ExternalCopyEngine.valid() {
 		return vnextPreparedProducerSeal{}, fmt.Errorf(
 			"VNext producer external copy engine %d is invalid", request.ExternalCopyEngine)

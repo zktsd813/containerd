@@ -6,12 +6,13 @@ import "testing"
 // tests. Production paths never derive authority from an operation string.
 func vnextOwnerAuthorizedTestRole(operation string) vnextOwnerCallerRole {
 	switch operation {
-	case vnextOwnerRPCOperationSeal:
-		return vnextOwnerCallerProducer
-	case vnextOwnerRPCOperationAbort:
+	case vnextOwnerRPCOperationSeal, vnextOwnerRPCOperationProducerAbort:
 		return vnextOwnerCallerProducer
 	case vnextOwnerRPCOperationReserve,
+		vnextOwnerRPCOperationIssueProducerCapability,
+		vnextOwnerRPCOperationRevokeProducerCapability,
 		vnextOwnerRPCOperationCommit,
+		vnextOwnerRPCOperationAbort,
 		vnextOwnerRPCOperationInventory,
 		vnextOwnerRPCOperationReservationStatus,
 		vnextOwnerRPCOperationSetAdmission,
@@ -26,8 +27,12 @@ func runCommandWithVNextOwnerRPCTestRole(
 	request daemonRequest,
 	rpc *vnextOwnerRPC,
 ) execResponse {
-	return runCommandWithVNextOwnerRPCRole(
-		request, rpc, vnextOwnerAuthorizedTestRole(request.Operation))
+	role := vnextOwnerAuthorizedTestRole(request.Operation)
+	caller := vnextOwnerTestSchedulerCaller
+	if role == vnextOwnerCallerProducer {
+		caller = vnextOwnerTestProducerCaller
+	}
+	return runCommandWithVNextOwnerRPCCaller(request, rpc, caller)
 }
 
 func TestVNextOwnerAuthorizationPolicyIsFailClosed(t *testing.T) {
@@ -43,9 +48,12 @@ func TestVNextOwnerAuthorizationPolicyIsFailClosed(t *testing.T) {
 		{vnextOwnerCallerScheduler, vnextOwnerRPCOperationSetAdmission, true},
 		{vnextOwnerCallerScheduler, vnextOwnerRPCOperationCommit, true},
 		{vnextOwnerCallerScheduler, vnextOwnerRPCOperationAbort, true},
+		{vnextOwnerCallerScheduler, vnextOwnerRPCOperationIssueProducerCapability, true},
+		{vnextOwnerCallerScheduler, vnextOwnerRPCOperationRevokeProducerCapability, true},
 		{vnextOwnerCallerScheduler, vnextOwnerRPCOperationSeal, false},
 		{vnextOwnerCallerProducer, vnextOwnerRPCOperationSeal, true},
-		{vnextOwnerCallerProducer, vnextOwnerRPCOperationAbort, true},
+		{vnextOwnerCallerProducer, vnextOwnerRPCOperationProducerAbort, true},
+		{vnextOwnerCallerProducer, vnextOwnerRPCOperationAbort, false},
 		{vnextOwnerCallerProducer, vnextOwnerRPCOperationCommit, false},
 		{vnextOwnerCallerProducer, vnextOwnerRPCOperationReserve, false},
 		{vnextOwnerCallerReader, vnextOwnerRPCOperationSeal, false},

@@ -13,7 +13,7 @@ const (
 	vnextMaxOwnerTransactions                = 1 << 20
 )
 
-var vnextOwnerJournalMagic = [8]byte{'T', 'R', 'O', 'W', 'N', '0', '0', '7'}
+var vnextOwnerJournalMagic = [8]byte{'T', 'R', 'O', 'W', 'N', '0', '0', '8'}
 
 type vnextOwnerTransactionState uint8
 
@@ -58,6 +58,7 @@ type vnextOwnerTransaction struct {
 	MaxExtents         uint32
 	Contents           []vnextContentSegment
 	Fragments          []vnextOwnerDeviceFragment
+	ProducerCapability *vnextProducerCapabilityRecord
 }
 
 // vnextOwnerJournal is a bounded full-snapshot redo/control record. Its file
@@ -114,6 +115,10 @@ func (journal *vnextOwnerJournal) clone() *vnextOwnerJournal {
 		for index, fragment := range transaction.Fragments {
 			copyTransaction.Fragments[index] = fragment
 			copyTransaction.Fragments[index].Extents = append([]vnextOwnerExtent(nil), fragment.Extents...)
+		}
+		if transaction.ProducerCapability != nil {
+			capability := *transaction.ProducerCapability
+			copyTransaction.ProducerCapability = &capability
 		}
 		cloned.Transactions[allocationID] = &copyTransaction
 	}
@@ -194,6 +199,37 @@ func (journal *vnextOwnerJournal) marshalAtSequence(
 				vnextWriteU64(&payload, extent.PageCount)
 				vnextWriteU64(&payload, extent.GlobalLogicalStart)
 			}
+		}
+		if transaction.ProducerCapability == nil {
+			payload.WriteByte(0)
+			payload.Write(make([]byte, 7))
+		} else {
+			capability := transaction.ProducerCapability
+			payload.WriteByte(1)
+			payload.Write(make([]byte, 7))
+			vnextWriteString(&payload, capability.IssueRequestID)
+			payload.Write(capability.IssueRequestDigest[:])
+			vnextWriteString(&payload, capability.CapabilityID)
+			payload.Write(capability.TokenDigest[:])
+			payload.Write(capability.ScopeDigest[:])
+			vnextWriteString(&payload, capability.ProducerPrincipal)
+			vnextWriteString(&payload, capability.IssuerPrincipal)
+			payload.WriteByte(byte(capability.AllowedOperations))
+			payload.Write(make([]byte, 7))
+			vnextWriteString(&payload, capability.SchedulerTerm)
+			vnextWriteU64(&payload, capability.IssuedAtUnixNano)
+			vnextWriteU64(&payload, capability.ExpiresAtUnixNano)
+			if capability.Revoked {
+				payload.WriteByte(1)
+			} else {
+				payload.WriteByte(0)
+			}
+			payload.Write(make([]byte, 7))
+			vnextWriteString(&payload, capability.RevokeRequestID)
+			payload.Write(capability.RevokeRequestDigest[:])
+			vnextWriteString(&payload, capability.RevokedByPrincipal)
+			vnextWriteString(&payload, capability.RevokeSchedulerTerm)
+			vnextWriteU64(&payload, capability.RevokedAtUnixNano)
 		}
 	}
 	return vnextMarshalEnvelope(vnextOwnerJournalMagic, payload.Bytes())
@@ -477,7 +513,110 @@ func vnextParseOwnerTransaction(decoder *vnextDecoder) (*vnextOwnerTransaction, 
 		}
 		transaction.Fragments = append(transaction.Fragments, fragment)
 	}
+	hasCapability, err := decoder.u8()
+	if err != nil {
+		return nil, err
+	}
+	reserved, err = decoder.bytes(7)
+	if err != nil {
+		return nil, err
+	}
+	if !vnextAllZero(reserved) || hasCapability > 1 {
+		return nil, fmt.Errorf("Owner capability presence encoding is invalid: %w", errVNextWrongFormat)
+	}
+	if hasCapability == 1 {
+		capability, err := vnextParseProducerCapabilityRecord(decoder)
+		if err != nil {
+			return nil, err
+		}
+		transaction.ProducerCapability = capability
+	}
 	return transaction, nil
+}
+
+func vnextParseProducerCapabilityRecord(
+	decoder *vnextDecoder,
+) (*vnextProducerCapabilityRecord, error) {
+	record := &vnextProducerCapabilityRecord{}
+	var err error
+	if record.IssueRequestID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return nil, err
+	}
+	digest, err := decoder.bytes(32)
+	if err != nil {
+		return nil, err
+	}
+	copy(record.IssueRequestDigest[:], digest)
+	if record.CapabilityID, err = decoder.string(2 * vnextProducerCapabilityIDBytes); err != nil {
+		return nil, err
+	}
+	digest, err = decoder.bytes(32)
+	if err != nil {
+		return nil, err
+	}
+	copy(record.TokenDigest[:], digest)
+	digest, err = decoder.bytes(32)
+	if err != nil {
+		return nil, err
+	}
+	copy(record.ScopeDigest[:], digest)
+	if record.ProducerPrincipal, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return nil, err
+	}
+	if record.IssuerPrincipal, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return nil, err
+	}
+	operations, err := decoder.u8()
+	if err != nil {
+		return nil, err
+	}
+	record.AllowedOperations = vnextProducerCapabilityOperations(operations)
+	reserved, err := decoder.bytes(7)
+	if err != nil {
+		return nil, err
+	}
+	if !vnextAllZero(reserved) {
+		return nil, fmt.Errorf("Producer capability operation reserved bytes are non-zero: %w", errVNextWrongFormat)
+	}
+	if record.SchedulerTerm, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return nil, err
+	}
+	if record.IssuedAtUnixNano, err = decoder.u64(); err != nil {
+		return nil, err
+	}
+	if record.ExpiresAtUnixNano, err = decoder.u64(); err != nil {
+		return nil, err
+	}
+	revoked, err := decoder.u8()
+	if err != nil {
+		return nil, err
+	}
+	reserved, err = decoder.bytes(7)
+	if err != nil {
+		return nil, err
+	}
+	if !vnextAllZero(reserved) || revoked > 1 {
+		return nil, fmt.Errorf("Producer capability revocation encoding is invalid: %w", errVNextWrongFormat)
+	}
+	record.Revoked = revoked == 1
+	if record.RevokeRequestID, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return nil, err
+	}
+	digest, err = decoder.bytes(32)
+	if err != nil {
+		return nil, err
+	}
+	copy(record.RevokeRequestDigest[:], digest)
+	if record.RevokedByPrincipal, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return nil, err
+	}
+	if record.RevokeSchedulerTerm, err = decoder.string(vnextMaxIdentityBytes); err != nil {
+		return nil, err
+	}
+	if record.RevokedAtUnixNano, err = decoder.u64(); err != nil {
+		return nil, err
+	}
+	return record, nil
 }
 
 func (journal *vnextOwnerJournal) validate(attachedDevices map[string]*vnextPersistentDevice) error {
@@ -675,6 +814,11 @@ func vnextValidateOwnerTransaction(
 	if transaction.RequestDigest != expectedDigest {
 		return fmt.Errorf("Owner transaction %d request digest mismatch: %w",
 			transaction.AllocationRecordID, errVNextCorrupt)
+	}
+	if err := validateVNextProducerCapabilityRecord(
+		transaction.ProducerCapability, ownerID, ownerEpoch, transaction); err != nil {
+		return fmt.Errorf("Owner transaction %d Producer capability is invalid: %w",
+			transaction.AllocationRecordID, err)
 	}
 	return nil
 }

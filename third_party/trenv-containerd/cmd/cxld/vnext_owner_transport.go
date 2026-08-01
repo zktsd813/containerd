@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	vnextOwnerTLSALPN             = "cxld-vnext-owner/3"
+	vnextOwnerTLSALPN             = "cxld-vnext-owner/4"
 	vnextOwnerTLSDialTimeout      = 10 * time.Second
 	vnextOwnerTLSHandshakeTimeout = 10 * time.Second
 	vnextOwnerTLSMaxHandshakes    = 32
@@ -58,7 +58,7 @@ type vnextOwnerTLSClientConfig struct {
 // remote transport. Every field is mandatory, including empty failure fields,
 // so the peer can reject missing, null, duplicate, unknown, and trailing JSON
 // instead of inheriting the looser legacy daemon response decoder. Per-stage
-// timing maps are intentionally not part of this bounded v2 transport.
+// timing maps are intentionally not part of this bounded v3 transport.
 type vnextOwnerTLSExecResponse struct {
 	OK             bool   `json:"ok"`
 	Stdout         string `json:"stdout"`
@@ -327,7 +327,7 @@ func newVNextOwnerTLSServerConfig(
 		if len(state.VerifiedChains) == 0 || len(state.PeerCertificates) == 0 {
 			return errors.New("VNext Owner TLS client certificate was not verified")
 		}
-		_, err := vnextOwnerTLSCallerRole(state, allowedRoles)
+		_, err := vnextOwnerTLSCaller(state, allowedRoles)
 		return err
 	}
 	return tlsConfig, nil
@@ -337,24 +337,36 @@ func vnextOwnerTLSCallerRole(
 	state tls.ConnectionState,
 	allowedRoles map[string]vnextOwnerCallerRole,
 ) (vnextOwnerCallerRole, error) {
+	caller, err := vnextOwnerTLSCaller(state, allowedRoles)
+	return caller.Role, err
+}
+
+func vnextOwnerTLSCaller(
+	state tls.ConnectionState,
+	allowedRoles map[string]vnextOwnerCallerRole,
+) (vnextOwnerCallerContext, error) {
 	if len(state.VerifiedChains) == 0 || len(state.PeerCertificates) == 0 {
-		return vnextOwnerCallerUnknown,
+		return vnextOwnerCallerContext{},
 			errors.New("VNext Owner TLS client certificate was not verified")
 	}
 	identities := state.PeerCertificates[0].URIs
 	if len(identities) != 1 {
-		return vnextOwnerCallerUnknown, fmt.Errorf(
+		return vnextOwnerCallerContext{}, fmt.Errorf(
 			"VNext Owner TLS client certificate has %d URI SANs; exactly one is required",
 			len(identities))
 	}
 	identity := identities[0].String()
 	role, permitted := allowedRoles[identity]
 	if !permitted {
-		return vnextOwnerCallerUnknown, fmt.Errorf(
+		return vnextOwnerCallerContext{}, fmt.Errorf(
 			"VNext Owner TLS client URI SAN %q is not assigned to an allowed role",
 			identity)
 	}
-	return role, nil
+	caller := vnextOwnerCallerContext{Role: role, Principal: identity}
+	if err := caller.validate(); err != nil {
+		return vnextOwnerCallerContext{}, err
+	}
+	return caller, nil
 }
 
 func loadVNextOwnerTLSCertificatePool(path string, role string) (*x509.CertPool, error) {
@@ -504,7 +516,7 @@ func (server *vnextOwnerTLSServer) serveAccepted(rawConn net.Conn) {
 	if err := tlsConn.HandshakeContext(handshakeContext); err != nil {
 		return
 	}
-	callerRole, err := vnextOwnerTLSCallerRole(
+	caller, err := vnextOwnerTLSCaller(
 		tlsConn.ConnectionState(), server.allowedClientRoles)
 	if err != nil {
 		return
@@ -519,14 +531,14 @@ func (server *vnextOwnerTLSServer) serveAccepted(rawConn net.Conn) {
 		return
 	}
 	serveAuthenticatedVNextOwnerTLSConn(
-		tlsConn, server.rpc, callerRole, server.largeAdmission,
+		tlsConn, server.rpc, caller, server.largeAdmission,
 		server.readTimeout, server.writeTimeout)
 }
 
 func serveAuthenticatedVNextOwnerTLSConn(
 	conn net.Conn,
 	rpc *vnextOwnerRPC,
-	callerRole vnextOwnerCallerRole,
+	caller vnextOwnerCallerContext,
 	largeAdmission chan struct{},
 	readTimeout time.Duration,
 	writeTimeout time.Duration,
@@ -552,7 +564,7 @@ func serveAuthenticatedVNextOwnerTLSConn(
 		return
 	}
 	writeVNextOwnerTLSResponse(
-		conn, runCommandWithVNextOwnerRPCRole(request, rpc, callerRole), writeTimeout)
+		conn, runCommandWithVNextOwnerRPCCaller(request, rpc, caller), writeTimeout)
 }
 
 func decodeVNextOwnerRemoteDaemonRequest(body []byte) (daemonRequest, error) {

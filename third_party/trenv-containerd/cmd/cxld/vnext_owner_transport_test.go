@@ -380,6 +380,87 @@ func TestVNextOwnerTLSReserveUsesRealMutualTLSFraming(t *testing.T) {
 	}
 }
 
+func TestVNextOwnerTLSCapabilityBindsExactProducerURISAN(t *testing.T) {
+	material := newVNextOwnerTLSTestMaterial(t)
+	server, fixture, _ := startVNextOwnerTLSTestServer(t, material,
+		func(config *vnextOwnerTLSServerConfig) {
+			config.AllowedProducerClientURISANs = []string{testVNextOwnerTLSProducerURI}
+		})
+	schedulerTransport, err := newVNextOwnerTLSRoundTripper(
+		vnextOwnerTLSTestClientConfig(material, server.Addr().String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduler, err := newVNextOwnerClient(schedulerTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserved, err := scheduler.Reserve(
+		context.Background(), vnextOwnerTLSTestReserveRequest("capability-uri-san"))
+	if err != nil {
+		t.Fatalf("reserve over Scheduler TLS identity: %v", err)
+	}
+	issueRequest := vnextOwnerTestCapabilityIssueRequest(
+		reserved.Operation, vnextProducerCapabilityAbort)
+	issueRequest.ProducerPrincipal = testVNextOwnerTLSProducerURI
+	issued, err := scheduler.IssueProducerCapability(context.Background(), issueRequest)
+	if err != nil {
+		t.Fatalf("issue exact TLS Producer capability: %v", err)
+	}
+	producerTransport, err := newVNextOwnerTLSRoundTripper(
+		vnextOwnerTLSProducerTestClientConfig(material, server.Addr().String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer, err := newVNextOwnerClient(producerTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := producer.ProducerAbortVNextCheckpoint(
+		context.Background(), reserved.Operation, issued.Capability); err != nil {
+		t.Fatalf("exact Producer URI SAN capability abort: %v", err)
+	}
+	fixture.group.mu.Lock()
+	transaction := fixture.group.journal.Transactions[reserved.Operation.AllocationRecordID]
+	state := vnextOwnerTransactionState(0)
+	if transaction != nil {
+		state = transaction.State
+	}
+	fixture.group.mu.Unlock()
+	if state != vnextOwnerAborted {
+		t.Fatalf("TLS Producer abort state=%d, want ABORTED", state)
+	}
+}
+
+func TestVNextOwnerTLSCallerRetainsExactVerifiedURISAN(t *testing.T) {
+	material := newVNextOwnerTLSTestMaterial(t)
+	raw, err := os.ReadFile(material.producerCertificatePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		t.Fatal("Producer test certificate PEM is empty")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caller, err := vnextOwnerTLSCaller(tls.ConnectionState{
+		PeerCertificates: []*x509.Certificate{certificate},
+		VerifiedChains:   [][]*x509.Certificate{{certificate}},
+	}, map[string]vnextOwnerCallerRole{
+		testVNextOwnerTLSProducerURI: vnextOwnerCallerProducer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if caller.Role != vnextOwnerCallerProducer ||
+		caller.Principal != testVNextOwnerTLSProducerURI {
+		t.Fatalf("TLS caller lost exact URI SAN: %#v", caller)
+	}
+}
+
 func TestVNextOwnerTLSInventoryUsesRealMutualTLSFramingWithoutMutation(t *testing.T) {
 	material := newVNextOwnerTLSTestMaterial(t)
 	server, fixture, _ := startVNextOwnerTLSTestServer(t, material, nil)

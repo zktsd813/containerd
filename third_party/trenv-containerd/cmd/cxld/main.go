@@ -48,24 +48,27 @@ var (
 )
 
 type daemonRequest struct {
-	CommandLabel                string                    `json:"commandLabel"`
-	TimeoutMillis               int64                     `json:"timeoutMillis"`
-	Operation                   string                    `json:"operation"`
-	CreateContainer             *createContainerRequest   `json:"createContainer,omitempty"`
-	Checkpoint                  *checkpointRequest        `json:"checkpointContainer,omitempty"`
-	Restore                     *switchRequest            `json:"restoreIntoContainer,omitempty"`
-	Switch                      *switchRequest            `json:"switchIntoCandidate,omitempty"`
-	Container                   *containerRequest         `json:"container,omitempty"`
-	Cleanup                     *cleanupContainersRequest `json:"cleanupContainers,omitempty"`
-	MetadataResolve             *metadataResolveRequest   `json:"metadataResolve,omitempty"`
-	VNextOwnerReserve           json.RawMessage           `json:"vnextOwnerReserve,omitempty"`
-	VNextOwnerSeal              json.RawMessage           `json:"vnextOwnerSeal,omitempty"`
-	VNextOwnerCommit            json.RawMessage           `json:"vnextOwnerCommit,omitempty"`
-	VNextOwnerAbort             json.RawMessage           `json:"vnextOwnerAbort,omitempty"`
-	VNextOwnerInventory         json.RawMessage           `json:"vnextOwnerInventory,omitempty"`
-	VNextOwnerReservationStatus json.RawMessage           `json:"vnextOwnerReservationStatus,omitempty"`
-	VNextOwnerSetAdmission      json.RawMessage           `json:"vnextOwnerSetAdmission,omitempty"`
-	VNextOwnerAdmissionStatus   json.RawMessage           `json:"vnextOwnerAdmissionStatus,omitempty"`
+	CommandLabel                       string                    `json:"commandLabel"`
+	TimeoutMillis                      int64                     `json:"timeoutMillis"`
+	Operation                          string                    `json:"operation"`
+	CreateContainer                    *createContainerRequest   `json:"createContainer,omitempty"`
+	Checkpoint                         *checkpointRequest        `json:"checkpointContainer,omitempty"`
+	Restore                            *switchRequest            `json:"restoreIntoContainer,omitempty"`
+	Switch                             *switchRequest            `json:"switchIntoCandidate,omitempty"`
+	Container                          *containerRequest         `json:"container,omitempty"`
+	Cleanup                            *cleanupContainersRequest `json:"cleanupContainers,omitempty"`
+	MetadataResolve                    *metadataResolveRequest   `json:"metadataResolve,omitempty"`
+	VNextOwnerReserve                  json.RawMessage           `json:"vnextOwnerReserve,omitempty"`
+	VNextOwnerIssueProducerCapability  json.RawMessage           `json:"vnextOwnerIssueProducerCapability,omitempty"`
+	VNextOwnerRevokeProducerCapability json.RawMessage           `json:"vnextOwnerRevokeProducerCapability,omitempty"`
+	VNextOwnerSeal                     json.RawMessage           `json:"vnextOwnerSeal,omitempty"`
+	VNextOwnerProducerAbort            json.RawMessage           `json:"vnextOwnerProducerAbort,omitempty"`
+	VNextOwnerCommit                   json.RawMessage           `json:"vnextOwnerCommit,omitempty"`
+	VNextOwnerAbort                    json.RawMessage           `json:"vnextOwnerAbort,omitempty"`
+	VNextOwnerInventory                json.RawMessage           `json:"vnextOwnerInventory,omitempty"`
+	VNextOwnerReservationStatus        json.RawMessage           `json:"vnextOwnerReservationStatus,omitempty"`
+	VNextOwnerSetAdmission             json.RawMessage           `json:"vnextOwnerSetAdmission,omitempty"`
+	VNextOwnerAdmissionStatus          json.RawMessage           `json:"vnextOwnerAdmissionStatus,omitempty"`
 }
 
 // A structured checkpoint request is preferred over allowing the invoker to
@@ -366,9 +369,9 @@ func writeDaemonResponse(conn net.Conn, payload []byte) {
 }
 
 func runCommand(req daemonRequest) execResponse {
-	return runCommandWithVNextOwnerGatewayRole(
+	return runCommandWithVNextOwnerGatewayCaller(
 		req, activeVNextOwnerRPC, activeVNextOwnerGateway,
-		vnextOwnerCallerProducer)
+		vnextOwnerInternalCaller(vnextOwnerCallerProducer))
 }
 
 func runCommandWithVNextOwnerRPCRole(
@@ -376,34 +379,40 @@ func runCommandWithVNextOwnerRPCRole(
 	vnextOwnerRPC *vnextOwnerRPC,
 	callerRole vnextOwnerCallerRole,
 ) (resp execResponse) {
+	return runCommandWithVNextOwnerRPCCaller(
+		req, vnextOwnerRPC, vnextOwnerInternalCaller(callerRole))
+}
+
+func runCommandWithVNextOwnerRPCCaller(
+	req daemonRequest,
+	vnextOwnerRPC *vnextOwnerRPC,
+	caller vnextOwnerCallerContext,
+) execResponse {
+	return runCommandWithVNextOwnerBoundaryCaller(
+		req, vnextOwnerRPC, vnextOwnerRPC != nil, caller)
+}
+
+func runCommandWithVNextOwnerBoundaryCaller(
+	req daemonRequest,
+	vnextOwnerRPC *vnextOwnerRPC,
+	vnextOwnerActive bool,
+	caller vnextOwnerCallerContext,
+) (resp execResponse) {
 	startedAt := time.Now()
-	operation := strings.TrimSpace(req.Operation)
-	if operation == "" && req.CreateContainer != nil {
-		operation = "createContainer"
-	}
-	if operation == "" && req.Checkpoint != nil {
-		operation = "checkpointContainer"
-	}
-	if operation == "" && req.Restore != nil {
-		operation = "restoreIntoContainer"
-	}
-	if operation == "" && req.Switch != nil {
-		operation = "switchIntoCandidate"
-	}
-	if operation == "" && req.Container != nil {
-		operation = "container"
-	}
-	if operation == "" && req.Cleanup != nil {
-		operation = "cleanupContainers"
-	}
+	operation := daemonRequestOperation(req)
 	defer func() {
 		resp.Operation = operation
 		resp.DurationMicros = elapsedMicros(startedAt)
 	}()
-	if err := authorizeDaemonOperation(callerRole, operation); err != nil {
+	if err := caller.validate(); err != nil {
+		return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+			operation, vnextOwnerServicePermissionDenied,
+			"daemon caller principal is not authenticated", err))
+	}
+	if err := authorizeDaemonOperation(caller.Role, operation); err != nil {
 		return vnextOwnerRPCErrorResponse(err)
 	}
-	if vnextOwnerRPC != nil && vnextOwnerRejectsLegacyDAXOperation(operation) {
+	if vnextOwnerActive && vnextOwnerRejectsLegacyDAXOperation(operation) {
 		return execResponse{
 			Ok: false,
 			Error: fmt.Sprintf(
@@ -450,19 +459,45 @@ func runCommandWithVNextOwnerRPCRole(
 		}
 		return runMetadataResolveRequest(*req.MetadataResolve, req.TimeoutMillis, activeConfig)
 	case vnextOwnerRPCOperationReserve,
+		vnextOwnerRPCOperationIssueProducerCapability,
+		vnextOwnerRPCOperationRevokeProducerCapability,
 		vnextOwnerRPCOperationSeal,
+		vnextOwnerRPCOperationProducerAbort,
 		vnextOwnerRPCOperationCommit,
 		vnextOwnerRPCOperationAbort,
 		vnextOwnerRPCOperationInventory,
 		vnextOwnerRPCOperationReservationStatus,
 		vnextOwnerRPCOperationSetAdmission,
 		vnextOwnerRPCOperationAdmissionStatus:
-		return runVNextOwnerRPC(operation, req, vnextOwnerRPC)
+		return runVNextOwnerRPC(operation, req, vnextOwnerRPC, caller)
 	case "":
 		return execResponse{Ok: false, Error: "operation is empty"}
 	default:
 		return execResponse{Ok: false, Error: fmt.Sprintf("unsupported operation %q", operation)}
 	}
+}
+
+func daemonRequestOperation(req daemonRequest) string {
+	operation := strings.TrimSpace(req.Operation)
+	if operation == "" && req.CreateContainer != nil {
+		operation = "createContainer"
+	}
+	if operation == "" && req.Checkpoint != nil {
+		operation = "checkpointContainer"
+	}
+	if operation == "" && req.Restore != nil {
+		operation = "restoreIntoContainer"
+	}
+	if operation == "" && req.Switch != nil {
+		operation = "switchIntoCandidate"
+	}
+	if operation == "" && req.Container != nil {
+		operation = "container"
+	}
+	if operation == "" && req.Cleanup != nil {
+		operation = "cleanupContainers"
+	}
+	return operation
 }
 
 func vnextOwnerRejectsLegacyDAXOperation(operation string) bool {
@@ -2242,6 +2277,25 @@ func validateVNextOwnerExclusiveLegacyConfig(config daemonConfig) error {
 	return nil
 }
 
+func validateVNextOwnerStartupExclusivity(
+	legacy daemonConfig,
+	runtime vnextOwnerRuntimeConfig,
+	gateway vnextOwnerGatewayConfig,
+) error {
+	runtimeConfigured := strings.TrimSpace(runtime.ControlFilePath) != "" ||
+		runtime.ControlSlotBytes != 0 || strings.TrimSpace(runtime.DAXDeviceList) != ""
+	gatewayConfigured := strings.TrimSpace(gateway.RouteFilePath) != "" ||
+		strings.TrimSpace(gateway.SchedulerClientCertificatePath) != "" ||
+		strings.TrimSpace(gateway.SchedulerClientPrivateKeyPath) != "" ||
+		strings.TrimSpace(gateway.ProducerClientCertificatePath) != "" ||
+		strings.TrimSpace(gateway.ProducerClientPrivateKeyPath) != "" ||
+		strings.TrimSpace(gateway.ServerCAPath) != ""
+	if !runtimeConfigured && !gatewayConfigured {
+		return nil
+	}
+	return validateVNextOwnerExclusiveLegacyConfig(legacy)
+}
+
 func serveConn(conn net.Conn) {
 	serveConnWithVNextOwnerGateway(
 		conn, activeVNextOwnerRPC, activeVNextOwnerGateway)
@@ -2356,7 +2410,8 @@ func serveAdmittedConnWithVNextOwnerGatewayPolicyLimits(
 	readTimeout time.Duration,
 	writeTimeout time.Duration,
 ) {
-	if err := unixPolicy.authenticate(conn); err != nil {
+	caller, err := unixPolicy.authenticateCaller(conn)
+	if err != nil {
 		defer conn.Close()
 		_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		resp := vnextOwnerRPCErrorResponse(err)
@@ -2365,8 +2420,8 @@ func serveAdmittedConnWithVNextOwnerGatewayPolicyLimits(
 		writeDaemonResponse(conn, respBody)
 		return
 	}
-	serveAuthenticatedDaemonConnWithVNextOwnerGatewayRoleLimits(
-		conn, vnextOwnerRPC, gateway, unixPolicy.Role, largeAdmission,
+	serveAuthenticatedDaemonConnWithVNextOwnerGatewayCallerLimits(
+		conn, vnextOwnerRPC, gateway, caller, largeAdmission,
 		readTimeout, writeTimeout)
 }
 
@@ -2375,6 +2430,20 @@ func serveAuthenticatedDaemonConnWithVNextOwnerGatewayRoleLimits(
 	vnextOwnerRPC *vnextOwnerRPC,
 	gateway *vnextOwnerGateway,
 	callerRole vnextOwnerCallerRole,
+	largeAdmission chan struct{},
+	readTimeout time.Duration,
+	writeTimeout time.Duration,
+) {
+	serveAuthenticatedDaemonConnWithVNextOwnerGatewayCallerLimits(
+		conn, vnextOwnerRPC, gateway, vnextOwnerInternalCaller(callerRole),
+		largeAdmission, readTimeout, writeTimeout)
+}
+
+func serveAuthenticatedDaemonConnWithVNextOwnerGatewayCallerLimits(
+	conn net.Conn,
+	vnextOwnerRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
+	caller vnextOwnerCallerContext,
 	largeAdmission chan struct{},
 	readTimeout time.Duration,
 	writeTimeout time.Duration,
@@ -2405,8 +2474,8 @@ func serveAuthenticatedDaemonConnWithVNextOwnerGatewayRoleLimits(
 		return
 	}
 
-	respBody, _ := json.Marshal(runCommandWithVNextOwnerGatewayRole(
-		req, vnextOwnerRPC, gateway, callerRole))
+	respBody, _ := json.Marshal(runCommandWithVNextOwnerGatewayCaller(
+		req, vnextOwnerRPC, gateway, caller))
 	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	writeDaemonResponse(conn, respBody)
 }
@@ -2810,23 +2879,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	vnextOwnerRuntime, err := openVNextOwnerRuntime(vnextOwnerRuntimeConfig{
+	vnextRuntimeConfig := vnextOwnerRuntimeConfig{
 		ControlFilePath:  *vnextOwnerControlFile,
 		ControlSlotBytes: *vnextOwnerControlSlotBytes,
 		DAXDeviceList:    *vnextOwnerDAXDevices,
-	})
+	}
+	vnextGatewayConfig := vnextOwnerGatewayConfig{
+		RouteFilePath:                  *vnextOwnerGatewayRoutes,
+		SchedulerClientCertificatePath: *vnextOwnerGatewaySchedulerClientCertificate,
+		SchedulerClientPrivateKeyPath:  *vnextOwnerGatewaySchedulerClientPrivateKey,
+		ProducerClientCertificatePath:  *vnextOwnerGatewayProducerClientCertificate,
+		ProducerClientPrivateKeyPath:   *vnextOwnerGatewayProducerClientPrivateKey,
+		ServerCAPath:                   *vnextOwnerGatewayServerCA,
+	}
+	if err := validateVNextOwnerStartupExclusivity(
+		activeConfig, vnextRuntimeConfig, vnextGatewayConfig); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid VNext Owner configuration: %v\n", err)
+		os.Exit(1)
+	}
+
+	vnextOwnerRuntime, err := openVNextOwnerRuntime(vnextRuntimeConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open VNext Owner runtime: %v\n", err)
 		os.Exit(1)
 	}
 	if vnextOwnerRuntime != nil {
-		if err := validateVNextOwnerExclusiveLegacyConfig(activeConfig); err != nil {
-			if closeErr := closeVNextOwnerRuntimeWithRetry(vnextOwnerRuntime, 3); closeErr != nil {
-				fmt.Fprintf(os.Stderr, "failed to close invalid VNext Owner runtime: %v\n", closeErr)
-			}
-			fmt.Fprintf(os.Stderr, "invalid VNext Owner configuration: %v\n", err)
-			os.Exit(1)
-		}
 		defer func() {
 			if err := closeVNextOwnerRuntimeWithRetry(vnextOwnerRuntime, 3); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to close VNext Owner runtime: %v\n", err)
@@ -2835,15 +2912,7 @@ func main() {
 		activeVNextOwnerRPC = newVNextOwnerRPC(vnextOwnerRuntime.service)
 	}
 	activeVNextOwnerGateway, err = openVNextOwnerGateway(
-		vnextOwnerGatewayConfig{
-			RouteFilePath:                  *vnextOwnerGatewayRoutes,
-			SchedulerClientCertificatePath: *vnextOwnerGatewaySchedulerClientCertificate,
-			SchedulerClientPrivateKeyPath:  *vnextOwnerGatewaySchedulerClientPrivateKey,
-			ProducerClientCertificatePath:  *vnextOwnerGatewayProducerClientCertificate,
-			ProducerClientPrivateKeyPath:   *vnextOwnerGatewayProducerClientPrivateKey,
-			ServerCAPath:                   *vnextOwnerGatewayServerCA,
-		},
-		activeVNextOwnerRPC)
+		vnextGatewayConfig, activeVNextOwnerRPC)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open VNext Owner gateway: %v\n", err)
 		os.Exit(1)

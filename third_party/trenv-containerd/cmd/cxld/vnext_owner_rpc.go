@@ -10,25 +10,29 @@ import (
 	"math"
 	"reflect"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
 const (
-	vnextOwnerRPCProtocol = "cxld.vnext-owner.v2"
+	vnextOwnerRPCProtocol = "cxld.vnext-owner.v3"
 
-	vnextOwnerRPCOperationReserve           = "vnextOwnerReserve"
-	vnextOwnerRPCOperationSeal              = "vnextOwnerSeal"
-	vnextOwnerRPCOperationCommit            = "vnextOwnerCommit"
-	vnextOwnerRPCOperationAbort             = "vnextOwnerAbort"
-	vnextOwnerRPCOperationInventory         = "vnextOwnerInventory"
-	vnextOwnerRPCOperationReservationStatus = "vnextOwnerReservationStatus"
-	vnextOwnerRPCOperationSetAdmission      = "vnextOwnerSetAdmission"
-	vnextOwnerRPCOperationAdmissionStatus   = "vnextOwnerAdmissionStatus"
+	vnextOwnerRPCOperationReserve                  = "vnextOwnerReserve"
+	vnextOwnerRPCOperationIssueProducerCapability  = "vnextOwnerIssueProducerCapability"
+	vnextOwnerRPCOperationRevokeProducerCapability = "vnextOwnerRevokeProducerCapability"
+	vnextOwnerRPCOperationSeal                     = "vnextOwnerSeal"
+	vnextOwnerRPCOperationProducerAbort            = "vnextOwnerProducerAbort"
+	vnextOwnerRPCOperationCommit                   = "vnextOwnerCommit"
+	vnextOwnerRPCOperationAbort                    = "vnextOwnerAbort"
+	vnextOwnerRPCOperationInventory                = "vnextOwnerInventory"
+	vnextOwnerRPCOperationReservationStatus        = "vnextOwnerReservationStatus"
+	vnextOwnerRPCOperationSetAdmission             = "vnextOwnerSetAdmission"
+	vnextOwnerRPCOperationAdmissionStatus          = "vnextOwnerAdmissionStatus"
 
 	// JSON/base64 is intentionally limited below the 64 MiB publication codec
 	// ceiling. At 40 bytes per record, eight MiB of TRCRC006 describes roughly
 	// 0.8 GiB of 4 KiB pages. Larger metadata requires a future streaming or
-	// SCM_RIGHTS protocol, not a larger single allocation in this v2 adapter.
+	// SCM_RIGHTS protocol, not a larger single allocation in this v3 adapter.
 	vnextOwnerRPCMaxPublicationBytes = 8 << 20
 	vnextOwnerRPCMaxSidecarBytes     = 8 << 20
 	vnextOwnerRPCMaxSidecars         = 4096
@@ -45,7 +49,7 @@ const (
 	// byte needs HTML-safe JSON escaping, this count keeps both the inner
 	// inventory JSON and its escaped outer execResponse below 32 MiB.
 	vnextOwnerRPCMaxInventoryDevices = 1024
-	// The complete daemon envelope currently defines eighteen fields. Keep a
+	// The complete daemon envelope currently defines twenty-one fields. Keep a
 	// little legacy headroom, but reject an attacker-controlled number of
 	// unknown or duplicate members before retaining RawMessage entries.
 	vnextOwnerRPCMaxDaemonFields = 32
@@ -73,6 +77,55 @@ type vnextOwnerRPCOperationIdentity struct {
 	OwnerID            string `json:"ownerId"`
 	OwnerEpoch         uint64 `json:"ownerEpoch"`
 	AllocationRecordID uint64 `json:"allocationRecordId"`
+}
+
+type vnextOwnerRPCProducerCapabilityProof struct {
+	CapabilityID string `json:"capabilityId"`
+	Token        []byte `json:"token"`
+}
+
+type vnextOwnerRPCIssueProducerCapabilityRequest struct {
+	Protocol           string                         `json:"protocol"`
+	RequestID          string                         `json:"requestId"`
+	Identity           vnextOwnerRPCOperationIdentity `json:"identity"`
+	ProducerPrincipal  string                         `json:"producerPrincipal"`
+	AllowedOperations  uint8                          `json:"allowedOperations"`
+	SchedulerTerm      string                         `json:"schedulerTerm"`
+	RequestedTTLMillis uint64                         `json:"requestedTtlMillis"`
+	Nonce              []byte                         `json:"nonce"`
+}
+
+type vnextOwnerRPCIssueProducerCapabilityResponse struct {
+	Protocol          string                               `json:"protocol"`
+	Operation         string                               `json:"operation"`
+	RequestID         string                               `json:"requestId"`
+	Identity          vnextOwnerRPCOperationIdentity       `json:"identity"`
+	Capability        vnextOwnerRPCProducerCapabilityProof `json:"capability"`
+	ProducerPrincipal string                               `json:"producerPrincipal"`
+	AllowedOperations uint8                                `json:"allowedOperations"`
+	SchedulerTerm     string                               `json:"schedulerTerm"`
+	IssuedAtUnixNano  uint64                               `json:"issuedAtUnixNano"`
+	ExpiresAtUnixNano uint64                               `json:"expiresAtUnixNano"`
+	Replayed          bool                                 `json:"replayed"`
+}
+
+type vnextOwnerRPCRevokeProducerCapabilityRequest struct {
+	Protocol      string                         `json:"protocol"`
+	RequestID     string                         `json:"requestId"`
+	Identity      vnextOwnerRPCOperationIdentity `json:"identity"`
+	CapabilityID  string                         `json:"capabilityId"`
+	SchedulerTerm string                         `json:"schedulerTerm"`
+}
+
+type vnextOwnerRPCRevokeProducerCapabilityResponse struct {
+	Protocol          string                         `json:"protocol"`
+	Operation         string                         `json:"operation"`
+	RequestID         string                         `json:"requestId"`
+	Identity          vnextOwnerRPCOperationIdentity `json:"identity"`
+	CapabilityID      string                         `json:"capabilityId"`
+	SchedulerTerm     string                         `json:"schedulerTerm"`
+	RevokedAtUnixNano uint64                         `json:"revokedAtUnixNano"`
+	Replayed          bool                           `json:"replayed"`
 }
 
 type vnextOwnerRPCReserveContent struct {
@@ -165,9 +218,16 @@ type vnextOwnerRPCExternalContentPageCRCs []vnextOwnerRPCExternalContentPageCRC
 type vnextOwnerRPCSealRequest struct {
 	Protocol                string                               `json:"protocol"`
 	Identity                vnextOwnerRPCOperationIdentity       `json:"identity"`
+	Capability              vnextOwnerRPCProducerCapabilityProof `json:"capability"`
 	PublicationEnvelope     []byte                               `json:"publicationEnvelope"`
 	CRCPageSidecars         vnextOwnerRPCSidecars                `json:"crcPageSidecars"`
 	ExternalContentPageCRCs vnextOwnerRPCExternalContentPageCRCs `json:"externalContentPageCRCs"`
+}
+
+type vnextOwnerRPCProducerAbortRequest struct {
+	Protocol   string                               `json:"protocol"`
+	Identity   vnextOwnerRPCOperationIdentity       `json:"identity"`
+	Capability vnextOwnerRPCProducerCapabilityProof `json:"capability"`
 }
 
 type vnextOwnerRPCPageID struct {
@@ -409,14 +469,23 @@ func runVNextOwnerRPC(
 	operation string,
 	request daemonRequest,
 	rpc *vnextOwnerRPC,
+	caller vnextOwnerCallerContext,
 ) execResponse {
 	// VNext Owner mutations include persistence barriers that must not be
-	// cancelled halfway through. The v2 transport therefore does not pretend
+	// cancelled halfway through. The v3 transport therefore does not pretend
 	// that the legacy command timeout applies to these operations. A future
 	// protocol may add a deadline for admission before a mutation starts.
 	if request.TimeoutMillis != 0 {
 		return vnextOwnerRPCErrorResponse(errors.New(
-			"VNext Owner protocol v2 does not support timeoutMillis; it must be zero"))
+			"VNext Owner protocol v3 does not support timeoutMillis; it must be zero"))
+	}
+	if err := caller.validate(); err != nil {
+		return vnextOwnerRPCErrorResponse(vnextOwnerServiceFailure(
+			operation, vnextOwnerServicePermissionDenied,
+			"strict Owner caller principal is not authenticated", err))
+	}
+	if err := authorizeVNextOwnerOperation(caller.Role, operation); err != nil {
+		return vnextOwnerRPCErrorResponse(err)
 	}
 	raw, err := vnextOwnerRPCPayload(operation, request)
 	if err != nil {
@@ -433,8 +502,14 @@ func runVNextOwnerRPC(
 	switch operation {
 	case vnextOwnerRPCOperationReserve:
 		return rpc.reserve(raw)
+	case vnextOwnerRPCOperationIssueProducerCapability:
+		return rpc.issueProducerCapability(raw, caller)
+	case vnextOwnerRPCOperationRevokeProducerCapability:
+		return rpc.revokeProducerCapability(raw, caller)
 	case vnextOwnerRPCOperationSeal:
-		return rpc.seal(raw)
+		return rpc.seal(raw, caller)
+	case vnextOwnerRPCOperationProducerAbort:
+		return rpc.producerAbort(raw, caller)
 	case vnextOwnerRPCOperationCommit:
 		return rpc.commit(raw)
 	case vnextOwnerRPCOperationAbort:
@@ -455,7 +530,10 @@ func runVNextOwnerRPC(
 func isVNextOwnerRPCOperation(operation string) bool {
 	switch operation {
 	case vnextOwnerRPCOperationReserve,
+		vnextOwnerRPCOperationIssueProducerCapability,
+		vnextOwnerRPCOperationRevokeProducerCapability,
 		vnextOwnerRPCOperationSeal,
+		vnextOwnerRPCOperationProducerAbort,
 		vnextOwnerRPCOperationCommit,
 		vnextOwnerRPCOperationAbort,
 		vnextOwnerRPCOperationInventory,
@@ -474,24 +552,27 @@ type vnextOwnerRPCRawField struct {
 }
 
 var vnextOwnerRPCDaemonFields = map[string]struct{}{
-	"commandLabel":                {},
-	"timeoutMillis":               {},
-	"operation":                   {},
-	"createContainer":             {},
-	"checkpointContainer":         {},
-	"restoreIntoContainer":        {},
-	"switchIntoCandidate":         {},
-	"container":                   {},
-	"cleanupContainers":           {},
-	"metadataResolve":             {},
-	"vnextOwnerReserve":           {},
-	"vnextOwnerSeal":              {},
-	"vnextOwnerCommit":            {},
-	"vnextOwnerAbort":             {},
-	"vnextOwnerInventory":         {},
-	"vnextOwnerReservationStatus": {},
-	"vnextOwnerSetAdmission":      {},
-	"vnextOwnerAdmissionStatus":   {},
+	"commandLabel":                       {},
+	"timeoutMillis":                      {},
+	"operation":                          {},
+	"createContainer":                    {},
+	"checkpointContainer":                {},
+	"restoreIntoContainer":               {},
+	"switchIntoCandidate":                {},
+	"container":                          {},
+	"cleanupContainers":                  {},
+	"metadataResolve":                    {},
+	"vnextOwnerReserve":                  {},
+	"vnextOwnerIssueProducerCapability":  {},
+	"vnextOwnerRevokeProducerCapability": {},
+	"vnextOwnerSeal":                     {},
+	"vnextOwnerProducerAbort":            {},
+	"vnextOwnerCommit":                   {},
+	"vnextOwnerAbort":                    {},
+	"vnextOwnerInventory":                {},
+	"vnextOwnerReservationStatus":        {},
+	"vnextOwnerSetAdmission":             {},
+	"vnextOwnerAdmissionStatus":          {},
 }
 
 var vnextOwnerRPCLegacyPayloadFields = map[string]struct{}{
@@ -620,8 +701,14 @@ func decodeVNextOwnerRPCDaemonEnvelope(
 			}
 		case "vnextOwnerReserve":
 			request.VNextOwnerReserve = append(json.RawMessage(nil), field.raw...)
+		case "vnextOwnerIssueProducerCapability":
+			request.VNextOwnerIssueProducerCapability = append(json.RawMessage(nil), field.raw...)
+		case "vnextOwnerRevokeProducerCapability":
+			request.VNextOwnerRevokeProducerCapability = append(json.RawMessage(nil), field.raw...)
 		case "vnextOwnerSeal":
 			request.VNextOwnerSeal = append(json.RawMessage(nil), field.raw...)
+		case "vnextOwnerProducerAbort":
+			request.VNextOwnerProducerAbort = append(json.RawMessage(nil), field.raw...)
 		case "vnextOwnerCommit":
 			request.VNextOwnerCommit = append(json.RawMessage(nil), field.raw...)
 		case "vnextOwnerAbort":
@@ -667,7 +754,10 @@ func vnextOwnerRPCPayload(operation string, request daemonRequest) (json.RawMess
 		payload   json.RawMessage
 	}{
 		{vnextOwnerRPCOperationReserve, request.VNextOwnerReserve},
+		{vnextOwnerRPCOperationIssueProducerCapability, request.VNextOwnerIssueProducerCapability},
+		{vnextOwnerRPCOperationRevokeProducerCapability, request.VNextOwnerRevokeProducerCapability},
 		{vnextOwnerRPCOperationSeal, request.VNextOwnerSeal},
+		{vnextOwnerRPCOperationProducerAbort, request.VNextOwnerProducerAbort},
 		{vnextOwnerRPCOperationCommit, request.VNextOwnerCommit},
 		{vnextOwnerRPCOperationAbort, request.VNextOwnerAbort},
 		{vnextOwnerRPCOperationInventory, request.VNextOwnerInventory},
@@ -1166,12 +1256,139 @@ func decodeVNextOwnerRPCReserveRequest(
 	return request, nil
 }
 
-func (rpc *vnextOwnerRPC) seal(raw json.RawMessage) execResponse {
+func (rpc *vnextOwnerRPC) issueProducerCapability(
+	raw json.RawMessage,
+	caller vnextOwnerCallerContext,
+) execResponse {
+	request, err := decodeVNextOwnerRPCIssueProducerCapabilityRequest(raw)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	response, err := rpc.service.issueProducerCapability(request, caller)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	return marshalVNextOwnerRPCResponse(vnextOwnerRPCIssueProducerCapabilityResponse{
+		Protocol:          vnextOwnerRPCProtocol,
+		Operation:         vnextOwnerRPCOperationIssueProducerCapability,
+		RequestID:         response.RequestID,
+		Identity:          vnextOwnerRPCIdentityFromInternal(response.Operation),
+		Capability:        vnextOwnerRPCProofFromInternal(response.Capability),
+		ProducerPrincipal: response.ProducerPrincipal,
+		AllowedOperations: uint8(response.AllowedOperations),
+		SchedulerTerm:     response.SchedulerTerm,
+		IssuedAtUnixNano:  response.IssuedAtUnixNano,
+		ExpiresAtUnixNano: response.ExpiresAtUnixNano,
+		Replayed:          response.Replayed,
+	})
+}
+
+func decodeVNextOwnerRPCIssueProducerCapabilityRequest(
+	raw json.RawMessage,
+) (vnextOwnerIssueProducerCapabilityRequest, error) {
+	var wire vnextOwnerRPCIssueProducerCapabilityRequest
+	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
+		return vnextOwnerIssueProducerCapabilityRequest{}, err
+	}
+	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
+		return vnextOwnerIssueProducerCapabilityRequest{}, err
+	}
+	if len(wire.Nonce) != vnextProducerCapabilityTokenBytes {
+		return vnextOwnerIssueProducerCapabilityRequest{}, fmt.Errorf(
+			"Producer capability nonce has %d bytes, expected %d",
+			len(wire.Nonce), vnextProducerCapabilityTokenBytes)
+	}
+	request := vnextOwnerIssueProducerCapabilityRequest{
+		RequestID:          wire.RequestID,
+		Operation:          wire.Identity.internal(),
+		ProducerPrincipal:  wire.ProducerPrincipal,
+		AllowedOperations:  vnextProducerCapabilityOperations(wire.AllowedOperations),
+		SchedulerTerm:      wire.SchedulerTerm,
+		RequestedTTLMillis: wire.RequestedTTLMillis,
+	}
+	copy(request.Nonce[:], wire.Nonce)
+	// Owner time is authoritative and supplied only inside the service. Zero is
+	// used here solely to validate all request fields that do not depend on it.
+	if request.RequestID == "" || len(request.RequestID) > vnextMaxIdentityBytes ||
+		request.SchedulerTerm == "" || len(request.SchedulerTerm) > vnextMaxIdentityBytes ||
+		request.RequestedTTLMillis == 0 ||
+		request.RequestedTTLMillis > uint64(vnextProducerCapabilityMaxLifetime/time.Millisecond) ||
+		!request.AllowedOperations.valid() || vnextAllZero(request.Nonce[:]) {
+		return vnextOwnerIssueProducerCapabilityRequest{}, errors.New(
+			"Producer capability issue request is incomplete or outside its bounds")
+	}
+	if err := validateVNextOwnerClientOperationIdentity(request.Operation); err != nil {
+		return vnextOwnerIssueProducerCapabilityRequest{}, err
+	}
+	if err := validateVNextOwnerPrincipal(request.ProducerPrincipal); err != nil {
+		return vnextOwnerIssueProducerCapabilityRequest{}, err
+	}
+	return request, nil
+}
+
+func (rpc *vnextOwnerRPC) revokeProducerCapability(
+	raw json.RawMessage,
+	caller vnextOwnerCallerContext,
+) execResponse {
+	request, err := decodeVNextOwnerRPCRevokeProducerCapabilityRequest(raw)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	response, err := rpc.service.revokeProducerCapability(request, caller)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	return marshalVNextOwnerRPCResponse(vnextOwnerRPCRevokeProducerCapabilityResponse{
+		Protocol:          vnextOwnerRPCProtocol,
+		Operation:         vnextOwnerRPCOperationRevokeProducerCapability,
+		RequestID:         response.RequestID,
+		Identity:          vnextOwnerRPCIdentityFromInternal(response.Operation),
+		CapabilityID:      response.CapabilityID,
+		SchedulerTerm:     response.SchedulerTerm,
+		RevokedAtUnixNano: response.RevokedAtUnixNano,
+		Replayed:          response.Replayed,
+	})
+}
+
+func decodeVNextOwnerRPCRevokeProducerCapabilityRequest(
+	raw json.RawMessage,
+) (vnextOwnerRevokeProducerCapabilityRequest, error) {
+	var wire vnextOwnerRPCRevokeProducerCapabilityRequest
+	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
+		return vnextOwnerRevokeProducerCapabilityRequest{}, err
+	}
+	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
+		return vnextOwnerRevokeProducerCapabilityRequest{}, err
+	}
+	request := vnextOwnerRevokeProducerCapabilityRequest{
+		RequestID:     wire.RequestID,
+		Operation:     wire.Identity.internal(),
+		CapabilityID:  wire.CapabilityID,
+		SchedulerTerm: wire.SchedulerTerm,
+	}
+	if request.RequestID == "" || len(request.RequestID) > vnextMaxIdentityBytes ||
+		request.SchedulerTerm == "" || len(request.SchedulerTerm) > vnextMaxIdentityBytes {
+		return vnextOwnerRevokeProducerCapabilityRequest{}, errors.New(
+			"Producer capability revoke request is incomplete")
+	}
+	if err := validateVNextProducerCapabilityID(request.CapabilityID); err != nil {
+		return vnextOwnerRevokeProducerCapabilityRequest{}, err
+	}
+	if err := validateVNextOwnerClientOperationIdentity(request.Operation); err != nil {
+		return vnextOwnerRevokeProducerCapabilityRequest{}, err
+	}
+	return request, nil
+}
+
+func (rpc *vnextOwnerRPC) seal(
+	raw json.RawMessage,
+	caller vnextOwnerCallerContext,
+) execResponse {
 	request, err := decodeVNextOwnerRPCSealRequest(raw)
 	if err != nil {
 		return vnextOwnerRPCErrorResponse(err)
 	}
-	response, err := rpc.service.sealExternal(request)
+	response, err := rpc.service.sealExternal(request, caller)
 	if err != nil {
 		return vnextOwnerRPCErrorResponse(err)
 	}
@@ -1218,6 +1435,10 @@ func decodeVNextOwnerRPCSealRequest(
 		return vnextOwnerExternalSealRequest{}, err
 	}
 	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
+		return vnextOwnerExternalSealRequest{}, err
+	}
+	capability, err := wire.Capability.internal()
+	if err != nil {
 		return vnextOwnerExternalSealRequest{}, err
 	}
 	if len(wire.PublicationEnvelope) == 0 ||
@@ -1284,6 +1505,7 @@ func decodeVNextOwnerRPCSealRequest(
 	}
 	request := vnextOwnerExternalSealRequest{
 		Operation:               wire.Identity.internal(),
+		Capability:              capability,
 		PublicationEnvelope:     wire.PublicationEnvelope,
 		CRCPageSidecars:         sidecars,
 		ExternalContentPageCRCs: externalContentPageCRCs,
@@ -1292,6 +1514,45 @@ func decodeVNextOwnerRPCSealRequest(
 		return vnextOwnerExternalSealRequest{}, err
 	}
 	return request, nil
+}
+
+func (rpc *vnextOwnerRPC) producerAbort(
+	raw json.RawMessage,
+	caller vnextOwnerCallerContext,
+) execResponse {
+	identity, capability, err := decodeVNextOwnerRPCProducerAbortRequest(raw)
+	if err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	if err := rpc.service.producerAbort(identity, capability, caller); err != nil {
+		return vnextOwnerRPCErrorResponse(err)
+	}
+	return marshalVNextOwnerRPCResponse(vnextOwnerRPCLifecycleResponse{
+		Protocol:  vnextOwnerRPCProtocol,
+		Operation: vnextOwnerRPCOperationProducerAbort,
+		State:     "ABORTED",
+	})
+}
+
+func decodeVNextOwnerRPCProducerAbortRequest(
+	raw json.RawMessage,
+) (vnextOwnerOperationIdentity, vnextProducerCapabilityProof, error) {
+	var wire vnextOwnerRPCProducerAbortRequest
+	if err := decodeStrictVNextOwnerRPC(raw, &wire); err != nil {
+		return vnextOwnerOperationIdentity{}, vnextProducerCapabilityProof{}, err
+	}
+	if err := requireVNextOwnerRPCProtocol(wire.Protocol); err != nil {
+		return vnextOwnerOperationIdentity{}, vnextProducerCapabilityProof{}, err
+	}
+	identity := wire.Identity.internal()
+	if err := validateVNextOwnerClientOperationIdentity(identity); err != nil {
+		return vnextOwnerOperationIdentity{}, vnextProducerCapabilityProof{}, err
+	}
+	capability, err := wire.Capability.internal()
+	if err != nil {
+		return vnextOwnerOperationIdentity{}, vnextProducerCapabilityProof{}, err
+	}
+	return identity, capability, nil
 }
 
 func (rpc *vnextOwnerRPC) commit(raw json.RawMessage) execResponse {
@@ -1557,6 +1818,32 @@ func (identity vnextOwnerRPCOperationIdentity) internal() vnextOwnerOperationIde
 		OwnerID:            identity.OwnerID,
 		OwnerEpoch:         identity.OwnerEpoch,
 		AllocationRecordID: identity.AllocationRecordID,
+	}
+}
+
+func (proof vnextOwnerRPCProducerCapabilityProof) internal() (
+	vnextProducerCapabilityProof,
+	error,
+) {
+	if len(proof.Token) != vnextProducerCapabilityTokenBytes {
+		return vnextProducerCapabilityProof{}, fmt.Errorf(
+			"Producer capability token has %d bytes, expected %d",
+			len(proof.Token), vnextProducerCapabilityTokenBytes)
+	}
+	internal := vnextProducerCapabilityProof{CapabilityID: proof.CapabilityID}
+	copy(internal.Token[:], proof.Token)
+	if err := validateVNextProducerCapabilityProof(internal); err != nil {
+		return vnextProducerCapabilityProof{}, err
+	}
+	return internal, nil
+}
+
+func vnextOwnerRPCProofFromInternal(
+	proof vnextProducerCapabilityProof,
+) vnextOwnerRPCProducerCapabilityProof {
+	return vnextOwnerRPCProducerCapabilityProof{
+		CapabilityID: proof.CapabilityID,
+		Token:        append([]byte(nil), proof.Token[:]...),
 	}
 }
 

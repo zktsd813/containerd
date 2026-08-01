@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -23,7 +25,7 @@ import (
 //
 // The transport is responsible for encoding daemonRequest into the bounded
 // daemon frame and decoding its outer execResponse. This client owns the
-// cxld.vnext-owner.v2 operation payload and response contracts inside those
+// cxld.vnext-owner.v3 operation payload and response contracts inside those
 // envelopes.
 type vnextOwnerClientRoundTripper interface {
 	RoundTrip(context.Context, daemonRequest) (execResponse, error)
@@ -495,6 +497,148 @@ func (client *vnextOwnerClient) ReservationStatus(
 	return result, nil
 }
 
+func (client *vnextOwnerClient) IssueProducerCapability(
+	ctx context.Context,
+	request vnextOwnerIssueProducerCapabilityRequest,
+) (vnextOwnerIssueProducerCapabilityResponse, error) {
+	if client == nil || client.transport == nil {
+		return vnextOwnerIssueProducerCapabilityResponse{}, errors.New(
+			"VNext Owner client is unavailable")
+	}
+	if err := validateVNextOwnerClientOperationIdentity(request.Operation); err != nil {
+		return vnextOwnerIssueProducerCapabilityResponse{}, err
+	}
+	if request.RequestID == "" || len(request.RequestID) > vnextMaxIdentityBytes ||
+		request.SchedulerTerm == "" || len(request.SchedulerTerm) > vnextMaxIdentityBytes ||
+		request.RequestedTTLMillis == 0 ||
+		request.RequestedTTLMillis > uint64(vnextProducerCapabilityMaxLifetime/time.Millisecond) ||
+		!request.AllowedOperations.valid() || vnextAllZero(request.Nonce[:]) {
+		return vnextOwnerIssueProducerCapabilityResponse{}, errors.New(
+			"Producer capability issue request is incomplete or outside its bounds")
+	}
+	if err := validateVNextOwnerPrincipal(request.ProducerPrincipal); err != nil {
+		return vnextOwnerIssueProducerCapabilityResponse{}, err
+	}
+	wire := vnextOwnerRPCIssueProducerCapabilityRequest{
+		Protocol:           vnextOwnerRPCProtocol,
+		RequestID:          request.RequestID,
+		Identity:           vnextOwnerRPCIdentityFromInternal(request.Operation),
+		ProducerPrincipal:  request.ProducerPrincipal,
+		AllowedOperations:  uint8(request.AllowedOperations),
+		SchedulerTerm:      request.SchedulerTerm,
+		RequestedTTLMillis: request.RequestedTTLMillis,
+		Nonce:              append([]byte(nil), request.Nonce[:]...),
+	}
+	raw, err := marshalVNextOwnerClientPayload(wire)
+	if err != nil {
+		return vnextOwnerIssueProducerCapabilityResponse{}, err
+	}
+	response, err := client.roundTrip(
+		ctx, vnextOwnerRPCOperationIssueProducerCapability,
+		daemonRequest{VNextOwnerIssueProducerCapability: raw})
+	if err != nil {
+		return vnextOwnerIssueProducerCapabilityResponse{}, err
+	}
+	var decoded vnextOwnerRPCIssueProducerCapabilityResponse
+	if err := decodeVNextOwnerClientSuccess(
+		response, vnextOwnerRPCOperationIssueProducerCapability, &decoded); err != nil {
+		return vnextOwnerIssueProducerCapabilityResponse{}, err
+	}
+	proof, err := decoded.Capability.internal()
+	if err != nil {
+		return vnextOwnerIssueProducerCapabilityResponse{}, err
+	}
+	ttlNanos, ok := vnextMul(request.RequestedTTLMillis, uint64(time.Millisecond))
+	if !ok || decoded.Protocol != vnextOwnerRPCProtocol ||
+		decoded.Operation != vnextOwnerRPCOperationIssueProducerCapability ||
+		decoded.RequestID != request.RequestID ||
+		decoded.Identity.internal() != request.Operation ||
+		decoded.ProducerPrincipal != request.ProducerPrincipal ||
+		decoded.AllowedOperations != uint8(request.AllowedOperations) ||
+		decoded.SchedulerTerm != request.SchedulerTerm ||
+		decoded.IssuedAtUnixNano == 0 ||
+		decoded.IssuedAtUnixNano > uint64(math.MaxInt64) ||
+		decoded.ExpiresAtUnixNano <= decoded.IssuedAtUnixNano ||
+		decoded.ExpiresAtUnixNano > uint64(math.MaxInt64) ||
+		decoded.ExpiresAtUnixNano-decoded.IssuedAtUnixNano != ttlNanos ||
+		subtle.ConstantTimeCompare(proof.Token[:], request.Nonce[:]) != 1 {
+		return vnextOwnerIssueProducerCapabilityResponse{}, errors.New(
+			"Producer capability issue response does not match the exact request")
+	}
+	return vnextOwnerIssueProducerCapabilityResponse{
+		RequestID:         decoded.RequestID,
+		Capability:        proof,
+		Operation:         decoded.Identity.internal(),
+		ProducerPrincipal: decoded.ProducerPrincipal,
+		AllowedOperations: vnextProducerCapabilityOperations(decoded.AllowedOperations),
+		SchedulerTerm:     decoded.SchedulerTerm,
+		IssuedAtUnixNano:  decoded.IssuedAtUnixNano,
+		ExpiresAtUnixNano: decoded.ExpiresAtUnixNano,
+		Replayed:          decoded.Replayed,
+	}, nil
+}
+
+func (client *vnextOwnerClient) RevokeProducerCapability(
+	ctx context.Context,
+	request vnextOwnerRevokeProducerCapabilityRequest,
+) (vnextOwnerRevokeProducerCapabilityResponse, error) {
+	if client == nil || client.transport == nil {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, errors.New(
+			"VNext Owner client is unavailable")
+	}
+	if err := validateVNextOwnerClientOperationIdentity(request.Operation); err != nil {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, err
+	}
+	if request.RequestID == "" || len(request.RequestID) > vnextMaxIdentityBytes ||
+		request.SchedulerTerm == "" || len(request.SchedulerTerm) > vnextMaxIdentityBytes {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, errors.New(
+			"Producer capability revoke request is incomplete")
+	}
+	if err := validateVNextProducerCapabilityID(request.CapabilityID); err != nil {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, err
+	}
+	wire := vnextOwnerRPCRevokeProducerCapabilityRequest{
+		Protocol:      vnextOwnerRPCProtocol,
+		RequestID:     request.RequestID,
+		Identity:      vnextOwnerRPCIdentityFromInternal(request.Operation),
+		CapabilityID:  request.CapabilityID,
+		SchedulerTerm: request.SchedulerTerm,
+	}
+	raw, err := marshalVNextOwnerClientPayload(wire)
+	if err != nil {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, err
+	}
+	response, err := client.roundTrip(
+		ctx, vnextOwnerRPCOperationRevokeProducerCapability,
+		daemonRequest{VNextOwnerRevokeProducerCapability: raw})
+	if err != nil {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, err
+	}
+	var decoded vnextOwnerRPCRevokeProducerCapabilityResponse
+	if err := decodeVNextOwnerClientSuccess(
+		response, vnextOwnerRPCOperationRevokeProducerCapability, &decoded); err != nil {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, err
+	}
+	if decoded.Protocol != vnextOwnerRPCProtocol ||
+		decoded.Operation != vnextOwnerRPCOperationRevokeProducerCapability ||
+		decoded.RequestID != request.RequestID ||
+		decoded.Identity.internal() != request.Operation ||
+		decoded.CapabilityID != request.CapabilityID ||
+		decoded.SchedulerTerm != request.SchedulerTerm || decoded.RevokedAtUnixNano == 0 ||
+		decoded.RevokedAtUnixNano > uint64(math.MaxInt64) {
+		return vnextOwnerRevokeProducerCapabilityResponse{}, errors.New(
+			"Producer capability revoke response does not match the exact request")
+	}
+	return vnextOwnerRevokeProducerCapabilityResponse{
+		RequestID:         decoded.RequestID,
+		CapabilityID:      decoded.CapabilityID,
+		Operation:         decoded.Identity.internal(),
+		SchedulerTerm:     decoded.SchedulerTerm,
+		RevokedAtUnixNano: decoded.RevokedAtUnixNano,
+		Replayed:          decoded.Replayed,
+	}, nil
+}
+
 func (client *vnextOwnerClient) SealVNextCheckpoint(
 	ctx context.Context,
 	request vnextOwnerExternalSealRequest,
@@ -503,6 +647,9 @@ func (client *vnextOwnerClient) SealVNextCheckpoint(
 		return vnextOwnerSealResponse{}, errors.New("VNext Owner client is unavailable")
 	}
 	if err := validateVNextOwnerClientOperationIdentity(request.Operation); err != nil {
+		return vnextOwnerSealResponse{}, err
+	}
+	if err := validateVNextProducerCapabilityProof(request.Capability); err != nil {
 		return vnextOwnerSealResponse{}, err
 	}
 	if len(request.PublicationEnvelope) == 0 ||
@@ -572,6 +719,7 @@ func (client *vnextOwnerClient) SealVNextCheckpoint(
 	wire := vnextOwnerRPCSealRequest{
 		Protocol:                vnextOwnerRPCProtocol,
 		Identity:                vnextOwnerRPCIdentityFromInternal(request.Operation),
+		Capability:              vnextOwnerRPCProofFromInternal(request.Capability),
 		PublicationEnvelope:     append([]byte(nil), request.PublicationEnvelope...),
 		CRCPageSidecars:         sidecars,
 		ExternalContentPageCRCs: external,
@@ -608,6 +756,48 @@ func (client *vnextOwnerClient) AbortVNextCheckpoint(
 	identity vnextOwnerOperationIdentity,
 ) error {
 	return client.lifecycle(ctx, vnextOwnerRPCOperationAbort, "ABORTED", identity)
+}
+
+func (client *vnextOwnerClient) ProducerAbortVNextCheckpoint(
+	ctx context.Context,
+	identity vnextOwnerOperationIdentity,
+	capability vnextProducerCapabilityProof,
+) error {
+	if client == nil || client.transport == nil {
+		return errors.New("VNext Owner client is unavailable")
+	}
+	if err := validateVNextOwnerClientOperationIdentity(identity); err != nil {
+		return err
+	}
+	if err := validateVNextProducerCapabilityProof(capability); err != nil {
+		return err
+	}
+	wire := vnextOwnerRPCProducerAbortRequest{
+		Protocol:   vnextOwnerRPCProtocol,
+		Identity:   vnextOwnerRPCIdentityFromInternal(identity),
+		Capability: vnextOwnerRPCProofFromInternal(capability),
+	}
+	raw, err := marshalVNextOwnerClientPayload(wire)
+	if err != nil {
+		return err
+	}
+	response, err := client.roundTrip(
+		ctx, vnextOwnerRPCOperationProducerAbort,
+		daemonRequest{VNextOwnerProducerAbort: raw})
+	if err != nil {
+		return err
+	}
+	var decoded vnextOwnerRPCLifecycleResponse
+	if err := decodeVNextOwnerClientSuccess(
+		response, vnextOwnerRPCOperationProducerAbort, &decoded); err != nil {
+		return err
+	}
+	if decoded.Protocol != vnextOwnerRPCProtocol ||
+		decoded.Operation != vnextOwnerRPCOperationProducerAbort ||
+		decoded.State != "ABORTED" {
+		return errors.New("VNext Owner Producer abort response is invalid")
+	}
+	return nil
 }
 
 func (client *vnextOwnerClient) lifecycle(

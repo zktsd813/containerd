@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestVNextOwnerTROWN007AdmissionRoundTripIsStrict(t *testing.T) {
+func TestVNextOwnerTROWN008AdmissionRoundTripIsStrict(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
 		UUID: "owner-format-v7", Size: 256 << 10,
 	}})
@@ -19,7 +19,7 @@ func TestVNextOwnerTROWN007AdmissionRoundTripIsStrict(t *testing.T) {
 	encoded, err := fixture.group.journal.marshalAtSequence(
 		fixture.group.journal.SnapshotSequence, fixture.group.devices)
 	if err != nil {
-		t.Fatalf("marshal TROWN007 journal: %v", err)
+		t.Fatalf("marshal TROWN008 journal: %v", err)
 	}
 	if !bytes.Equal(encoded[:len(vnextOwnerJournalMagic)], vnextOwnerJournalMagic[:]) {
 		t.Fatalf("Owner journal magic is %q, expected %q",
@@ -27,17 +27,17 @@ func TestVNextOwnerTROWN007AdmissionRoundTripIsStrict(t *testing.T) {
 	}
 	decoded, err := parseVNextOwnerJournal(encoded, fixture.group.devices)
 	if err != nil {
-		t.Fatalf("parse TROWN007 journal: %v", err)
+		t.Fatalf("parse TROWN008 journal: %v", err)
 	}
 	if decoded.AdmissionState != vnextOwnerAdmissionReadOnly ||
 		decoded.AdmissionSequence != 2 ||
 		!reflect.DeepEqual(decoded.AdmissionTransitions,
 			fixture.group.journal.AdmissionTransitions) {
-		t.Fatalf("TROWN007 admission round trip changed state: %#v", decoded)
+		t.Fatalf("TROWN008 admission round trip changed state: %#v", decoded)
 	}
 }
 
-func TestVNextOwnerTROWN006JournalFailsClosedWithoutMigration(t *testing.T) {
+func TestVNextOwnerTROWN007JournalFailsClosedWithoutMigration(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
 		UUID: "owner-format-v6-rejected", Size: 256 << 10,
 	}})
@@ -50,13 +50,13 @@ func TestVNextOwnerTROWN006JournalFailsClosedWithoutMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacyMagic := [8]byte{'T', 'R', 'O', 'W', 'N', '0', '0', '6'}
+	legacyMagic := [8]byte{'T', 'R', 'O', 'W', 'N', '0', '0', '7'}
 	legacy, err := vnextMarshalEnvelope(legacyMagic, payload)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := parseVNextOwnerJournal(legacy, fixture.group.devices); err == nil {
-		t.Fatal("TROWN006 magic was accepted by the clean-slate TROWN007 parser")
+		t.Fatal("TROWN007 magic was accepted by the clean-slate TROWN008 parser")
 	}
 	for _, offset := range []uint64{0, testVNextOwnerControlSlotBytes} {
 		if err := vnextWriteCommittedEnvelopeSlot(
@@ -72,11 +72,11 @@ func TestVNextOwnerTROWN006JournalFailsClosedWithoutMigration(t *testing.T) {
 		fixture.controlFile,
 		testVNextOwnerControlSlotBytes,
 		[]*vnextPersistentDevice{reopenedDevice}); !errors.Is(err, errVNextCorrupt) {
-		t.Fatalf("two TROWN006 slots returned %v, expected fail-closed corruption", err)
+		t.Fatalf("two TROWN007 slots returned %v, expected fail-closed corruption", err)
 	}
 }
 
-func TestVNextOwnerTROWN007RejectsAdmissionReservedBytesAndDigestTamper(t *testing.T) {
+func TestVNextOwnerTROWN008RejectsAdmissionReservedBytesAndDigestTamper(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
 		UUID: "owner-format-admission-corrupt", Size: 256 << 10,
 	}})
@@ -125,7 +125,7 @@ func TestVNextOwnerTROWN007RejectsAdmissionReservedBytesAndDigestTamper(t *testi
 	})
 }
 
-func TestVNextOwnerTROWN007EncoderRejectsNonCanonicalAdmissionHistory(t *testing.T) {
+func TestVNextOwnerTROWN008EncoderRejectsNonCanonicalAdmissionHistory(t *testing.T) {
 	fixture := newVNextOwnerTestFixture(t, []vnextOwnerTestDeviceSpec{{
 		UUID: "owner-format-history-invalid", Size: 256 << 10,
 	}})

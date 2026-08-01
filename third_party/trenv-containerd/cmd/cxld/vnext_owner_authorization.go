@@ -30,6 +30,32 @@ func (role vnextOwnerCallerRole) String() string {
 	}
 }
 
+// vnextOwnerCallerContext is created only by a trusted Unix or TLS transport
+// boundary. Principal is the exact authenticated peer identity: a canonical
+// URI SAN for TLS, or a canonical SO_PEERCRED-derived Unix UID URI. Neither
+// field is decoded from the request body.
+type vnextOwnerCallerContext struct {
+	Role      vnextOwnerCallerRole
+	Principal string
+}
+
+// vnextOwnerInternalCaller labels direct in-process dispatch used by command
+// mode and unit-test adapters. Unix and TLS listeners must never use it: they
+// derive the exact peer principal from SO_PEERCRED or the verified URI SAN.
+func vnextOwnerInternalCaller(role vnextOwnerCallerRole) vnextOwnerCallerContext {
+	return vnextOwnerCallerContext{
+		Role:      role,
+		Principal: "internal://cxld/" + role.String(),
+	}
+}
+
+func (caller vnextOwnerCallerContext) validate() error {
+	if caller.Role != vnextOwnerCallerScheduler && caller.Role != vnextOwnerCallerProducer {
+		return fmt.Errorf("caller role %s has no strict Owner authority", caller.Role)
+	}
+	return validateVNextOwnerPrincipal(caller.Principal)
+}
+
 // authorizeVNextOwnerOperation is the single strict Owner operation policy.
 // Callers must apply it before selecting a local Owner or a remote gateway so
 // a denied request can neither mutate durable state nor consume a privileged
@@ -43,6 +69,8 @@ func authorizeVNextOwnerOperation(
 	case vnextOwnerCallerScheduler:
 		switch operation {
 		case vnextOwnerRPCOperationReserve,
+			vnextOwnerRPCOperationIssueProducerCapability,
+			vnextOwnerRPCOperationRevokeProducerCapability,
 			vnextOwnerRPCOperationCommit,
 			vnextOwnerRPCOperationAbort,
 			vnextOwnerRPCOperationInventory,
@@ -53,7 +81,7 @@ func authorizeVNextOwnerOperation(
 		}
 	case vnextOwnerCallerProducer:
 		switch operation {
-		case vnextOwnerRPCOperationSeal, vnextOwnerRPCOperationAbort:
+		case vnextOwnerRPCOperationSeal, vnextOwnerRPCOperationProducerAbort:
 			allowed = true
 		}
 	case vnextOwnerCallerReader, vnextOwnerCallerUnknown:

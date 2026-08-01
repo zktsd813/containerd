@@ -29,12 +29,35 @@ var (
 )
 
 func (policy vnextOwnerUnixListenerPolicy) authenticate(conn net.Conn) error {
+	_, err := policy.authenticateCaller(conn)
+	return err
+}
+
+func (policy vnextOwnerUnixListenerPolicy) authenticateCaller(
+	conn net.Conn,
+) (vnextOwnerCallerContext, error) {
 	switch policy.Role {
 	case vnextOwnerCallerProducer:
-		return nil
+		uid, err := vnextOwnerUnixPeerUID(conn)
+		if err != nil {
+			return vnextOwnerCallerContext{}, vnextOwnerServiceFailure(
+				"unix-authentication",
+				vnextOwnerServicePermissionDenied,
+				"Producer runtime peer credentials are unavailable",
+				err)
+		}
+		principal, err := vnextOwnerUnixPrincipal(policy.Role, uid)
+		if err != nil {
+			return vnextOwnerCallerContext{}, vnextOwnerServiceFailure(
+				"unix-authentication",
+				vnextOwnerServicePermissionDenied,
+				"Producer runtime peer principal is invalid",
+				err)
+		}
+		return vnextOwnerCallerContext{Role: policy.Role, Principal: principal}, nil
 	case vnextOwnerCallerScheduler:
 		if policy.RequiredSchedulerUID < 0 {
-			return vnextOwnerServiceFailure(
+			return vnextOwnerCallerContext{}, vnextOwnerServiceFailure(
 				"unix-authentication",
 				vnextOwnerServicePermissionDenied,
 				"Scheduler control UID is not configured",
@@ -42,14 +65,14 @@ func (policy vnextOwnerUnixListenerPolicy) authenticate(conn net.Conn) error {
 		}
 		uid, err := vnextOwnerUnixPeerUID(conn)
 		if err != nil {
-			return vnextOwnerServiceFailure(
+			return vnextOwnerCallerContext{}, vnextOwnerServiceFailure(
 				"unix-authentication",
 				vnextOwnerServicePermissionDenied,
 				"Scheduler control peer credentials are unavailable",
 				err)
 		}
 		if int64(uid) != policy.RequiredSchedulerUID {
-			return vnextOwnerServiceFailure(
+			return vnextOwnerCallerContext{}, vnextOwnerServiceFailure(
 				"unix-authentication",
 				vnextOwnerServicePermissionDenied,
 				fmt.Sprintf(
@@ -57,9 +80,17 @@ func (policy vnextOwnerUnixListenerPolicy) authenticate(conn net.Conn) error {
 					uid, policy.RequiredSchedulerUID),
 				nil)
 		}
-		return nil
+		principal, err := vnextOwnerUnixPrincipal(policy.Role, uid)
+		if err != nil {
+			return vnextOwnerCallerContext{}, vnextOwnerServiceFailure(
+				"unix-authentication",
+				vnextOwnerServicePermissionDenied,
+				"Scheduler control peer principal is invalid",
+				err)
+		}
+		return vnextOwnerCallerContext{Role: policy.Role, Principal: principal}, nil
 	default:
-		return vnextOwnerServiceFailure(
+		return vnextOwnerCallerContext{}, vnextOwnerServiceFailure(
 			"unix-authentication",
 			vnextOwnerServicePermissionDenied,
 			"Unix listener has no authorized role",

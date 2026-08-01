@@ -427,7 +427,7 @@ func decodeVNextOwnerGatewayCall(
 	}
 	if request.TimeoutMillis != 0 {
 		return vnextOwnerGatewayCall{}, errors.New(
-			"VNext Owner protocol v2 does not support timeoutMillis; it must be zero")
+			"VNext Owner protocol v3 does not support timeoutMillis; it must be zero")
 	}
 	raw, err := vnextOwnerRPCPayload(operation, request)
 	if err != nil {
@@ -494,6 +494,30 @@ func decodeVNextOwnerGatewayCall(
 				return err
 			},
 		}, nil
+	case vnextOwnerRPCOperationIssueProducerCapability:
+		decoded, err := decodeVNextOwnerRPCIssueProducerCapabilityRequest(raw)
+		if err != nil {
+			return vnextOwnerGatewayCall{}, err
+		}
+		return vnextOwnerGatewayCall{
+			key: vnextOwnerGatewayRouteKey{decoded.Operation.OwnerID, decoded.Operation.OwnerEpoch},
+			invoke: func(ctx context.Context, client *vnextOwnerClient) error {
+				_, err := client.IssueProducerCapability(ctx, decoded)
+				return err
+			},
+		}, nil
+	case vnextOwnerRPCOperationRevokeProducerCapability:
+		decoded, err := decodeVNextOwnerRPCRevokeProducerCapabilityRequest(raw)
+		if err != nil {
+			return vnextOwnerGatewayCall{}, err
+		}
+		return vnextOwnerGatewayCall{
+			key: vnextOwnerGatewayRouteKey{decoded.Operation.OwnerID, decoded.Operation.OwnerEpoch},
+			invoke: func(ctx context.Context, client *vnextOwnerClient) error {
+				_, err := client.RevokeProducerCapability(ctx, decoded)
+				return err
+			},
+		}, nil
 	case vnextOwnerRPCOperationSeal:
 		decoded, err := decodeVNextOwnerRPCSealRequest(raw)
 		if err != nil {
@@ -504,6 +528,17 @@ func decodeVNextOwnerGatewayCall(
 			invoke: func(ctx context.Context, client *vnextOwnerClient) error {
 				_, err := client.SealVNextCheckpoint(ctx, decoded)
 				return err
+			},
+		}, nil
+	case vnextOwnerRPCOperationProducerAbort:
+		identity, capability, err := decodeVNextOwnerRPCProducerAbortRequest(raw)
+		if err != nil {
+			return vnextOwnerGatewayCall{}, err
+		}
+		return vnextOwnerGatewayCall{
+			key: vnextOwnerGatewayRouteKey{identity.OwnerID, identity.OwnerEpoch},
+			invoke: func(ctx context.Context, client *vnextOwnerClient) error {
+				return client.ProducerAbortVNextCheckpoint(ctx, identity, capability)
 			},
 		}, nil
 	case vnextOwnerRPCOperationCommit, vnextOwnerRPCOperationAbort:
@@ -551,6 +586,13 @@ func (gateway *vnextOwnerGateway) dispatch(
 	request daemonRequest,
 	callerRole vnextOwnerCallerRole,
 ) execResponse {
+	return gateway.dispatchCaller(request, vnextOwnerInternalCaller(callerRole))
+}
+
+func (gateway *vnextOwnerGateway) dispatchCaller(
+	request daemonRequest,
+	caller vnextOwnerCallerContext,
+) execResponse {
 	startedAt := time.Now()
 	operation := strings.TrimSpace(request.Operation)
 	failure := func(code vnextOwnerServiceErrorCode, detail string, cause error) execResponse {
@@ -564,7 +606,11 @@ func (gateway *vnextOwnerGateway) dispatch(
 		return failure(vnextOwnerServiceInvalidRequest,
 			"operation is not a strict VNext Owner operation", nil)
 	}
-	if err := authorizeVNextOwnerOperation(callerRole, operation); err != nil {
+	if err := caller.validate(); err != nil {
+		return failure(vnextOwnerServicePermissionDenied,
+			"caller principal is not authenticated", err)
+	}
+	if err := authorizeVNextOwnerOperation(caller.Role, operation); err != nil {
 		return failure(vnextOwnerServicePermissionDenied,
 			"caller is not authorized for this Owner operation", err)
 	}
@@ -585,7 +631,7 @@ func (gateway *vnextOwnerGateway) dispatch(
 	if local {
 		// The exact local incarnation is always authoritative in-process. No
 		// route-file entry may shadow it, and this branch performs no network I/O.
-		response := runCommandWithVNextOwnerRPCRole(request, localRPC, callerRole)
+		response := runCommandWithVNextOwnerRPCCaller(request, localRPC, caller)
 		response.Operation = operation
 		if response.DurationMicros < 0 {
 			response.DurationMicros = 0
@@ -598,11 +644,11 @@ func (gateway *vnextOwnerGateway) dispatch(
 			fmt.Sprintf("no exact route for Owner incarnation %q/%d", call.key.OwnerID, call.key.OwnerEpoch),
 			errVNextAuthority)
 	}
-	transport, transportConfigured := route.transports[callerRole]
+	transport, transportConfigured := route.transports[caller.Role]
 	if !transportConfigured || transport == nil || vnextProducerInterfaceIsNil(transport) {
 		return failure(
 			vnextOwnerServicePermissionDenied,
-			fmt.Sprintf("no %s gateway identity is configured", callerRole),
+			fmt.Sprintf("no %s gateway identity is configured", caller.Role),
 			nil)
 	}
 	select {
@@ -614,6 +660,11 @@ func (gateway *vnextOwnerGateway) dispatch(
 	}
 
 	capture := &vnextOwnerGatewayCaptureTransport{delegate: transport}
+	// A remote hop is a new authenticated principal. In particular, a Producer
+	// capability routed remotely must name the URI SAN of this gateway's
+	// outbound Producer certificate. This gateway deliberately provides no
+	// delegation proof and does not claim to preserve the inbound Unix UID or
+	// TLS URI SAN across the hop.
 	client, err := newVNextOwnerClient(capture)
 	if err != nil {
 		return failure(vnextOwnerServiceUnavailable,
@@ -652,11 +703,22 @@ func runCommandWithVNextOwnerGatewayRole(
 	gateway *vnextOwnerGateway,
 	callerRole vnextOwnerCallerRole,
 ) execResponse {
-	operation := strings.TrimSpace(request.Operation)
+	return runCommandWithVNextOwnerGatewayCaller(
+		request, localRPC, gateway, vnextOwnerInternalCaller(callerRole))
+}
+
+func runCommandWithVNextOwnerGatewayCaller(
+	request daemonRequest,
+	localRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
+	caller vnextOwnerCallerContext,
+) execResponse {
+	operation := daemonRequestOperation(request)
 	if gateway != nil && isVNextOwnerRPCOperation(operation) {
-		return gateway.dispatch(request, callerRole)
+		return gateway.dispatchCaller(request, caller)
 	}
-	return runCommandWithVNextOwnerRPCRole(request, localRPC, callerRole)
+	return runCommandWithVNextOwnerBoundaryCaller(
+		request, localRPC, localRPC != nil || gateway != nil, caller)
 }
 
 func validateVNextOwnerGatewaySuccess(response execResponse, operation string) error {

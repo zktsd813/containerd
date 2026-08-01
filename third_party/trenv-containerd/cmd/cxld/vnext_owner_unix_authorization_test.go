@@ -104,6 +104,64 @@ func TestVNextOwnerSchedulerUnixSocketUsesExactPeerUID(t *testing.T) {
 	}
 }
 
+func TestVNextOwnerUnixCallerPrincipalUsesExactPeerUID(t *testing.T) {
+	for _, policy := range []vnextOwnerUnixListenerPolicy{
+		vnextOwnerRuntimeUnixPolicy,
+		{
+			Role:                 vnextOwnerCallerScheduler,
+			RequiredSchedulerUID: int64(os.Getuid()),
+		},
+	} {
+		t.Run(policy.Role.String(), func(t *testing.T) {
+			socketPath := filepath.Join(t.TempDir(), "peer.sock")
+			listener, err := net.ListenUnix(
+				"unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			result := make(chan struct {
+				caller vnextOwnerCallerContext
+				err    error
+			}, 1)
+			go func() {
+				conn, err := listener.AcceptUnix()
+				if err != nil {
+					result <- struct {
+						caller vnextOwnerCallerContext
+						err    error
+					}{err: err}
+					return
+				}
+				defer conn.Close()
+				caller, err := policy.authenticateCaller(conn)
+				result <- struct {
+					caller vnextOwnerCallerContext
+					err    error
+				}{caller: caller, err: err}
+			}()
+			client, err := net.DialUnix(
+				"unix", nil, &net.UnixAddr{Name: socketPath, Net: "unix"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			got := <-result
+			if got.err != nil {
+				t.Fatal(got.err)
+			}
+			wantPrincipal, err := vnextOwnerUnixPrincipal(policy.Role, uint32(os.Getuid()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.caller.Role != policy.Role || got.caller.Principal != wantPrincipal {
+				t.Fatalf("Unix caller=%#v, want role=%s principal=%q",
+					got.caller, policy.Role, wantPrincipal)
+			}
+		})
+	}
+}
+
 func TestSchedulerControlUIDConfigurationHasNoMalformedFallback(t *testing.T) {
 	const unsetName = "CXLD_TEST_SCHEDULER_UID_UNSET_91B9F52D"
 	old, existed := os.LookupEnv(unsetName)
