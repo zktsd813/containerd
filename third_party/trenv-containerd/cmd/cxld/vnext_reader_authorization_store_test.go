@@ -525,7 +525,7 @@ func TestVNextReaderAuthorizationStoreClonesRetainedStringsAndRuns(t *testing.T)
 	if err != nil {
 		t.Fatalf("prepare aliased authorization: %v", err)
 	}
-	stored := store.byID[acquired.Authorization.RestoreAuthorizationID].Acquired
+	stored := store.byID[acquired.Authorization.RestoreAuthorizationID].acquired
 	checks := []struct {
 		name   string
 		input  string

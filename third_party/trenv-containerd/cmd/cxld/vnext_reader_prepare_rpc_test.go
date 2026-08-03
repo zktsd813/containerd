@@ -766,6 +766,38 @@ func TestVNextReaderPrepareMapsConflictEntryAndByteCapacity(t *testing.T) {
 	}
 }
 
+func TestVNextReaderPrepareMapsPermanentFenceToDefinitiveConflict(t *testing.T) {
+	fixture := newVNextReaderPrepareTestFixture(t)
+	status, err := fixture.store.StatusAndFencePreparedExact(fixture.acquired)
+	if err != nil || status.State != vnextReaderPreparedStatusNotPreparedFenced ||
+		!reflect.DeepEqual(status.Prepared, vnextReaderPreparedAuthorization{}) {
+		t.Fatalf("seed NOT_PREPARED_FENCED status=%#v err=%v", status, err)
+	}
+
+	body, failure := fixture.rpc.Handle(
+		context.Background(), vnextReaderPrepareTestPrincipal, fixture.frame)
+	if len(body) != 0 || failure == nil ||
+		failure.Code != vnextReaderPrepareConflictError ||
+		failure.Acceptance != vnextReaderPrepareDefinitelyNotAccepted ||
+		!errors.Is(failure, errVNextReaderAuthorizationNotPreparedFenced) {
+		t.Fatalf("late fenced PREPARE body=%q failure=%#v", body, failure)
+	}
+	if fixture.verifier.callCount() != 1 {
+		t.Fatalf("late fenced PREPARE verifier calls = %d, want 1",
+			fixture.verifier.callCount())
+	}
+	if _, err := fixture.store.LookupPreparedExact(
+		fixture.acquired, 150); !errors.Is(
+		err, errVNextReaderAuthorizationNotPreparedFenced) {
+		t.Fatalf("late fenced PREPARE installed a receipt: %v", err)
+	}
+	again, err := fixture.store.StatusAndFencePreparedExact(fixture.acquired)
+	if err != nil || again.State != vnextReaderPreparedStatusNotPreparedFenced ||
+		!reflect.DeepEqual(again.Prepared, vnextReaderPreparedAuthorization{}) {
+		t.Fatalf("late PREPARE changed permanent fence: status=%#v err=%v", again, err)
+	}
+}
+
 func TestVNextReaderPrepareEncodeFailureAfterStoreIsAmbiguous(t *testing.T) {
 	fixture := newVNextReaderPrepareTestFixture(t)
 	fixture.rpc.encodeResponse = func(vnextReaderPrepareResponse) ([]byte, error) {

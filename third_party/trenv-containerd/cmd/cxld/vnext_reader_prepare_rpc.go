@@ -341,7 +341,8 @@ func mapVNextReaderPrepareStoreError(err error) *vnextReaderPrepareRPCError {
 	code := vnextReaderPrepareInvalidRequest
 	acceptance := vnextReaderPrepareDefinitelyNotAccepted
 	switch {
-	case errors.Is(err, errVNextReaderAuthorizationConflict):
+	case errors.Is(err, errVNextReaderAuthorizationConflict),
+		errors.Is(err, errVNextReaderAuthorizationNotPreparedFenced):
 		code = vnextReaderPrepareConflictError
 	case errors.Is(err, errVNextReaderAuthorizationStoreFull),
 		errors.Is(err, errVNextReaderAuthorizationStoreRetainedBytesFull):
@@ -416,7 +417,36 @@ func validateVNextReaderPrepareAcquired(
 	acquired vnextReaderAcquiredAuthorization,
 	nowEpochMillis int64,
 ) error {
-	if err := validateVNextReaderAcquiredAuthorization(acquired, nowEpochMillis); err != nil {
+	return validateVNextReaderPrepareAcquiredAtOptionalTime(
+		acquired, &nowEpochMillis)
+}
+
+// validateVNextReaderPrepareAcquiredStructure applies the complete portable
+// PREPARE ACQUIRED contract without consulting a receiver wall clock. It is
+// shared with reconciliation so a malformed record can neither become
+// PREPARED nor consume a permanent NOT_PREPARED_FENCED store entry.
+func validateVNextReaderPrepareAcquiredStructure(
+	acquired vnextReaderAcquiredAuthorization,
+) error {
+	return validateVNextReaderPrepareAcquiredAtOptionalTime(acquired, nil)
+}
+
+// validateVNextReaderPrepareAcquiredAtOptionalTime keeps the time-aware
+// PREPARE and clock-free status paths on one structural validation contract.
+// A nil validationTime omits only the comparison with receiver wall time; the
+// ACQUIRED interval itself and every portable root/digest field remain
+// mandatory.
+func validateVNextReaderPrepareAcquiredAtOptionalTime(
+	acquired vnextReaderAcquiredAuthorization,
+	validationTime *int64,
+) error {
+	var err error
+	if validationTime == nil {
+		err = validateVNextReaderAcquiredAuthorizationStructure(acquired)
+	} else {
+		err = validateVNextReaderAcquiredAuthorization(acquired, *validationTime)
+	}
+	if err != nil {
 		return err
 	}
 	if allVNextReaderZero(acquired.Authorization.Root.DeviceTableDigest[:]) {

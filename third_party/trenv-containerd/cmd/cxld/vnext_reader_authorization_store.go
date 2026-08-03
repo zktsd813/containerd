@@ -74,6 +74,22 @@ type vnextReaderPreparedAuthorization struct {
 	PreparationState vnextReaderPreparationState
 }
 
+type vnextReaderAuthorizationStoreEntryKind uint8
+
+const (
+	vnextReaderAuthorizationStoreEntryPrepared vnextReaderAuthorizationStoreEntryKind = iota + 1
+	vnextReaderAuthorizationStoreEntryNotPreparedFenced
+)
+
+// vnextReaderAuthorizationStoreEntry is one process-lifetime, never-evicted
+// decision for an authorization ID. A fenced entry retains the same full
+// ACQUIRED identity and conservative charge as a PREPARED entry, but is not a
+// prepared receipt and grants no mapping or lifecycle authority.
+type vnextReaderAuthorizationStoreEntry struct {
+	kind     vnextReaderAuthorizationStoreEntryKind
+	acquired vnextReaderAcquiredAuthorization
+}
+
 type vnextReaderAuthorizationStoreConfig struct {
 	MaxEntries       int
 	MaxRetainedBytes uint64
@@ -96,7 +112,7 @@ type vnextReaderAuthorizationStore struct {
 	maxEntries       int
 	maxRetainedBytes uint64
 	retainedBytes    uint64
-	byID             map[string]vnextReaderPreparedAuthorization
+	byID             map[string]vnextReaderAuthorizationStoreEntry
 }
 
 func newVNextReaderAuthorizationStore(
@@ -126,7 +142,7 @@ func newVNextReaderAuthorizationStore(
 	return &vnextReaderAuthorizationStore{
 		maxEntries:       config.MaxEntries,
 		maxRetainedBytes: config.MaxRetainedBytes,
-		byID:             make(map[string]vnextReaderPreparedAuthorization, initialMapCapacity),
+		byID:             make(map[string]vnextReaderAuthorizationStoreEntry, initialMapCapacity),
 	}, nil
 }
 
@@ -155,34 +171,33 @@ func (store *vnextReaderAuthorizationStore) Prepare(
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if current, exists := store.byID[authorizationID]; exists {
-		if !equalVNextReaderAcquiredAuthorization(current.Acquired, acquired) {
+		if !equalVNextReaderAcquiredAuthorization(current.acquired, acquired) {
 			return vnextReaderPreparedAuthorization{}, 0, fmt.Errorf(
 				"authorization %q: %w",
 				authorizationID, errVNextReaderAuthorizationConflict)
 		}
-		return cloneVNextReaderPreparedAuthorization(current),
-			vnextReaderPreparationExactReplay, nil
+		switch current.kind {
+		case vnextReaderAuthorizationStoreEntryPrepared:
+			return vnextReaderPreparedAuthorizationFromStoreEntry(current),
+				vnextReaderPreparationExactReplay, nil
+		case vnextReaderAuthorizationStoreEntryNotPreparedFenced:
+			return vnextReaderPreparedAuthorization{}, 0, fmt.Errorf(
+				"authorization %q: %w",
+				authorizationID, errVNextReaderAuthorizationNotPreparedFenced)
+		default:
+			return vnextReaderPreparedAuthorization{}, 0, fmt.Errorf(
+				"authorization %q has an invalid internal store entry", authorizationID)
+		}
 	}
-	if len(store.byID) >= store.maxEntries {
-		return vnextReaderPreparedAuthorization{}, 0, fmt.Errorf(
-			"capacity %d: %w", store.maxEntries, errVNextReaderAuthorizationStoreFull)
+	entry := vnextReaderAuthorizationStoreEntry{
+		kind:     vnextReaderAuthorizationStoreEntryPrepared,
+		acquired: acquired,
 	}
-	if store.retainedBytes > store.maxRetainedBytes ||
-		retainedCharge > store.maxRetainedBytes-store.retainedBytes {
-		return vnextReaderPreparedAuthorization{}, 0, fmt.Errorf(
-			"retained %d bytes plus authorization charge %d exceeds capacity %d: %w",
-			store.retainedBytes,
-			retainedCharge,
-			store.maxRetainedBytes,
-			errVNextReaderAuthorizationStoreRetainedBytesFull)
+	if err := store.installVNextReaderAuthorizationEntryLocked(
+		authorizationID, entry, retainedCharge); err != nil {
+		return vnextReaderPreparedAuthorization{}, 0, err
 	}
-	prepared := vnextReaderPreparedAuthorization{
-		Acquired:         acquired,
-		PreparationState: vnextReaderPreparationPrepared,
-	}
-	store.byID[authorizationID] = prepared
-	store.retainedBytes += retainedCharge
-	return cloneVNextReaderPreparedAuthorization(prepared),
+	return vnextReaderPreparedAuthorizationFromStoreEntry(entry),
 		vnextReaderPreparationInstalled, nil
 }
 
@@ -210,13 +225,48 @@ func (store *vnextReaderAuthorizationStore) LookupPreparedExact(
 		return vnextReaderPreparedAuthorization{}, fmt.Errorf(
 			"authorization %q: %w", authorizationID, errVNextReaderAuthorizationNotFound)
 	}
-	if current.PreparationState != vnextReaderPreparationPrepared ||
-		!equalVNextReaderAcquiredAuthorization(current.Acquired, acquired) {
+	if !equalVNextReaderAcquiredAuthorization(current.acquired, acquired) {
 		return vnextReaderPreparedAuthorization{}, fmt.Errorf(
 			"authorization %q: %w",
 			authorizationID, errVNextReaderAuthorizationIdentityMismatch)
 	}
-	return cloneVNextReaderPreparedAuthorization(current), nil
+	switch current.kind {
+	case vnextReaderAuthorizationStoreEntryPrepared:
+		return vnextReaderPreparedAuthorizationFromStoreEntry(current), nil
+	case vnextReaderAuthorizationStoreEntryNotPreparedFenced:
+		return vnextReaderPreparedAuthorization{}, fmt.Errorf(
+			"authorization %q: %w",
+			authorizationID, errVNextReaderAuthorizationNotPreparedFenced)
+	default:
+		return vnextReaderPreparedAuthorization{}, fmt.Errorf(
+			"authorization %q has an invalid internal store entry", authorizationID)
+	}
+}
+
+// installVNextReaderAuthorizationEntryLocked atomically charges and installs
+// one new never-evicted decision. The caller must hold store.mu and must have
+// checked that authorizationID is absent.
+func (store *vnextReaderAuthorizationStore) installVNextReaderAuthorizationEntryLocked(
+	authorizationID string,
+	entry vnextReaderAuthorizationStoreEntry,
+	retainedCharge uint64,
+) error {
+	if len(store.byID) >= store.maxEntries {
+		return fmt.Errorf(
+			"capacity %d: %w", store.maxEntries, errVNextReaderAuthorizationStoreFull)
+	}
+	if store.retainedBytes > store.maxRetainedBytes ||
+		retainedCharge > store.maxRetainedBytes-store.retainedBytes {
+		return fmt.Errorf(
+			"retained %d bytes plus authorization charge %d exceeds capacity %d: %w",
+			store.retainedBytes,
+			retainedCharge,
+			store.maxRetainedBytes,
+			errVNextReaderAuthorizationStoreRetainedBytesFull)
+	}
+	store.byID[authorizationID] = entry
+	store.retainedBytes += retainedCharge
+	return nil
 }
 
 func validateVNextReaderAcquiredAuthorization(
@@ -226,6 +276,43 @@ func validateVNextReaderAcquiredAuthorization(
 	if nowEpochMillis < 0 {
 		return errors.New("VNext Reader authorization validation time is negative")
 	}
+	if err := validateVNextReaderAcquiredAuthorizationIdentityAndInterval(
+		acquired); err != nil {
+		return err
+	}
+	if nowEpochMillis < acquired.IssuedAtEpochMillis {
+		return errors.New("VNext Reader authorization issue time is in the future")
+	}
+	if nowEpochMillis >= acquired.ExpiresAtEpochMillis {
+		return errors.New("VNext Reader authorization is expired")
+	}
+	if err := validateVNextReaderPreparedRoot(acquired.Authorization.Root); err != nil {
+		return fmt.Errorf("validate VNext Reader ACQUIRED root: %w", err)
+	}
+	return nil
+}
+
+// validateVNextReaderAcquiredAuthorizationStructure validates the full exact
+// Scheduler ACQUIRED identity and its internally valid time interval without
+// comparing that interval with a receiver wall clock. Reconciliation/status
+// may therefore preserve a permanent decision after expiry, while Prepare and
+// LookupPreparedExact continue to use the time-aware wrapper above.
+func validateVNextReaderAcquiredAuthorizationStructure(
+	acquired vnextReaderAcquiredAuthorization,
+) error {
+	if err := validateVNextReaderAcquiredAuthorizationIdentityAndInterval(
+		acquired); err != nil {
+		return err
+	}
+	if err := validateVNextReaderPreparedRoot(acquired.Authorization.Root); err != nil {
+		return fmt.Errorf("validate VNext Reader ACQUIRED root: %w", err)
+	}
+	return nil
+}
+
+func validateVNextReaderAcquiredAuthorizationIdentityAndInterval(
+	acquired vnextReaderAcquiredAuthorization,
+) error {
 	if err := validateVNextReaderRequest(vnextReaderRequest{
 		RestoreAuthorizationID: acquired.Authorization.RestoreAuthorizationID,
 		CheckpointID:           acquired.Authorization.CheckpointID,
@@ -263,15 +350,6 @@ func validateVNextReaderAcquiredAuthorization(
 	if acquired.IssuedAtEpochMillis < 0 ||
 		acquired.ExpiresAtEpochMillis <= acquired.IssuedAtEpochMillis {
 		return errors.New("VNext Reader authorization time interval is invalid")
-	}
-	if nowEpochMillis < acquired.IssuedAtEpochMillis {
-		return errors.New("VNext Reader authorization issue time is in the future")
-	}
-	if nowEpochMillis >= acquired.ExpiresAtEpochMillis {
-		return errors.New("VNext Reader authorization is expired")
-	}
-	if err := validateVNextReaderPreparedRoot(acquired.Authorization.Root); err != nil {
-		return fmt.Errorf("validate VNext Reader ACQUIRED root: %w", err)
 	}
 	return nil
 }
@@ -494,6 +572,15 @@ func cloneVNextReaderPreparedAuthorization(
 	cloned := prepared
 	cloned.Acquired = cloneVNextReaderAcquiredAuthorization(prepared.Acquired)
 	return cloned
+}
+
+func vnextReaderPreparedAuthorizationFromStoreEntry(
+	entry vnextReaderAuthorizationStoreEntry,
+) vnextReaderPreparedAuthorization {
+	return cloneVNextReaderPreparedAuthorization(vnextReaderPreparedAuthorization{
+		Acquired:         entry.acquired,
+		PreparationState: vnextReaderPreparationPrepared,
+	})
 }
 
 func equalVNextReaderAcquiredAuthorization(
