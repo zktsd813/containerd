@@ -570,12 +570,21 @@ func TestVNextReaderRequiresActiveArmedBeforeCrossDeviceExactReadAndMaterializes
 	if materializedPath == "" {
 		t.Fatal("CRIU remap runner was not invoked")
 	}
+	invocationWorkspace := filepath.Dir(materializedPath)
+	if filepath.Dir(invocationWorkspace) != workDirectory ||
+		invocationWorkspace == workDirectory {
+		t.Fatalf("CRIU remap was not isolated below configured root: %q",
+			materializedPath)
+	}
 	if invokedTarget.TargetContainerID() != fixture.request.TargetContainerID {
 		t.Fatalf("CRIU Invoke target=%q, want exact validated target %q",
 			invokedTarget.TargetContainerID(), fixture.request.TargetContainerID)
 	}
 	if _, err := os.Stat(materializedPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ephemeral CRIU remap was not removed: %v", err)
+	}
+	if _, err := os.Stat(invocationWorkspace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ephemeral CRIU invocation workspace was not removed: %v", err)
 	}
 }
 

@@ -147,23 +147,35 @@ func (runner vnextReaderCRIURemapRunner) RunAuthorizedVNextPublication(
 	target vnextReaderExecutionTarget,
 	directory *vnextLocalDAXDirectory,
 	verified vnextReaderVerifiedPublication,
-) error {
-	if runner.Invoke == nil {
-		return errors.New("VNext reader CRIU invocation is unavailable")
-	}
+) (returnErr error) {
 	if err := validateVNextReaderIdentity(
 		"VNext reader execution target", target.TargetContainerID()); err != nil {
 		return err
 	}
+	if runner.Invoke == nil {
+		return errors.New("VNext reader CRIU invocation is unavailable")
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	path, cleanup, err := directory.materializeVNextCRIUCompleteRemap(
-		runner.WorkDirectory, verified.Publication)
+	workspace, err := createVNextReaderInvocationWorkspace(
+		runner.WorkDirectory, target)
 	if err != nil {
-		return fmt.Errorf("materialize authorized VNext CRIU remap: %w", err)
+		return err
 	}
-	defer cleanup()
+	path, cleanup, err := directory.materializeVNextCRIUCompleteRemap(
+		workspace.path, verified.Publication)
+	if err != nil {
+		return appendVNextReaderInvocationCleanupError(
+			fmt.Errorf("materialize authorized VNext CRIU remap: %w", err),
+			workspace.cleanup())
+	}
+	defer func() {
+		// The remap must disappear before its now-empty private workspace.
+		cleanup()
+		returnErr = appendVNextReaderInvocationCleanupError(
+			returnErr, workspace.cleanup())
+	}()
 	if err := runner.Invoke(ctx, target, path, verified); err != nil {
 		return fmt.Errorf("run authorized VNext CRIU restore adapter: %w", err)
 	}
