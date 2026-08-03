@@ -215,9 +215,7 @@ func TestResolveDirectPseudoMMImportPlanBuildsV5RestoreMap(t *testing.T) {
 	publication.ArtifactID = strings.Repeat("artifact-", 64)
 	publication.CheckpointPath = imagePath
 	publication.DaxDevice = "/dev/dax-writer-must-not-leak"
-	if err := writeJSONFile(filepath.Join(restoreRoot, "publication.reader.json"), publication); err != nil {
-		t.Fatal(err)
-	}
+	writeStrictReaderPublication(t, restoreRoot, publication)
 	localDevice := filepath.Join(restoreRoot, "reader-dax")
 	config := daemonConfig{
 		WorkingDirectory: filepath.Join(restoreRoot, "work"),

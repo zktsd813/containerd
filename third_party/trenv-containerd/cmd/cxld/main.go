@@ -1,7 +1,6 @@
 package main
 
 import (
-	"archive/tar"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -552,12 +551,17 @@ func resolveMetadata(ctx context.Context, req metadataResolveRequest, config dae
 		return metadataResolveResponse{}, errors.New("metadata resolve reader container is empty")
 	}
 	transport := strings.TrimSpace(config.ArtifactTransport)
+	if transport == "" {
+		transport = "dax-manifest"
+	}
 	requestedTransport := strings.TrimSpace(req.ArtifactTransport)
 	if requestedTransport != "" {
-		if transport != "" && requestedTransport != transport {
+		if requestedTransport != transport {
 			return metadataResolveResponse{}, fmt.Errorf("requested artifact transport %q does not match daemon transport %q", requestedTransport, transport)
 		}
-		transport = requestedTransport
+	}
+	if transport != "dax-manifest" {
+		return metadataResolveResponse{}, fmt.Errorf("unsupported artifact transport %q; only dax-manifest is supported", transport)
 	}
 
 	publications, err := fetchPeerPublications(ctx, config.MetadataPeers, fingerprint)
@@ -609,26 +613,7 @@ func resolveMetadata(ctx context.Context, req metadataResolveRequest, config dae
 		return metadataResolveResponse{Found: false}, nil
 	}
 	selected := publications[len(publications)-1]
-	readerRoot := ""
-	source := "publication-reader-network"
-	if transport == "" {
-		if selected.Version >= int(trenvpub.Version) {
-			transport = "dax-manifest"
-		} else {
-			transport = "legacy-tar"
-		}
-	}
-	if transport == "dax-manifest" {
-		if selected.Version < int(trenvpub.Version) {
-			return metadataResolveResponse{}, fmt.Errorf("publication version %d cannot use dax-manifest transport", selected.Version)
-		}
-		readerRoot, err = materializeDaxArtifact(selected, readerContainer, config)
-		source = "publication-reader-dax-manifest"
-	} else if transport == "legacy-tar" {
-		readerRoot, err = materializePeerArtifact(ctx, selected, readerContainer, config)
-	} else {
-		return metadataResolveResponse{}, fmt.Errorf("unsupported artifact transport %q", transport)
-	}
+	readerRoot, err := materializeDaxArtifact(selected, readerContainer, config)
 	if err != nil {
 		return metadataResolveResponse{}, err
 	}
@@ -641,11 +626,6 @@ func resolveMetadata(ctx context.Context, req metadataResolveRequest, config dae
 		actionRoot = ""
 	}
 	publicationPath := filepath.Join(readerRoot, "publication.reader"+trenvpub.Extension)
-	manifestSchema := ""
-	if transport == "dax-manifest" {
-		manifestSchema = directDaxManifestSchema
-	}
-
 	return metadataResolveResponse{
 		Found:                      true,
 		CheckpointID:               selected.CheckpointID,
@@ -656,12 +636,12 @@ func resolveMetadata(ctx context.Context, req metadataResolveRequest, config dae
 		CheckpointActionExportRoot: actionRoot,
 		PublicationPath:            publicationPath,
 		Fingerprint:                selected.Fingerprint,
-		Source:                     source,
+		Source:                     "publication-reader-dax-manifest",
 		CreatedAt:                  selected.CreatedAt.Format(time.RFC3339Nano),
 		ArtifactTransport:          transport,
 		PublicationID:              selected.CheckpointID,
 		ArtifactID:                 selected.ArtifactID,
-		ManifestSchema:             manifestSchema,
+		ManifestSchema:             directDaxManifestSchema,
 		Generation:                 selected.Generation,
 		WriterID:                   selected.WriterID,
 		WriterEpoch:                selected.WriterEpoch,
@@ -705,6 +685,12 @@ func fetchPeerPublications(ctx context.Context, peers []string, fingerprint stri
 			}
 			for _, publication := range publications {
 				if publication.State == "COMMITTED" && publication.Fingerprint == fingerprint {
+					if err := validateDaxPublication(publication); err != nil {
+						failures = append(
+							failures,
+							fmt.Sprintf("%s: dedup_publication_invalid: validate publication %q: %v", peer, publication.ArtifactID, err))
+						continue
+					}
 					publication.PeerURL = peer
 					results = append(results, publication)
 				}
@@ -820,124 +806,6 @@ func dedupOutcomeHasPublication(outcome dedupRunStatus, publications []metadataP
 		}
 	}
 	return false
-}
-
-func materializePeerArtifact(ctx context.Context, publication metadataPublicationRecord, readerContainer string, config daemonConfig) (string, error) {
-	if strings.TrimSpace(publication.PeerURL) == "" {
-		return "", errors.New("selected publication is missing peer URL")
-	}
-	checkpointID := strings.TrimSpace(publication.CheckpointID)
-	if checkpointID == "" {
-		return "", errors.New("selected publication is missing checkpoint id")
-	}
-	cacheRoot := filepath.Join(config.WorkingDirectory, "reader-cache", publicationCacheKey(publication))
-	cacheCommitted := filepath.Join(cacheRoot, "COMMITTED")
-	if isRegularFile(cacheCommitted) {
-		if err := materializeRestoreState(cacheRoot, checkpointID, readerContainer, publication, config); err != nil {
-			return "", err
-		}
-		return filepath.Join(config.WorkingDirectory, "restore", sanitizePathPart(readerContainer), sanitizePathPart(checkpointID)), nil
-	}
-
-	if err := os.MkdirAll(filepath.Join(config.WorkingDirectory, "reader-cache"), 0o755); err != nil {
-		return "", err
-	}
-	stageRoot, err := os.MkdirTemp(filepath.Join(config.WorkingDirectory, "reader-cache"), publicationCacheKey(publication)+".tmp.")
-	if err != nil {
-		return "", err
-	}
-	defer os.RemoveAll(stageRoot)
-
-	if err := fetchArtifactTar(ctx, publication, stageRoot); err != nil {
-		return "", err
-	}
-	if err := validateMaterializedArtifact(stageRoot, publication); err != nil {
-		return "", err
-	}
-	// Commit by rename after validation so readers never observe a partially
-	// extracted metadata bundle or action-root.
-	if err := os.RemoveAll(cacheRoot); err != nil {
-		return "", err
-	}
-	if err := os.Rename(stageRoot, cacheRoot); err != nil {
-		return "", err
-	}
-	if err := writeReaderPublication(cacheRoot, publication); err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(filepath.Join(cacheRoot, "COMMITTED"), []byte(time.Now().UTC().Format(time.RFC3339Nano)+"\n"), 0o644); err != nil {
-		return "", err
-	}
-	if err := materializeRestoreState(cacheRoot, checkpointID, readerContainer, publication, config); err != nil {
-		return "", err
-	}
-	return filepath.Join(config.WorkingDirectory, "restore", sanitizePathPart(readerContainer), sanitizePathPart(checkpointID)), nil
-}
-
-func publicationCacheKey(publication metadataPublicationRecord) string {
-	key := strings.TrimSpace(publication.ArtifactID)
-	if key == "" {
-		key = strings.TrimSpace(publication.CheckpointID)
-	}
-	return sanitizePathPart(key)
-}
-
-func fetchArtifactTar(ctx context.Context, publication metadataPublicationRecord, target string) error {
-	artifactID := strings.TrimSpace(publication.CheckpointID)
-	if artifactID == "" {
-		return errors.New("publication checkpoint id is empty")
-	}
-	endpoint := publication.PeerURL + "/v1/artifacts/" + url.PathEscape(artifactID) + ".tar"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return err
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("fetch artifact %q failed: status %s", artifactID, resp.Status)
-	}
-	return extractTar(resp.Body, target)
-}
-
-func validateMaterializedArtifact(root string, publication metadataPublicationRecord) error {
-	bundlePath := filepath.Join(root, "metadata-bundle")
-	if !isDirectory(filepath.Join(bundlePath, "image")) {
-		return errors.New("metadata bundle image directory is missing")
-	}
-	if !isRegularFile(filepath.Join(bundlePath, "bundle.json")) {
-		return errors.New("metadata bundle manifest is missing")
-	}
-	if !isRegularFile(filepath.Join(bundlePath, "placement.json")) {
-		return errors.New("metadata bundle placement is missing")
-	}
-	return nil
-}
-
-func materializeRestoreState(cacheRoot, checkpointID, readerContainer string, publication metadataPublicationRecord, config daemonConfig) error {
-	restoreRoot := filepath.Join(config.WorkingDirectory, "restore", sanitizePathPart(readerContainer), sanitizePathPart(checkpointID))
-	if err := os.RemoveAll(restoreRoot); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(restoreRoot, 0o755); err != nil {
-		return err
-	}
-	if err := copyTree(filepath.Join(cacheRoot, "metadata-bundle"), filepath.Join(restoreRoot, "metadata-bundle")); err != nil {
-		return err
-	}
-	actionRoot := filepath.Join(cacheRoot, "action-root")
-	if isDirectory(actionRoot) {
-		// The restore workdir is target-private. Metadata and action-root are
-		// copied out of the immutable cache so CRIU logs and action writes do
-		// not mutate the cached publication artifact.
-		if err := copyTree(actionRoot, filepath.Join(restoreRoot, "action-root")); err != nil {
-			return err
-		}
-	}
-	return writeReaderPublication(restoreRoot, publication)
 }
 
 func writeReaderPublication(root string, publication metadataPublicationRecord) error {
@@ -1696,7 +1564,7 @@ func listCommittedPublications(config daemonConfig, fingerprint string) ([]metad
 	}
 	var publications []metadataPublicationRecord
 	for _, entry := range entries {
-		if entry.IsDir() || (!strings.HasSuffix(entry.Name(), trenvpub.Extension) && !strings.HasSuffix(entry.Name(), ".json")) {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), trenvpub.Extension) {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
@@ -1720,26 +1588,17 @@ func listCommittedPublications(config daemonConfig, fingerprint string) ([]metad
 }
 
 func readPublicationRecord(path string) (metadataPublicationRecord, error) {
-	if filepath.Ext(path) == trenvpub.Extension {
-		pub, err := trenvpub.ReadFile(path)
-		if err != nil {
-			return metadataPublicationRecord{}, err
-		}
-		record := publicationRecordFromBinary(pub)
-		record.PublicationPath = path
-		return record, nil
+	if filepath.Ext(path) != trenvpub.Extension {
+		return metadataPublicationRecord{}, fmt.Errorf(
+			"unsupported publication path %q; only strict V5 %s publications are accepted",
+			path,
+			trenvpub.Extension)
 	}
-	data, err := os.ReadFile(path)
+	pub, err := trenvpub.ReadFile(path)
 	if err != nil {
 		return metadataPublicationRecord{}, err
 	}
-	var record metadataPublicationRecord
-	if err := json.Unmarshal(data, &record); err != nil {
-		return metadataPublicationRecord{}, err
-	}
-	if record.CheckpointID == "" {
-		record.CheckpointID = record.ArtifactID
-	}
+	record := publicationRecordFromBinary(pub)
 	record.PublicationPath = path
 	return record, nil
 }
@@ -1891,17 +1750,15 @@ func handlePublications(config daemonConfig) http.HandlerFunc {
 		}
 		portable := make([]metadataPublicationRecord, 0, len(publications))
 		for _, publication := range publications {
-			if publication.Version >= int(trenvpub.Version) {
-				if err := validateDaxPublication(publication); err != nil {
-					w.Header().Set("X-Cxld-Error-Code", "dedup_publication_invalid")
-					http.Error(
-						w,
-						fmt.Sprintf("invalid committed publication %q: %v", publication.ArtifactID, err),
-						http.StatusUnprocessableEntity)
-					return
-				}
-				publication = compactNetworkPublication(publication)
+			if err := validateDaxPublication(publication); err != nil {
+				w.Header().Set("X-Cxld-Error-Code", "dedup_publication_invalid")
+				http.Error(
+					w,
+					fmt.Sprintf("invalid committed publication %q: %v", publication.ArtifactID, err),
+					http.StatusUnprocessableEntity)
+				return
 			}
+			publication = compactNetworkPublication(publication)
 			portable = append(portable, publication)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -1972,36 +1829,6 @@ func handleDedupOutcomes(config daemonConfig) http.HandlerFunc {
 	}
 }
 
-func handleArtifact(config daemonConfig) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		name := strings.TrimPrefix(r.URL.Path, "/v1/artifacts/")
-		name = strings.TrimSuffix(name, ".tar")
-		checkpointID, err := url.PathUnescape(name)
-		if err != nil || checkpointID == "" || strings.Contains(checkpointID, "/") || strings.Contains(checkpointID, "..") {
-			http.Error(w, "invalid checkpoint id", http.StatusBadRequest)
-			return
-		}
-		publication, err := findPublicationByCheckpointID(config, checkpointID)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusNotFound)
-			return
-		}
-		if publication.Version >= int(trenvpub.Version) && strings.TrimSpace(config.ArtifactTransport) != "legacy-tar" {
-			http.Error(w, "v5 publications use manifest-only shared-DAX transport", http.StatusGone)
-			return
-		}
-		w.Header().Set("Content-Type", "application/x-tar")
-		if err := writeArtifactTar(w, publication); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
-}
-
 func handleBinaryPublication(config daemonConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -2022,176 +1849,6 @@ func handleBinaryPublication(config daemonConfig) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", trenvpub.ContentType)
 		http.ServeFile(w, r, publication.PublicationPath)
-	}
-}
-
-func writeArtifactTar(writer io.Writer, publication metadataPublicationRecord) error {
-	tw := tar.NewWriter(writer)
-	defer tw.Close()
-	// Artifact tar deliberately contains metadata/action-root only. DAX page
-	// payload remains in the shared DAX publication and is referenced by
-	// placement.json.
-	if err := addDirectoryToTar(tw, publication.MetadataBundlePath, "metadata-bundle"); err != nil {
-		return err
-	}
-	if strings.TrimSpace(publication.CheckpointActionExportRoot) != "" && isDirectory(publication.CheckpointActionExportRoot) {
-		if err := addDirectoryToTar(tw, publication.CheckpointActionExportRoot, "action-root"); err != nil {
-			return err
-		}
-	}
-	archiveName := "publication.original" + filepath.Ext(publication.PublicationPath)
-	if archiveName == "publication.original" {
-		archiveName = "publication.original"
-	}
-	return addFileToTar(tw, publication.PublicationPath, archiveName)
-}
-
-func addDirectoryToTar(tw *tar.Writer, sourceRoot, archiveRoot string) error {
-	sourceRoot = filepath.Clean(sourceRoot)
-	return filepath.Walk(sourceRoot, func(path string, info os.FileInfo, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if info == nil {
-			return nil
-		}
-		relative, err := filepath.Rel(sourceRoot, path)
-		if err != nil {
-			return err
-		}
-		name := archiveRoot
-		if relative != "." {
-			name = filepath.ToSlash(filepath.Join(archiveRoot, relative))
-		}
-		linkTarget := ""
-		if info.Mode()&os.ModeSymlink != 0 {
-			linkTarget, err = os.Readlink(path)
-			if err != nil {
-				return err
-			}
-		}
-		header, err := tar.FileInfoHeader(info, linkTarget)
-		if err != nil {
-			return err
-		}
-		header.Name = name
-		if info.IsDir() {
-			header.Name = strings.TrimSuffix(header.Name, "/") + "/"
-		}
-		if err := tw.WriteHeader(header); err != nil {
-			return err
-		}
-		if info.IsDir() || !info.Mode().IsRegular() {
-			return nil
-		}
-		file, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-		_, err = io.Copy(tw, file)
-		return err
-	})
-}
-
-func addFileToTar(tw *tar.Writer, sourcePath, archivePath string) error {
-	info, err := os.Stat(sourcePath)
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return fmt.Errorf("artifact source is not a regular file: %s", sourcePath)
-	}
-	header, err := tar.FileInfoHeader(info, "")
-	if err != nil {
-		return err
-	}
-	header.Name = archivePath
-	if err := tw.WriteHeader(header); err != nil {
-		return err
-	}
-	file, err := os.Open(sourcePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	_, err = io.Copy(tw, file)
-	return err
-}
-
-func extractTar(reader io.Reader, target string) error {
-	tr := tar.NewReader(reader)
-	for {
-		header, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		targetPath, err := safeJoin(target, header.Name)
-		if err != nil {
-			return err
-		}
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := ensureArchivePathHasNoSymlink(target, targetPath); err != nil {
-				return err
-			}
-			if err := os.MkdirAll(targetPath, os.FileMode(header.Mode).Perm()); err != nil {
-				return err
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			parent := filepath.Dir(targetPath)
-			// Reject writes through symlink parents before creating files. This
-			// keeps a malicious or malformed artifact from escaping target root.
-			if err := ensureArchivePathHasNoSymlink(target, parent); err != nil {
-				return err
-			}
-			if err := os.MkdirAll(parent, 0o755); err != nil {
-				return err
-			}
-			if err := ensureArchivePathHasNoSymlink(target, targetPath); err != nil {
-				return err
-			}
-			file, err := os.OpenFile(targetPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode).Perm())
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(file, tr); err != nil {
-				file.Close()
-				return err
-			}
-			if err := file.Close(); err != nil {
-				return err
-			}
-		case tar.TypeSymlink:
-			if header.Linkname == "" {
-				return fmt.Errorf("archive symlink %q has empty target", header.Name)
-			}
-			parent := filepath.Dir(targetPath)
-			// Symlinks are allowed as entries, but not as traversal components
-			// leading to later entries.
-			if err := ensureArchivePathHasNoSymlink(target, parent); err != nil {
-				return err
-			}
-			if err := os.MkdirAll(parent, 0o755); err != nil {
-				return err
-			}
-			if err := ensureArchivePathHasNoSymlink(target, parent); err != nil {
-				return err
-			}
-			if _, err := os.Lstat(targetPath); err == nil {
-				return fmt.Errorf("archive symlink target already exists: %q", header.Name)
-			} else if !os.IsNotExist(err) {
-				return err
-			}
-			if err := os.Symlink(header.Linkname, targetPath); err != nil {
-				return err
-			}
-		default:
-			return fmt.Errorf("unsupported archive entry type for %q", header.Name)
-		}
 	}
 }
 
@@ -2241,7 +1898,6 @@ func startMetadataServer(config daemonConfig) (*http.Server, net.Listener, error
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/publications", handlePublications(config))
 	mux.HandleFunc("/v1/dedup-outcomes", handleDedupOutcomes(config))
-	mux.HandleFunc("/v1/artifacts/", handleArtifact(config))
 	mux.HandleFunc("/v5/publications/", handleBinaryPublication(config))
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	listener, err := net.Listen("tcp", config.MetadataListen)
@@ -2743,7 +2399,7 @@ func main() {
 	readerDaxShards := flag.String("reader-dax-shards", envDefault("CXLD_READER_DAX_SHARDS", ""), "comma-separated reader-local DAX shard mappings as shard-id=/dev/daxN.0")
 	readerArtifactDaxShards := flag.String("reader-artifact-dax-shards", envDefault("CXLD_READER_ARTIFACT_DAX_SHARDS", ""), "comma-separated reader-local artifact DAX shard mappings as shard-id=/dev/daxN.0")
 	daxPlacementPolicy := flag.String("dax-placement-policy", envDefault("CXLD_DAX_PLACEMENT_POLICY", "first-fit"), "DAX placement policy for checkpoint writers: first-fit or round-robin")
-	artifactTransport := flag.String("artifact-transport", envDefault("CXLD_ARTIFACT_TRANSPORT", "dax-manifest"), "artifact transport: dax-manifest or legacy-tar")
+	artifactTransport := flag.String("artifact-transport", envDefault("CXLD_ARTIFACT_TRANSPORT", "dax-manifest"), "artifact transport; only dax-manifest is supported")
 	publicationSchemaVersion := flag.Uint64(
 		"publication-schema-version",
 		envDefaultUint64("CXLD_PUBLICATION_SCHEMA_VERSION", uint64(trenvpub.Version)),
@@ -2936,9 +2592,9 @@ func main() {
 	}
 	activeConfig = normalizeDedupConfig(activeConfig)
 	switch activeConfig.ArtifactTransport {
-	case "dax-manifest", "legacy-tar":
+	case "dax-manifest":
 	default:
-		fmt.Fprintf(os.Stderr, "invalid --artifact-transport %q; expected dax-manifest or legacy-tar\n", activeConfig.ArtifactTransport)
+		fmt.Fprintf(os.Stderr, "invalid --artifact-transport %q; only dax-manifest is supported\n", activeConfig.ArtifactTransport)
 		os.Exit(1)
 	}
 	switch activeConfig.DedupExecution {

@@ -561,6 +561,60 @@ func TestVNextReaderRejectsMissingOrMismatchedAuthorizationBeforeDAXRead(t *test
 	}
 }
 
+func TestVNextReaderLocatorRunLimitAccepts256(t *testing.T) {
+	fixture := newVNextReaderTestFixture(t)
+	authorization := vnextReaderAuthorizationWithLocatorRuns(
+		fixture.authorization, vnextReaderMaxLocatorRuns)
+	reader := &vnextAuthorizedReader{directory: fixture.directory}
+
+	pages, err := reader.validateAuthorization(fixture.request, authorization)
+	if err != nil {
+		t.Fatalf("validate %d locator runs: %v", vnextReaderMaxLocatorRuns, err)
+	}
+	if len(pages) != vnextReaderMaxLocatorRuns {
+		t.Fatalf("resolved locator pages = %d, want %d", len(pages), vnextReaderMaxLocatorRuns)
+	}
+}
+
+func TestVNextReaderLocatorRunLimitRejects257(t *testing.T) {
+	fixture := newVNextReaderTestFixture(t)
+	authorization := vnextReaderAuthorizationWithLocatorRuns(
+		fixture.authorization, vnextReaderMaxLocatorRuns+1)
+	reader := &vnextAuthorizedReader{directory: fixture.directory}
+
+	_, err := reader.validateAuthorization(fixture.request, authorization)
+	if err == nil || !strings.Contains(err.Error(), "outside 1..256") {
+		t.Fatalf("validate %d locator runs = %v, want run-count rejection", vnextReaderMaxLocatorRuns+1, err)
+	}
+}
+
+func vnextReaderAuthorizationWithLocatorRuns(
+	authorization vnextReaderAuthorization,
+	runCount int,
+) vnextReaderAuthorization {
+	authorization.Root.PublicationLocator.PublicationByteLength =
+		uint64(runCount) * cxlcheckpoint.PageSize
+	authorization.Root.PublicationLocator.PageRuns = make(
+		[]cxlcheckpoint.PublicationPageRun, runCount)
+	for index := range authorization.Root.PublicationLocator.PageRuns {
+		deviceUUID := "reader-device-a"
+		if index%2 != 0 {
+			deviceUUID = "reader-device-b"
+		}
+		authorization.Root.PublicationLocator.PageRuns[index] =
+			cxlcheckpoint.PublicationPageRun{
+				FirstPage: cxlcheckpoint.PageID{
+					OwnerID:            "reader-owner",
+					DeviceUUID:         deviceUUID,
+					AllocationRecordID: 42,
+					DataPageIndex:      uint64(10 + index/2),
+				},
+				PageCount: 1,
+			}
+	}
+	return authorization
+}
+
 func TestVNextReaderRejectsChangedExactRootOrDescriptor(t *testing.T) {
 	tests := []struct {
 		name   string

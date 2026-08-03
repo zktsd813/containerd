@@ -7,9 +7,89 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/trenvpub"
 )
+
+func writeStrictReaderPublication(t *testing.T, restoreRoot string, publication metadataPublicationRecord) string {
+	t.Helper()
+	publication.Version = int(trenvpub.Version)
+	publication.ManifestSchema = trenvpub.ManifestSchema
+	publication.DedupApplySchema = trenvpub.DedupApplySchema
+	if publication.ArtifactID == "" {
+		publication.ArtifactID = publication.CheckpointID
+	}
+	if publication.CheckpointID == "" {
+		publication.CheckpointID = publication.ArtifactID
+	}
+	if publication.Generation == 0 {
+		publication.Generation = 1
+	}
+	if publication.WriterEpoch == 0 {
+		publication.WriterEpoch = 1
+	}
+	publication.State = "COMMITTED"
+	if publication.CheckpointPhase == "" {
+		publication.CheckpointPhase = "cold"
+	}
+	if publication.Fingerprint == "" {
+		publication.Fingerprint = "reader-fixture"
+	}
+	if publication.SnapshotStartMode == "" {
+		publication.SnapshotStartMode = "switch"
+	}
+	if publication.RuntimeKind == "" {
+		publication.RuntimeKind = "nodejs:20_hybrid"
+	}
+	if publication.RuntimeFamily == "" {
+		publication.RuntimeFamily = "nodejs"
+	}
+	if publication.WriterID == "" {
+		publication.WriterID = "writer-test"
+	}
+	if publication.PageExtent.Layout == "" {
+		publication.PageExtent.Layout = "contiguous-criu-page-stream"
+	}
+	publication.ShardID = publication.PageExtent.ShardID
+	publication.DaxStartPage = publication.PageExtent.OffsetBytes / publication.PageExtent.PageSize
+	publication.DaxLengthPages = publication.PageExtent.LengthBytes / publication.PageExtent.PageSize
+	publication.PageCount = publication.PageExtent.PayloadBytes / publication.PageExtent.PageSize
+	publication.PageSize = publication.PageExtent.PageSize
+	publication.Layout = publication.PageExtent.Layout
+	publication.Shards = []trenvpub.Shard{{
+		WriterID:       publication.WriterID,
+		ShardID:        publication.PageExtent.ShardID,
+		DaxStartPage:   publication.DaxStartPage,
+		DaxLengthPages: publication.DaxLengthPages,
+		PageCount:      publication.PageCount,
+		PageSize:       publication.PageSize,
+		Layout:         publication.Layout,
+	}}
+	publication.ArtifactExtent = trenvpub.StorageExtent{
+		Role:           directArtifactExtentRole,
+		DeviceIdentity: "artifact-fixture",
+		ShardID:        "artifact-fixture",
+		LengthBytes:    4096,
+		PayloadBytes:   4096,
+		PageSize:       4096,
+		Layout:         directArtifactExtentLayout,
+	}
+	publication.Files = []trenvpub.ArtifactFile{{
+		Path:   "metadata-bundle/image/inventory.img",
+		Type:   "regular",
+		Mode:   0o644,
+		Length: 1,
+	}}
+	if publication.CreatedAt.IsZero() {
+		publication.CreatedAt = time.Unix(1, 0).UTC()
+	}
+	path := filepath.Join(restoreRoot, "publication.reader"+trenvpub.Extension)
+	if err := trenvpub.WriteFileNoReplace(path, publicationRecordToBinary(publication)); err != nil {
+		t.Fatalf("write strict reader publication: %v", err)
+	}
+	return path
+}
 
 func TestResolveDirectPseudoMMImportPlanUsesStableReaderShard(t *testing.T) {
 	restoreRoot := t.TempDir()
@@ -34,9 +114,7 @@ func TestResolveDirectPseudoMMImportPlanUsesStableReaderShard(t *testing.T) {
 			PageSize:       4096,
 		},
 	}
-	if err := writeJSONFile(filepath.Join(restoreRoot, "publication.reader.json"), publication); err != nil {
-		t.Fatal(err)
-	}
+	writeStrictReaderPublication(t, restoreRoot, publication)
 	config := daemonConfig{
 		WorkingDirectory:            filepath.Join(restoreRoot, "work"),
 		PseudoMMMaterializationRoot: filepath.Join(restoreRoot, "pseudo"),
@@ -63,7 +141,7 @@ func TestResolveDirectPseudoMMImportPlanUsesStableReaderShard(t *testing.T) {
 		t.Fatalf("unexpected materialization work path: want %q got %q", wantWork, plan.workPath)
 	}
 	wantArgs := []string{"--dax-device", "/dev/dax-reader-local", "--dax-pgoff", "32", "--import-existing-dax"}
-	args := buildDirectPseudoMMImportArgs(plan)
+	args := directReaderCriuImportArgs(plan.checkpointPath, plan.workPath, plan.daxDevice, plan.daxStartPage, "")
 	for _, value := range wantArgs {
 		if !containsDirectImportArg(args, value) {
 			t.Fatalf("import args missing %q: %#v", value, args)
@@ -80,21 +158,21 @@ func TestResolveDirectPseudoMMImportPlanSkipsLocalCheckpoint(t *testing.T) {
 	}
 }
 
-func TestRemoveDirectReaderPseudoMMIDs(t *testing.T) {
-	imagePath := t.TempDir()
-	for _, name := range []string{"pseudo_mm_id-1", "pseudo_mm_id-2", "inventory.img"} {
-		if err := os.WriteFile(filepath.Join(imagePath, name), []byte(name), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := removeDirectReaderPseudoMMIDs(imagePath); err != nil {
+func TestResolveDirectPseudoMMImportPlanRejectsLegacyJSON(t *testing.T) {
+	restoreRoot := t.TempDir()
+	imagePath := filepath.Join(restoreRoot, "metadata-bundle", "image")
+	if err := os.MkdirAll(imagePath, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(imagePath, "inventory.img")); err != nil {
-		t.Fatal("non-pseudo_mm file was removed")
+	if err := os.WriteFile(filepath.Join(restoreRoot, "publication.reader.json"), []byte(`{"version":4}`), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if matches, _ := filepath.Glob(filepath.Join(imagePath, "pseudo_mm_id-*")); len(matches) != 0 {
-		t.Fatalf("stale pseudo_mm ids remain: %#v", matches)
+	_, ok, err := resolveDirectPseudoMMImportPlan(switchRequest{
+		CheckpointPath: imagePath,
+		ContainerID:    "reader-container",
+	}, daemonConfig{})
+	if err == nil || ok || !strings.Contains(err.Error(), "legacy reader publication") {
+		t.Fatalf("expected fail-closed legacy JSON rejection, ok=%v err=%v", ok, err)
 	}
 }
 
@@ -129,9 +207,7 @@ func TestPrepareDirectReaderPseudoMMImportsOncePerKernelBoot(t *testing.T) {
 			PageSize:       4096,
 		},
 	}
-	if err := writeJSONFile(filepath.Join(restoreRoot, "publication.reader.json"), publication); err != nil {
-		t.Fatal(err)
-	}
+	writeStrictReaderPublication(t, restoreRoot, publication)
 
 	pseudoDevice := filepath.Join(restoreRoot, "pseudo-mm")
 	if err := os.WriteFile(pseudoDevice, nil, 0o600); err != nil {

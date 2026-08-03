@@ -1182,9 +1182,12 @@ func writeDirectPublication(ctx context.Context, req checkpointRequest, placemen
 	if publication == nil {
 		return nil
 	}
-	publicationPath := trenvpub.NormalizePath(strings.TrimSpace(publication.PublicationPath))
+	publicationPath := strings.TrimSpace(publication.PublicationPath)
 	if publicationPath == "" {
 		return errors.New("publication path is empty")
+	}
+	if filepath.Ext(publicationPath) != trenvpub.Extension {
+		return fmt.Errorf("publication path %q must use the strict V5 %s extension", publicationPath, trenvpub.Extension)
 	}
 	if config.WriterEpoch == 0 {
 		return errors.New("writer epoch must be non-zero for a v5 publication")
@@ -1242,88 +1245,44 @@ func writeDirectPublication(ctx context.Context, req checkpointRequest, placemen
 			Revision:           strings.TrimSpace(publication.ActionRevision),
 		}
 	}
-	if filepath.Ext(publicationPath) == trenvpub.Extension {
-		if config.DedupCheckpointMode == "sync-required" {
-			if len(record.Shards) != 1 {
-				return fmt.Errorf(
-					"sync-required dedup supports exactly one page shard, got %d",
-					len(record.Shards))
-			}
-			baseDirectory := filepath.Join(
-				dedupWorkDirectory(config),
-				"base-staging",
-				sanitizePathPart(record.ArtifactID))
-			if err := os.MkdirAll(baseDirectory, 0o755); err != nil {
-				return err
-			}
-			basePath := filepath.Join(
-				baseDirectory,
-				fmt.Sprintf("base-%d%s", record.Generation, trenvpub.Extension))
-			if err := trenvpub.WriteFileNoReplace(basePath, publicationRecordToBinary(record)); err != nil {
-				return err
-			}
-			baseRecord := record
-			baseRecord.PublicationPath = basePath
-			dedupContext := ctx
-			cancel := func() {}
-			if config.DedupTimeout > 0 {
-				dedupContext, cancel = context.WithTimeout(ctx, config.DedupTimeout)
-			}
-			defer cancel()
-			if err := runDedupPublication(
-				dedupContext,
-				config,
-				baseRecord,
-				"checkpoint-sync-required",
-				publicationPath); err != nil {
-				return fmt.Errorf("required checkpoint dedup rejected: %w", err)
-			}
-			return nil
-		}
-		return trenvpub.WriteFileNoReplace(publicationPath, publicationRecordToBinary(record))
-	}
 	if config.DedupCheckpointMode == "sync-required" {
-		return errors.New("sync-required dedup needs a binary .trpub publication path")
-	}
-	return writeDirectJSONFileNoReplace(publicationPath, record)
-}
-
-func writeDirectJSONFileNoReplace(path string, value interface{}) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	if pathExists(path) {
-		return fmt.Errorf("publication metadata already exists at %q", path)
-	}
-	data, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp.")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o644); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Link(tmpPath, path); err != nil {
-		if os.IsExist(err) {
-			return fmt.Errorf("publication metadata already exists at %q", path)
+		if len(record.Shards) != 1 {
+			return fmt.Errorf(
+				"sync-required dedup supports exactly one page shard, got %d",
+				len(record.Shards))
 		}
-		return err
+		baseDirectory := filepath.Join(
+			dedupWorkDirectory(config),
+			"base-staging",
+			sanitizePathPart(record.ArtifactID))
+		if err := os.MkdirAll(baseDirectory, 0o755); err != nil {
+			return err
+		}
+		basePath := filepath.Join(
+			baseDirectory,
+			fmt.Sprintf("base-%d%s", record.Generation, trenvpub.Extension))
+		if err := trenvpub.WriteFileNoReplace(basePath, publicationRecordToBinary(record)); err != nil {
+			return err
+		}
+		baseRecord := record
+		baseRecord.PublicationPath = basePath
+		dedupContext := ctx
+		cancel := func() {}
+		if config.DedupTimeout > 0 {
+			dedupContext, cancel = context.WithTimeout(ctx, config.DedupTimeout)
+		}
+		defer cancel()
+		if err := runDedupPublication(
+			dedupContext,
+			config,
+			baseRecord,
+			"checkpoint-sync-required",
+			publicationPath); err != nil {
+			return fmt.Errorf("required checkpoint dedup rejected: %w", err)
+		}
+		return nil
 	}
-	return nil
+	return trenvpub.WriteFileNoReplace(publicationPath, publicationRecordToBinary(record))
 }
 
 func directContainerSubpath(root string) (string, error) {

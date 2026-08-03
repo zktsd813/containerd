@@ -16,7 +16,7 @@ import (
 	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/cxlcheckpoint"
 )
 
-const vnextReaderMaxLocatorRuns = 1 << 20
+const vnextReaderMaxLocatorRuns = 256
 
 // vnextReaderRequest is the portable input to the reader authorization
 // boundary. It deliberately contains no DAX path, file descriptor, or local

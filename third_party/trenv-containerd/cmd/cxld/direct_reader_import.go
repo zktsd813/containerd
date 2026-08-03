@@ -7,18 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/containerd/containerd/third_party/trenv-containerd/pkg/trenvpub"
 )
 
 const (
-	directDaxPublicationVersion   = 4
-	directDedupPublicationVersion = 5
+	directDedupPublicationVersion = int(trenvpub.Version)
 	directRestoreMapPageSize      = uint64(4096)
 	directRestoreMapMaxExtents    = 1_000_000
 	directRestoreMapMaxBytes      = 128 << 20
@@ -84,49 +80,13 @@ func prepareDirectReaderPseudoMM(ctx context.Context, plan directPseudoMMImportP
 	if state.PID <= 0 {
 		return fmt.Errorf("reader pseudo_mm import target pid is invalid: %d", state.PID)
 	}
-	if plan.publication.Version >= directDaxPublicationVersion && plan.publication.PageExtent.Role != "" {
-		if err := validateReaderPageExtent(plan.publication, config); err != nil {
-			if len(plan.restoreMap) > 0 {
-				return newDedupRestoreError(dedupRestoreCodeDevice, err)
-			}
-			return err
+	if err := validateReaderPageExtent(plan.publication, config); err != nil {
+		if len(plan.restoreMap) > 0 {
+			return newDedupRestoreError(dedupRestoreCodeDevice, err)
 		}
-		return materializeDirectReaderPseudoMM(ctx, state, config, plan)
-	}
-	if len(plan.restoreMap) > 0 {
-		return newDedupRestoreError(
-			dedupRestoreCodePublication,
-			errors.New("V5 dedup restore cannot use the legacy reader import path"))
-	}
-	if err := os.MkdirAll(plan.workPath, 0o700); err != nil {
 		return err
 	}
-	if err := removeDirectReaderPseudoMMIDs(plan.checkpointPath); err != nil {
-		return err
-	}
-
-	mntNS, err := os.Open(fmt.Sprintf("/proc/%d/ns/mnt", state.PID))
-	if err != nil {
-		return fmt.Errorf("open reader target mount namespace: %w", err)
-	}
-	defer mntNS.Close()
-	pseudoMM, err := os.OpenFile(directPseudoMMPath, os.O_RDWR, 0)
-	if err != nil {
-		return fmt.Errorf("open reader pseudo_mm device %q: %w", directPseudoMMPath, err)
-	}
-	defer pseudoMM.Close()
-
-	args := buildDirectPseudoMMImportArgs(plan)
-	command := exec.CommandContext(ctx, nonEmptyOrDefault(state.CriuBinary, "criu"), args...)
-	command.ExtraFiles = []*os.File{mntNS, pseudoMM}
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	command.Stdout = &stdout
-	command.Stderr = &stderr
-	if err := command.Run(); err != nil {
-		return fmt.Errorf("criu reader DAX import failed: %s", commandErrorString(err, stderr.String()+"\n"+stdout.String()))
-	}
-	return nil
+	return materializeDirectReaderPseudoMM(ctx, state, config, plan)
 }
 
 func directV5DedupPublication(publication metadataPublicationRecord) (bool, error) {
@@ -288,10 +248,13 @@ func resolveDirectPseudoMMImportPlan(req switchRequest, config daemonConfig) (di
 	publicationPath := filepath.Join(restoreRoot, "publication.reader"+trenvpub.Extension)
 	if !isRegularFile(publicationPath) {
 		legacyPath := filepath.Join(restoreRoot, "publication.reader.json")
-		if !isRegularFile(legacyPath) {
-			return directPseudoMMImportPlan{}, false, nil
+		if isRegularFile(legacyPath) {
+			return directPseudoMMImportPlan{}, false, fmt.Errorf(
+				"legacy reader publication %q is unsupported; only strict V5 %s is accepted",
+				legacyPath,
+				trenvpub.Extension)
 		}
-		publicationPath = legacyPath
+		return directPseudoMMImportPlan{}, false, nil
 	}
 	publication, err := readPublicationRecord(publicationPath)
 	if err != nil {
@@ -299,27 +262,11 @@ func resolveDirectPseudoMMImportPlan(req switchRequest, config daemonConfig) (di
 	}
 
 	pageExtent := publication.PageExtent
-	if publication.Version < directDaxPublicationVersion || pageExtent.Role == "" {
-		pageSize := publication.PageSize
-		if pageSize <= 0 {
-			pageSize = int64(os.Getpagesize())
-		}
-		pageExtent = trenvpub.StorageExtent{
-			Role:           directPageExtentRole,
-			DeviceIdentity: publication.ShardID,
-			ShardID:        publication.ShardID,
-			OffsetBytes:    publication.DaxStartPage * pageSize,
-			LengthBytes:    publication.DaxLengthPages * pageSize,
-			PayloadBytes:   publication.PageCount * pageSize,
-			PageSize:       pageSize,
-		}
-	} else {
-		if publication.State != "COMMITTED" || publication.Generation == 0 || publication.WriterEpoch == 0 {
-			return directPseudoMMImportPlan{}, false, errors.New("reader publication is not a fenced COMMITTED generation")
-		}
-		if err := validateDirectStorageExtent(pageExtent, directPageExtentRole); err != nil {
-			return directPseudoMMImportPlan{}, false, fmt.Errorf("reader page extent: %w", err)
-		}
+	if publication.State != "COMMITTED" || publication.Generation == 0 || publication.WriterEpoch == 0 {
+		return directPseudoMMImportPlan{}, false, errors.New("reader publication is not a fenced COMMITTED generation")
+	}
+	if err := validateDirectStorageExtent(pageExtent, directPageExtentRole); err != nil {
+		return directPseudoMMImportPlan{}, false, fmt.Errorf("reader page extent: %w", err)
 	}
 	if pageExtent.OffsetBytes < 0 || pageExtent.LengthBytes <= 0 || pageExtent.PageSize <= 0 || pageExtent.OffsetBytes%pageExtent.PageSize != 0 {
 		return directPseudoMMImportPlan{}, false, errors.New("reader page DAX placement is invalid")
@@ -367,34 +314,4 @@ func resolveDirectPseudoMMImportPlan(req switchRequest, config daemonConfig) (di
 		restoreMapExtentCount: uint64(len(publication.BaseRestoreMap)),
 		restoreMapPageCount:   restoreMapPageCount,
 	}, true, nil
-}
-
-func buildDirectPseudoMMImportArgs(plan directPseudoMMImportPlan) []string {
-	return []string{
-		"convert",
-		"-D", plan.checkpointPath,
-		"-W", plan.workPath,
-		"-v4",
-		"-o", filepath.Join(plan.workPath, "pseudo-mm-import.log"),
-		"--inherit-fd", "fd[3]:switch-ns-mnt",
-		"--inherit-fd", "fd[4]:" + directPseudoMMInheritID,
-		"--mem-pool", "dax",
-		"--dax-device", plan.daxDevice,
-		"--dax-pgoff", strconv.FormatInt(plan.daxStartPage, 10),
-		"--import-existing-dax",
-		"--tcp-close",
-	}
-}
-
-func removeDirectReaderPseudoMMIDs(checkpointPath string) error {
-	matches, err := filepath.Glob(filepath.Join(checkpointPath, "pseudo_mm_id-*"))
-	if err != nil {
-		return err
-	}
-	for _, match := range matches {
-		if err := os.Remove(match); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove stale reader pseudo_mm id %q: %w", match, err)
-		}
-	}
-	return nil
 }

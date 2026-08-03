@@ -677,8 +677,8 @@ func applyDirectArtifactOwnership(path string, artifactFile trenvpub.ArtifactFil
 }
 
 func validateDaxPublication(publication metadataPublicationRecord) error {
-	if publication.Version < int(trenvpub.Version) {
-		return fmt.Errorf("publication version %d does not contain a DAX artifact manifest", publication.Version)
+	if publication.Version != int(trenvpub.Version) {
+		return fmt.Errorf("publication version is %d, expected %d", publication.Version, trenvpub.Version)
 	}
 	if publication.State != "COMMITTED" {
 		return fmt.Errorf("publication state %q is not COMMITTED", publication.State)
@@ -688,6 +688,12 @@ func validateDaxPublication(publication metadataPublicationRecord) error {
 			"publication manifest schema %q does not match %q",
 			publication.ManifestSchema,
 			trenvpub.ManifestSchema)
+	}
+	if publication.DedupApplySchema != trenvpub.DedupApplySchema {
+		return fmt.Errorf(
+			"publication dedup apply schema %q does not match %q",
+			publication.DedupApplySchema,
+			trenvpub.DedupApplySchema)
 	}
 	if publication.Generation == 0 || publication.WriterEpoch == 0 {
 		return errors.New("publication generation is not writer-fenced")

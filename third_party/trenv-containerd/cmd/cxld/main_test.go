@@ -1,11 +1,9 @@
 package main
 
 import (
-	"archive/tar"
-	"bytes"
 	"context"
 	"encoding/json"
-	"io"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -127,7 +125,7 @@ func writeTestPublication(t *testing.T, workDir, checkpointID, fingerprint, crea
 	imagePath := filepath.Join(bundlePath, "image")
 	checkpointPath := filepath.Join(workDir, "checkpoints", checkpointID, "image")
 	actionRoot := filepath.Join(workDir, "checkpoints", checkpointID, "work", "action-root")
-	publicationPath := filepath.Join(workDir, "checkpoints", "publication", checkpointID+".json")
+	publicationPath := filepath.Join(workDir, "checkpoints", "publication", checkpointID+trenvpub.Extension)
 	if err := os.MkdirAll(imagePath, 0o755); err != nil {
 		t.Fatalf("mkdir image: %v", err)
 	}
@@ -239,11 +237,7 @@ func writeTestPublication(t *testing.T, workDir, checkpointID, fingerprint, crea
 		}},
 		CreatedAt: parsedCreatedAt,
 	}
-	data, err := json.Marshal(record)
-	if err != nil {
-		t.Fatalf("marshal publication: %v", err)
-	}
-	if err := os.WriteFile(publicationPath, data, 0o644); err != nil {
+	if err := trenvpub.WriteFileNoReplace(publicationPath, publicationRecordToBinary(record)); err != nil {
 		t.Fatalf("write publication: %v", err)
 	}
 	record.PublicationPath = publicationPath
@@ -326,10 +320,6 @@ func TestFindPublicationByCheckpointIDPrefersDerivedDedupPublication(t *testing.
 	workDir := t.TempDir()
 	config := daemonConfig{WorkingDirectory: workDir}
 	base := writeTestPublication(t, workDir, "ckpt-a", "fp-a", "2026-05-18T00:01:00Z")
-	baseBinaryPath := filepath.Join(workDir, "checkpoints", "publication", "ckpt-a"+trenvpub.Extension)
-	if err := trenvpub.WriteFileNoReplace(baseBinaryPath, publicationRecordToBinary(base)); err != nil {
-		t.Fatalf("write base binary publication: %v", err)
-	}
 	dedup := base
 	dedup.ArtifactID = "ckpt-a-dedup"
 	dedup.CheckpointPhase = trenvpub.DedupRestoreCOWPhase
@@ -415,6 +405,9 @@ func TestRunDedupPublicationPassesDaxDeviceToLedger(t *testing.T) {
 func TestRunDedupPublicationPublishesValidatedV5Atomically(t *testing.T) {
 	workDir := t.TempDir()
 	baseRecord := writeTestPublication(t, workDir, "ckpt-sync", "fp-sync", "2026-07-28T00:00:00Z")
+	if err := os.Remove(baseRecord.PublicationPath); err != nil {
+		t.Fatalf("remove initial base publication: %v", err)
+	}
 	basePath := filepath.Join(workDir, "dedup-base"+trenvpub.Extension)
 	baseRecord.PublicationPath = basePath
 	basePublication := publicationRecordToBinary(baseRecord)
@@ -649,30 +642,29 @@ func TestResolveMetadataDoesNotUseOlderPublicationForCurrentDedupOutcome(t *test
 		StartedAt:    now,
 		FinishedAt:   now.Add(time.Second),
 	}
-	oldPublication := metadataPublicationRecord{
-		Version:          int(trenvpub.Version),
-		State:            "COMMITTED",
-		CheckpointID:     "ckpt-old",
-		ArtifactID:       "artifact-old",
-		Fingerprint:      outcome.Fingerprint,
-		Generation:       8,
-		WriterID:         "writer-old",
-		WriterEpoch:      1,
-		CheckpointPhase:  trenvpub.DedupRestoreCOWPhase,
-		DedupApplySchema: trenvpub.DedupApplySchema,
-		BaseRestoreMap: []trenvpub.RestoreExtent{{
-			Vaddr:      0x1000,
-			NrPages:    1,
-			ShardIndex: 0,
-			Type:       trenvpub.RestoreExtentTypeSharedReadonly,
-			Flags:      trenvpub.RestoreExtentFlagCOW,
-		}},
-		Stats: trenvpub.Stats{
-			RestoreMapExtentCount: 1,
-			DedupAppliedPages:     1,
-		},
-		CreatedAt: now.Add(-time.Minute),
+	oldPublication := writeTestPublication(
+		t,
+		t.TempDir(),
+		"ckpt-old",
+		outcome.Fingerprint,
+		"2026-07-28T00:00:00Z")
+	oldPublication.ArtifactID = "artifact-old"
+	oldPublication.Generation = 8
+	oldPublication.WriterID = "writer-old"
+	oldPublication.WriterEpoch = 1
+	oldPublication.CheckpointPhase = trenvpub.DedupRestoreCOWPhase
+	oldPublication.BaseRestoreMap = []trenvpub.RestoreExtent{{
+		Vaddr:      0x1000,
+		NrPages:    1,
+		ShardIndex: 0,
+		Type:       trenvpub.RestoreExtentTypeSharedReadonly,
+		Flags:      trenvpub.RestoreExtentFlagCOW,
+	}}
+	oldPublication.Stats = trenvpub.Stats{
+		RestoreMapExtentCount: 1,
+		DedupAppliedPages:     1,
 	}
+	oldPublication.CreatedAt = now.Add(-time.Minute)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/v1/publications":
@@ -732,172 +724,62 @@ func TestResolveMetadataPropagatesInvalidV5Publication(t *testing.T) {
 	}
 }
 
-func TestArtifactTarContainsReaderMetadataAndActionRoot(t *testing.T) {
-	workDir := t.TempDir()
-	record := writeTestPublication(t, workDir, "ckpt-a", "fp-a", "2026-05-18T00:00:00Z")
-
-	var buf bytes.Buffer
-	if err := writeArtifactTar(&buf, record); err != nil {
-		t.Fatalf("write artifact tar: %v", err)
+func TestReadPublicationRecordRejectsLegacyJSON(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.json")
+	if err := os.WriteFile(path, []byte(`{"version":1,"state":"COMMITTED"}`), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	tr := tar.NewReader(&buf)
-	seen := map[string]bool{}
-	symlinks := map[string]string{}
-	for {
-		header, err := tr.Next()
-		if err != nil {
-			if err == io.EOF {
-				break
+	if _, err := readPublicationRecord(path); err == nil || !strings.Contains(err.Error(), "only strict V5") {
+		t.Fatalf("expected strict V5 rejection, got %v", err)
+	}
+}
+
+func TestFetchPeerPublicationsRejectsNonV5Schema(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*metadataPublicationRecord)
+	}{
+		{
+			name: "legacy version",
+			mutate: func(record *metadataPublicationRecord) {
+				record.Version = 1
+			},
+		},
+		{
+			name: "legacy manifest schema",
+			mutate: func(record *metadataPublicationRecord) {
+				record.ManifestSchema = "trenv-publication-v4"
+			},
+		},
+		{
+			name: "legacy dedup apply schema",
+			mutate: func(record *metadataPublicationRecord) {
+				record.DedupApplySchema = "trenv-dedup-apply-v4"
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			writerWorkDir := t.TempDir()
+			record := writeTestPublication(t, writerWorkDir, "ckpt-a", "fp-a", "2026-05-18T00:00:00Z")
+			test.mutate(&record)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/publications" {
+					t.Fatalf("unexpected path: %s", r.URL.Path)
+				}
+				if r.URL.Query().Get("fingerprint") != "fp-a" {
+					t.Fatalf("unexpected fingerprint query: %s", r.URL.RawQuery)
+				}
+				_ = json.NewEncoder(w).Encode([]metadataPublicationRecord{record})
+			}))
+			defer server.Close()
+
+			_, err := fetchPeerPublications(contextWithTimeout(t), []string{server.URL}, "fp-a")
+			var rejection *dedupMetadataRejectionError
+			if !errors.As(err, &rejection) || rejection.Code != "dedup_publication_invalid" {
+				t.Fatalf("expected typed non-V5 publication rejection, got %v", err)
 			}
-			t.Fatalf("read tar: %v", err)
-		}
-		seen[header.Name] = true
-		if header.Typeflag == tar.TypeSymlink {
-			symlinks[header.Name] = header.Linkname
-		}
-	}
-	for _, name := range []string{"metadata-bundle/bundle.json", "metadata-bundle/placement.json", "metadata-bundle/image/inventory.img", "action-root/index.js", "publication.original.json"} {
-		if !seen[name] {
-			t.Fatalf("expected tar entry %q, saw %#v", name, seen)
-		}
-	}
-	if got := symlinks["action-root/1/bin/virtualenv/bin/python3"]; got != "python3.10" {
-		t.Fatalf("expected action-root symlink target python3.10, got %q in %#v", got, symlinks)
-	}
-}
-
-func TestArtifactHandlerV3DaxManifestFailsClosed(t *testing.T) {
-	workDir := t.TempDir()
-	record := writeTestV3TarPublication(t, workDir, "ckpt-v3-dax-manifest")
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/v1/artifacts/"+record.CheckpointID+".tar", nil)
-
-	handleArtifact(daemonConfig{
-		WorkingDirectory:  workDir,
-		ArtifactTransport: "dax-manifest",
-	}).ServeHTTP(recorder, request)
-
-	if recorder.Code != http.StatusGone {
-		t.Fatalf("expected v3 dax-manifest tar rejection, got status=%d body=%q", recorder.Code, recorder.Body.String())
-	}
-}
-
-func TestArtifactHandlerV3LegacyTarAllowsMetadataAndActionRoot(t *testing.T) {
-	workDir := t.TempDir()
-	record := writeTestV3TarPublication(t, workDir, "ckpt-v3-legacy-tar")
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/v1/artifacts/"+record.CheckpointID+".tar", nil)
-
-	handleArtifact(daemonConfig{
-		WorkingDirectory:  workDir,
-		ArtifactTransport: "legacy-tar",
-	}).ServeHTTP(recorder, request)
-
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("expected explicit legacy-tar mode to serve v3 artifact, got status=%d body=%q", recorder.Code, recorder.Body.String())
-	}
-	if got := recorder.Header().Get("Content-Type"); got != "application/x-tar" {
-		t.Fatalf("unexpected content type %q", got)
-	}
-	entries := map[string]bool{}
-	reader := tar.NewReader(recorder.Body)
-	for {
-		header, err := reader.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("read v3 legacy tar: %v", err)
-		}
-		entries[header.Name] = true
-	}
-	for _, name := range []string{
-		"metadata-bundle/bundle.json",
-		"metadata-bundle/placement.json",
-		"metadata-bundle/image/inventory.img",
-		"action-root/index.js",
-		"publication.original" + trenvpub.Extension,
-	} {
-		if !entries[name] {
-			t.Fatalf("expected v3 legacy tar entry %q, saw %#v", name, entries)
-		}
-	}
-}
-
-func writeTestV3TarPublication(t *testing.T, workDir, checkpointID string) metadataPublicationRecord {
-	t.Helper()
-	record := writeTestPublication(t, workDir, checkpointID, "fp-v3", "2026-07-20T00:00:00Z")
-	if err := os.Remove(record.PublicationPath); err != nil {
-		t.Fatalf("remove legacy test publication: %v", err)
-	}
-	record.Version = int(trenvpub.Version)
-	record.Generation = 1
-	record.WriterEpoch = 1
-	publicationPath := filepath.Join(workDir, "checkpoints", "publication", checkpointID+trenvpub.Extension)
-	if err := trenvpub.WriteFileNoReplace(publicationPath, publicationRecordToBinary(record)); err != nil {
-		t.Fatalf("write v3 test publication: %v", err)
-	}
-	record.PublicationPath = publicationPath
-	return record
-}
-
-func TestMetadataResolveMaterializesPeerArtifact(t *testing.T) {
-	writerWorkDir := t.TempDir()
-	readerWorkDir := t.TempDir()
-	record := writeTestPublication(t, writerWorkDir, "ckpt-a", "fp-a", "2026-05-18T00:00:00Z")
-	record.Version = 1
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/v1/publications":
-			if r.URL.Query().Get("fingerprint") != "fp-a" {
-				t.Fatalf("unexpected fingerprint query: %s", r.URL.RawQuery)
-			}
-			_ = json.NewEncoder(w).Encode([]metadataPublicationRecord{record})
-		case r.URL.Path == "/v1/dedup-outcomes":
-			_ = json.NewEncoder(w).Encode([]dedupRunStatus{})
-		case r.URL.Path == "/v1/artifacts/ckpt-a.tar":
-			if err := writeArtifactTar(w, record); err != nil {
-				t.Fatalf("write artifact: %v", err)
-			}
-		default:
-			t.Fatalf("unexpected path: %s", r.URL.Path)
-		}
-	}))
-	defer server.Close()
-
-	response, err := resolveMetadata(contextWithTimeout(t), metadataResolveRequest{
-		Fingerprint:     "fp-a",
-		ReaderContainer: "reader-container",
-	}, daemonConfig{
-		WorkingDirectory: readerWorkDir,
-		MetadataPeers:    []string{server.URL},
-	})
-	if err != nil {
-		t.Fatalf("resolve metadata: %v", err)
-	}
-	if !response.Found || response.CheckpointID != "ckpt-a" || response.Source != "publication-reader-network" {
-		t.Fatalf("unexpected metadata response: %#v", response)
-	}
-	if _, err := os.Stat(response.CheckpointPath); err != nil {
-		t.Fatalf("expected reader checkpoint path: %v", err)
-	}
-	if _, err := os.Stat(response.CheckpointActionExportRoot); err != nil {
-		t.Fatalf("expected reader action root: %v", err)
-	}
-	readerSymlink := filepath.Join(response.CheckpointActionExportRoot, "1", "bin", "virtualenv", "bin", "python3")
-	if got, err := os.Readlink(readerSymlink); err != nil || got != "python3.10" {
-		t.Fatalf("expected reader action-root symlink target python3.10, got %q err=%v", got, err)
-	}
-	cachePublication, err := readPublicationRecord(filepath.Join(readerWorkDir, "reader-cache", "ckpt-a", "publication.reader"+trenvpub.Extension))
-	if err != nil {
-		t.Fatalf("read cache publication: %v", err)
-	}
-	wantCacheCheckpointPath := filepath.Join(readerWorkDir, "reader-cache", "ckpt-a", "metadata-bundle", "image")
-	if cachePublication.CheckpointPath != wantCacheCheckpointPath {
-		t.Fatalf("cache publication checkpoint path should use final cache root: want %q, got %q", wantCacheCheckpointPath, cachePublication.CheckpointPath)
-	}
-	if strings.Contains(cachePublication.CheckpointPath, ".tmp.") {
-		t.Fatalf("cache publication should not contain staging path: %q", cachePublication.CheckpointPath)
+		})
 	}
 }
 

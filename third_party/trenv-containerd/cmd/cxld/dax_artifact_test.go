@@ -491,23 +491,6 @@ func TestResolveReaderDaxDeviceUsesDedicatedArtifactMapping(t *testing.T) {
 	}
 }
 
-func TestArtifactHandlerRejectsV5TarTransport(t *testing.T) {
-	workDir := t.TempDir()
-	fixture := newDirectDaxArtifactFixture(t)
-	fixture.publication.ArtifactID = "ckpt-v5"
-	fixture.publication.CheckpointID = "ckpt-v5"
-	publicationPath := filepath.Join(workDir, "checkpoints", "publication", "ckpt-v5"+trenvpub.Extension)
-	if err := trenvpub.WriteFileNoReplace(publicationPath, publicationRecordToBinary(fixture.publication)); err != nil {
-		t.Fatal(err)
-	}
-	recorder := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodGet, "/v1/artifacts/ckpt-v5.tar", nil)
-	handleArtifact(daemonConfig{WorkingDirectory: workDir}).ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusGone {
-		t.Fatalf("expected v3 tar transport rejection, got status=%d body=%q", recorder.Code, recorder.Body.String())
-	}
-}
-
 type directDaxArtifactFixture struct {
 	device      string
 	publication metadataPublicationRecord
