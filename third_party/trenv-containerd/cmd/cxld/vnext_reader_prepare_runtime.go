@@ -99,6 +99,9 @@ type vnextReaderPrepareRuntimeDependencies struct {
 		vnextReaderProcessIncarnation,
 		vnextReaderActivationPreparedStore,
 	) (*vnextReaderActivationStore, error)
+	newRestoreRPC func(
+		*vnextReaderActivationStore,
+	) (*vnextReaderRestoreRPC, func() error, error)
 	openLeaderReader func(vnextOwnerSchedulerAuthorityConfig) (
 		vnextOwnerSchedulerLeaderReader, func() error, error)
 	newVerifier func(
@@ -201,6 +204,8 @@ type vnextReaderPrepareRuntime struct {
 	activationProposalRPC  vnextReaderActivationTransportRPC
 	activationCommitRPC    vnextReaderActivationTransportRPC
 	activationStatusRPC    vnextReaderActivationTransportRPC
+	restoreRPC             *vnextReaderRestoreRPC
+	closeRestoreRPC        func() error
 	server                 vnextReaderPrepareRuntimeServer
 	closeLeaderReader      func() error
 	requestAdmission       chan struct{}
@@ -598,7 +603,16 @@ func defaultVNextReaderPrepareRuntimeDependencies() vnextReaderPrepareRuntimeDep
 		processIncarnationLocker: &vnextReaderProcessIncarnationFileLockAcquirer{},
 		newStore:                 newVNextReaderAuthorizationStore,
 		newActivationStore:       newVNextReaderActivationStore,
-		openLeaderReader:         openVNextReaderPrepareIndependentLeaderReader,
+		// The local data plane stays fail-closed until a separately
+		// reviewed read-only devdax source and VNext CRIU runner exist.
+		// Returning nil installs no dummy Reader and cannot consume a
+		// one-shot activation claim.
+		newRestoreRPC: func(
+			*vnextReaderActivationStore,
+		) (*vnextReaderRestoreRPC, func() error, error) {
+			return nil, nil, nil
+		},
+		openLeaderReader: openVNextReaderPrepareIndependentLeaderReader,
 		newVerifier: func(
 			config vnextReaderPrepareCurrentAuthorityConfig,
 			reader vnextOwnerSchedulerLeaderReader,
@@ -683,6 +697,7 @@ func validateVNextReaderPrepareRuntimeDependencies(
 		vnextReaderPreparedStatusNilInterface(dependencies.processIncarnationWriter) ||
 		vnextReaderPreparedStatusNilInterface(dependencies.processIncarnationLocker) ||
 		dependencies.newStore == nil || dependencies.newActivationStore == nil ||
+		dependencies.newRestoreRPC == nil ||
 		dependencies.openLeaderReader == nil ||
 		dependencies.newVerifier == nil || dependencies.newStatusVerifier == nil ||
 		dependencies.newIdentifyVerifier == nil ||
@@ -790,6 +805,35 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 		return nil, releaseProcessLock(errors.New(
 			"VNext Reader activation store constructor returned nil"))
 	}
+	restoreRPC, closeRestoreRPC, err := dependencies.newRestoreRPC(activationStore)
+	cleanupRestoreRPC := func(primary error) error {
+		if closeRestoreRPC != nil {
+			if closeErr := closeRestoreRPC(); closeErr != nil {
+				primary = appendVNextReaderPrepareRuntimeError(
+					primary,
+					fmt.Errorf("close local VNext Reader restore RPC: %w", closeErr))
+			}
+			closeRestoreRPC = nil
+		}
+		return releaseProcessLock(primary)
+	}
+	if err != nil {
+		return nil, cleanupRestoreRPC(fmt.Errorf(
+			"construct optional local VNext Reader restore RPC: %w", err))
+	}
+	if restoreRPC == nil && closeRestoreRPC != nil {
+		return nil, cleanupRestoreRPC(errors.New(
+			"nil local VNext Reader restore RPC returned a close function"))
+	}
+	if restoreRPC != nil && closeRestoreRPC == nil {
+		return nil, cleanupRestoreRPC(errors.New(
+			"local VNext Reader restore RPC returned no close function"))
+	}
+	if restoreRPC != nil &&
+		(restoreRPC.reader == nil || restoreRPC.reader.activationStore != activationStore) {
+		return nil, cleanupRestoreRPC(errors.New(
+			"local VNext Reader restore RPC does not use the runtime activation store"))
+	}
 	reader, closeReader, err := dependencies.openLeaderReader(
 		canonical.SchedulerAuthority)
 	if err != nil {
@@ -802,7 +846,7 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 					fmt.Errorf("close partial VNext Reader PREPARE etcd reader: %w", closeErr))
 			}
 		}
-		return nil, releaseProcessLock(primary)
+		return nil, cleanupRestoreRPC(primary)
 	}
 	if vnextReaderPreparedStatusNilInterface(reader) || closeReader == nil {
 		primary := errors.New(
@@ -814,14 +858,14 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 					fmt.Errorf("close partial VNext Reader PREPARE etcd reader: %w", closeErr))
 			}
 		}
-		return nil, releaseProcessLock(primary)
+		return nil, cleanupRestoreRPC(primary)
 	}
 	cleanupReader := func(primary error) error {
 		if closeErr := closeReader(); closeErr != nil {
 			primary = appendVNextReaderPrepareRuntimeError(
 				primary, fmt.Errorf("close VNext Reader PREPARE etcd reader: %w", closeErr))
 		}
-		return releaseProcessLock(primary)
+		return cleanupRestoreRPC(primary)
 	}
 	verifierConfig := vnextReaderPrepareCurrentAuthorityConfig{
 		LeaderKey:            canonical.SchedulerAuthority.LeaderKey,
@@ -1042,12 +1086,29 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 		activationProposalRPC:  activationProposalRPC,
 		activationCommitRPC:    activationCommitRPC,
 		activationStatusRPC:    activationStatusRPC,
+		restoreRPC:             restoreRPC,
+		closeRestoreRPC:        closeRestoreRPC,
 		server:                 server,
 		closeLeaderReader:      closeReader,
 		requestAdmission:       requestAdmission,
 		largeFrameAdmission:    largeAdmission,
 		schedulerByPrincipal:   canonical.SchedulerByPrincipal,
 	}, nil
+}
+
+// localRestoreRPC is sampled once by main before the Unix accept loops start.
+// The returned pointer is immutable for the runtime lifetime, so local
+// dispatch needs no package global and introduces no test-visible global race.
+func (runtime *vnextReaderPrepareRuntime) localRestoreRPC() *vnextReaderRestoreRPC {
+	if runtime == nil {
+		return nil
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.closed || runtime.stopCalled {
+		return nil
+	}
+	return runtime.restoreRPC
 }
 
 // openVNextReaderPrepareIndependentLeaderReader always creates a dedicated
@@ -1084,6 +1145,9 @@ func (runtime *vnextReaderPrepareRuntime) Stop() error {
 	}
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
+	if runtime.activationStore != nil {
+		runtime.activationStore.CloseFirstReadAdmission()
+	}
 	if runtime.closed || runtime.stopCalled {
 		return runtime.stopErr
 	}
@@ -1094,8 +1158,11 @@ func (runtime *vnextReaderPrepareRuntime) Stop() error {
 	return runtime.stopErr
 }
 
-// Close is terminal and ordered: listener Stop, actual handler Wait, then the
-// independent etcd client close. It continues through every stage on error.
+// Close is terminal and ordered: listener Stop, actual control-handler Wait,
+// local restore resource close, then the independent etcd client close. Main
+// calls it only after the runtime Unix accept and request wait groups drain,
+// so the local restore resource cannot close beneath an admitted request. It
+// continues through every stage on error.
 func (runtime *vnextReaderPrepareRuntime) Close() error {
 	if runtime == nil {
 		return nil
@@ -1104,6 +1171,9 @@ func (runtime *vnextReaderPrepareRuntime) Close() error {
 	defer runtime.mu.Unlock()
 	if runtime.closed {
 		return nil
+	}
+	if runtime.activationStore != nil {
+		runtime.activationStore.CloseFirstReadAdmission()
 	}
 	if !runtime.stopCalled {
 		runtime.stopCalled = true
@@ -1114,6 +1184,12 @@ func (runtime *vnextReaderPrepareRuntime) Close() error {
 	closeErr := runtime.stopErr
 	if runtime.server != nil {
 		runtime.server.Wait()
+	}
+	if runtime.closeRestoreRPC != nil {
+		if err := runtime.closeRestoreRPC(); err != nil {
+			closeErr = appendVNextReaderPrepareRuntimeError(
+				closeErr, fmt.Errorf("close local VNext Reader restore RPC: %w", err))
+		}
 	}
 	if runtime.closeLeaderReader != nil {
 		if err := runtime.closeLeaderReader(); err != nil {
@@ -1135,6 +1211,7 @@ func (runtime *vnextReaderPrepareRuntime) Close() error {
 		}
 	}
 	runtime.server = nil
+	runtime.closeRestoreRPC = nil
 	runtime.closeLeaderReader = nil
 	runtime.service = nil
 	runtime.rpc = nil
@@ -1148,6 +1225,7 @@ func (runtime *vnextReaderPrepareRuntime) Close() error {
 	runtime.activationProposalRPC = nil
 	runtime.activationCommitRPC = nil
 	runtime.activationStatusRPC = nil
+	runtime.restoreRPC = nil
 	runtime.activationService = nil
 	runtime.activationVerifier = nil
 	runtime.activationStore = nil

@@ -57,6 +57,7 @@ type daemonRequest struct {
 	Container                            *containerRequest         `json:"container,omitempty"`
 	Cleanup                              *cleanupContainersRequest `json:"cleanupContainers,omitempty"`
 	MetadataResolve                      *metadataResolveRequest   `json:"metadataResolve,omitempty"`
+	VNextReaderRestore                   json.RawMessage           `json:"vnextReaderRestore,omitempty"`
 	VNextOwnerReserve                    json.RawMessage           `json:"vnextOwnerReserve,omitempty"`
 	VNextOwnerIssueProducerCapability    json.RawMessage           `json:"vnextOwnerIssueProducerCapability,omitempty"`
 	VNextOwnerCapabilityIssueStatusFence json.RawMessage           `json:"vnextOwnerProducerCapabilityIssueStatusAndFence,omitempty"`
@@ -376,6 +377,25 @@ func runCommand(req daemonRequest) execResponse {
 		vnextOwnerInternalCaller(vnextOwnerCallerProducer))
 }
 
+// runCommandWithVNextRuntimeBoundariesCaller keeps the local Reader data
+// plane separate from Owner gateway dispatch. Reader restore is always local;
+// only strict Owner operations may leave through the Owner gateway.
+func runCommandWithVNextRuntimeBoundariesCaller(
+	req daemonRequest,
+	vnextOwnerRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
+	vnextReaderRestoreRPC *vnextReaderRestoreRPC,
+	caller vnextOwnerCallerContext,
+) execResponse {
+	operation := daemonRequestOperation(req)
+	if gateway != nil && isVNextOwnerRPCOperation(operation) {
+		return gateway.dispatchCaller(req, caller)
+	}
+	return runCommandWithVNextReaderRestoreBoundaryCaller(
+		req, vnextOwnerRPC, vnextOwnerRPC != nil || gateway != nil,
+		vnextReaderRestoreRPC, caller)
+}
+
 func runCommandWithVNextOwnerRPCRole(
 	req daemonRequest,
 	vnextOwnerRPC *vnextOwnerRPC,
@@ -398,6 +418,17 @@ func runCommandWithVNextOwnerBoundaryCaller(
 	req daemonRequest,
 	vnextOwnerRPC *vnextOwnerRPC,
 	vnextOwnerActive bool,
+	caller vnextOwnerCallerContext,
+) (resp execResponse) {
+	return runCommandWithVNextReaderRestoreBoundaryCaller(
+		req, vnextOwnerRPC, vnextOwnerActive, nil, caller)
+}
+
+func runCommandWithVNextReaderRestoreBoundaryCaller(
+	req daemonRequest,
+	vnextOwnerRPC *vnextOwnerRPC,
+	vnextOwnerActive bool,
+	vnextReaderRestoreRPC *vnextReaderRestoreRPC,
 	caller vnextOwnerCallerContext,
 ) (resp execResponse) {
 	startedAt := time.Now()
@@ -460,6 +491,9 @@ func runCommandWithVNextOwnerBoundaryCaller(
 			return execResponse{Ok: false, Error: "metadataResolve operation requires metadataResolve request"}
 		}
 		return runMetadataResolveRequest(*req.MetadataResolve, req.TimeoutMillis, activeConfig)
+	case vnextReaderRestoreOperation:
+		return runVNextReaderRestoreRPC(
+			req.VNextReaderRestore, req.TimeoutMillis, vnextReaderRestoreRPC)
 	case vnextOwnerRPCOperationReserve,
 		vnextOwnerRPCOperationIssueProducerCapability,
 		vnextOwnerRPCOperationProducerCapabilityIssueStatusAndFence,
@@ -2087,6 +2121,21 @@ func serveAdmittedConnWithVNextOwnerGatewayPolicyLimits(
 	readTimeout time.Duration,
 	writeTimeout time.Duration,
 ) {
+	serveAdmittedConnWithVNextRuntimeBoundariesPolicyLimits(
+		conn, vnextOwnerRPC, gateway, nil, unixPolicy, largeAdmission,
+		readTimeout, writeTimeout)
+}
+
+func serveAdmittedConnWithVNextRuntimeBoundariesPolicyLimits(
+	conn net.Conn,
+	vnextOwnerRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
+	vnextReaderRestoreRPC *vnextReaderRestoreRPC,
+	unixPolicy vnextOwnerUnixListenerPolicy,
+	largeAdmission chan struct{},
+	readTimeout time.Duration,
+	writeTimeout time.Duration,
+) {
 	caller, err := unixPolicy.authenticateCaller(conn)
 	if err != nil {
 		defer conn.Close()
@@ -2097,8 +2146,8 @@ func serveAdmittedConnWithVNextOwnerGatewayPolicyLimits(
 		writeDaemonResponse(conn, respBody)
 		return
 	}
-	serveAuthenticatedDaemonConnWithVNextOwnerGatewayCallerLimits(
-		conn, vnextOwnerRPC, gateway, caller, largeAdmission,
+	serveAuthenticatedDaemonConnWithVNextRuntimeBoundariesCallerLimits(
+		conn, vnextOwnerRPC, gateway, vnextReaderRestoreRPC, caller, largeAdmission,
 		readTimeout, writeTimeout)
 }
 
@@ -2125,6 +2174,21 @@ func serveAuthenticatedDaemonConnWithVNextOwnerGatewayCallerLimits(
 	readTimeout time.Duration,
 	writeTimeout time.Duration,
 ) {
+	serveAuthenticatedDaemonConnWithVNextRuntimeBoundariesCallerLimits(
+		conn, vnextOwnerRPC, gateway, nil, caller, largeAdmission,
+		readTimeout, writeTimeout)
+}
+
+func serveAuthenticatedDaemonConnWithVNextRuntimeBoundariesCallerLimits(
+	conn net.Conn,
+	vnextOwnerRPC *vnextOwnerRPC,
+	gateway *vnextOwnerGateway,
+	vnextReaderRestoreRPC *vnextReaderRestoreRPC,
+	caller vnextOwnerCallerContext,
+	largeAdmission chan struct{},
+	readTimeout time.Duration,
+	writeTimeout time.Duration,
+) {
 	defer conn.Close()
 	body, releaseLarge, err := readDaemonRequestFrame(conn, largeAdmission, readTimeout)
 	if err != nil {
@@ -2139,7 +2203,7 @@ func serveAuthenticatedDaemonConnWithVNextOwnerGatewayCallerLimits(
 	}
 	defer releaseLarge()
 
-	req, err := decodeDaemonRequest(body)
+	req, err := decodeDaemonRequestWithVNextReaderRestore(body)
 	if err != nil {
 		_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 		resp, _ := json.Marshal(execResponse{
@@ -2151,8 +2215,8 @@ func serveAuthenticatedDaemonConnWithVNextOwnerGatewayCallerLimits(
 		return
 	}
 
-	respBody, _ := json.Marshal(runCommandWithVNextOwnerGatewayCaller(
-		req, vnextOwnerRPC, gateway, caller))
+	respBody, _ := json.Marshal(runCommandWithVNextRuntimeBoundariesCaller(
+		req, vnextOwnerRPC, gateway, vnextReaderRestoreRPC, caller))
 	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	writeDaemonResponse(conn, respBody)
 }
@@ -2318,6 +2382,7 @@ func (server *daemonUnixServer) close() {
 func (server *daemonUnixServer) acceptLoop(
 	vnextOwnerRPC *vnextOwnerRPC,
 	gateway *vnextOwnerGateway,
+	vnextReaderRestoreRPC *vnextReaderRestoreRPC,
 	requestWG *sync.WaitGroup,
 ) {
 	var acceptRetryDelay time.Duration
@@ -2347,10 +2412,11 @@ func (server *daemonUnixServer) acceptLoop(
 		go func(admittedConn net.Conn) {
 			defer requestWG.Done()
 			defer func() { <-daemonRequestAdmission }()
-			serveAdmittedConnWithVNextOwnerGatewayPolicyLimits(
+			serveAdmittedConnWithVNextRuntimeBoundariesPolicyLimits(
 				admittedConn,
 				vnextOwnerRPC,
 				gateway,
+				vnextReaderRestoreRPC,
 				server.policy,
 				daemonLargeAdmission,
 				daemonFrameReadTimeout,
@@ -2889,13 +2955,9 @@ func main() {
 			"failed to start six-operation VNext Reader control runtime: %v\n", err)
 		os.Exit(1)
 	}
+	var vnextReaderRestoreRPC *vnextReaderRestoreRPC
 	if vnextReaderPrepareRuntime != nil {
-		defer func() {
-			if err := vnextReaderPrepareRuntime.Close(); err != nil {
-				fmt.Fprintf(os.Stderr,
-					"failed to close six-operation VNext Reader control runtime: %v\n", err)
-			}
-		}()
+		vnextReaderRestoreRPC = vnextReaderPrepareRuntime.localRestoreRPC()
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -2908,7 +2970,8 @@ func main() {
 		go func(unixServer *daemonUnixServer) {
 			defer acceptWG.Done()
 			unixServer.acceptLoop(
-				activeVNextOwnerRPC, activeVNextOwnerGateway, &requestWG)
+				activeVNextOwnerRPC, activeVNextOwnerGateway,
+				vnextReaderRestoreRPC, &requestWG)
 		}(server)
 	}
 	<-sigCh
@@ -2930,6 +2993,9 @@ func main() {
 		server.close()
 	}
 	acceptWG.Wait()
+	// Local Reader restore contexts are bounded to the same 30-second daemon
+	// frame-stage limit. Drain them before Close releases their DAX/runner
+	// resources; Stop above has already rejected every unconsumed first read.
 	requestWG.Wait()
 	if vnextOwnerTLSServer != nil {
 		vnextOwnerTLSServer.Wait()

@@ -208,6 +208,27 @@ func openVNextReaderPrepareRuntimeTest(
 		config, requestAdmission, largeAdmission, dependencies)
 }
 
+func vnextReaderPrepareRuntimeTestRestoreRPC(
+	t *testing.T,
+	fixture *vnextReaderTestFixture,
+	store *vnextReaderActivationStore,
+) *vnextReaderRestoreRPC {
+	t.Helper()
+	reader, err := newVNextAuthorizedReader(
+		fixture.directory,
+		store,
+		vnextRegularFileReaderDAXSource{},
+		&vnextReaderTestRunner{})
+	if err != nil {
+		t.Fatalf("construct runtime test authorized Reader: %v", err)
+	}
+	rpc, err := newVNextReaderRestoreRPC(reader)
+	if err != nil {
+		t.Fatalf("construct runtime test restore RPC: %v", err)
+	}
+	return rpc
+}
+
 func TestVNextReaderPrepareRuntimeDisabledHasZeroSideEffects(t *testing.T) {
 	input := vnextReaderPrepareRuntimeInput{
 		Enabled:                         "false",
@@ -259,6 +280,9 @@ func TestVNextReaderPrepareAndStatusRuntimeDependenciesAreAllOrNothing(
 		},
 		"activation store": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.newActivationStore = nil
+		},
+		"local restore RPC": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newRestoreRPC = nil
 		},
 		"leader reader": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.openLeaderReader = nil
@@ -1084,12 +1108,24 @@ func TestVNextReaderPrepareRuntimePartialConstructionCleansUpInReverseOrder(
 	t *testing.T,
 ) {
 	config := validVNextReaderPrepareRuntimeConfig(t)
+	fixture := newVNextReaderTestFixture(t)
 	startErr := errors.New("test TLS start failure")
 	stopErr := errors.New("test partial listener stop failure")
 	etcdErr := errors.New("test independent etcd close failure")
+	restoreErr := errors.New("test local restore close failure")
 	events := &vnextReaderPrepareRuntimeTestEvents{}
 	dependencies, closeCalls := vnextReaderPrepareRuntimeTestDependencies(
 		events, etcdErr)
+	var restoreCloseCalls int64
+	dependencies.newRestoreRPC = func(
+		store *vnextReaderActivationStore,
+	) (*vnextReaderRestoreRPC, func() error, error) {
+		return vnextReaderPrepareRuntimeTestRestoreRPC(t, fixture, store), func() error {
+			atomic.AddInt64(&restoreCloseCalls, 1)
+			events.add("restore-close")
+			return restoreErr
+		}, nil
+	}
 	server := &vnextReaderPrepareRuntimeTestServer{
 		events: events, stopErr: stopErr,
 	}
@@ -1110,21 +1146,156 @@ func TestVNextReaderPrepareRuntimePartialConstructionCleansUpInReverseOrder(
 	if runtime != nil {
 		t.Fatalf("partial construction returned runtime %#v", runtime)
 	}
-	for _, target := range []error{startErr, stopErr, etcdErr} {
+	for _, target := range []error{startErr, stopErr, etcdErr, restoreErr} {
 		if !errors.Is(err, target) {
 			t.Fatalf("partial construction error %v lost %v", err, target)
 		}
 	}
-	wantEvents := []string{"listener-stop", "handler-wait", "etcd-close"}
+	wantEvents := []string{
+		"listener-stop", "handler-wait", "etcd-close", "restore-close",
+	}
 	if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
 		t.Fatalf("partial cleanup order = %v, want %v", got, wantEvents)
 	}
 	if atomic.LoadInt64(&server.stopCalls) != 1 ||
 		atomic.LoadInt64(&server.waitCalls) != 1 ||
-		atomic.LoadInt64(closeCalls) != 1 {
-		t.Fatalf("partial cleanup calls stop=%d wait=%d etcd=%d, want 1 each",
+		atomic.LoadInt64(closeCalls) != 1 ||
+		atomic.LoadInt64(&restoreCloseCalls) != 1 {
+		t.Fatalf("partial cleanup calls stop=%d wait=%d etcd=%d restore=%d, want 1 each",
 			atomic.LoadInt64(&server.stopCalls),
-			atomic.LoadInt64(&server.waitCalls), atomic.LoadInt64(closeCalls))
+			atomic.LoadInt64(&server.waitCalls), atomic.LoadInt64(closeCalls),
+			atomic.LoadInt64(&restoreCloseCalls))
+	}
+}
+
+func TestVNextReaderPrepareRuntimeRestoreFactoryFailureClosesPartialResource(
+	t *testing.T,
+) {
+	config := validVNextReaderPrepareRuntimeConfig(t)
+	factoryErr := errors.New("test local restore factory failure")
+	closeErr := errors.New("test partial local restore close failure")
+	dependencies := defaultVNextReaderPrepareRuntimeDependencies()
+	dependencies.processIncarnationPath = "/test/process-incarnation"
+	var releaseCalls int64
+	dependencies.processIncarnationLocker =
+		&vnextReaderPrepareRuntimeTestIncarnationLocker{
+			acquire: func(string) (vnextReaderProcessIncarnationLock, error) {
+				return &vnextReaderPrepareRuntimeTestIncarnationLock{
+					release: func() error {
+						atomic.AddInt64(&releaseCalls, 1)
+						return nil
+					},
+				}, nil
+			},
+		}
+	var restoreCloseCalls int64
+	dependencies.newRestoreRPC = func(
+		*vnextReaderActivationStore,
+	) (*vnextReaderRestoreRPC, func() error, error) {
+		return nil, func() error {
+			atomic.AddInt64(&restoreCloseCalls, 1)
+			return closeErr
+		}, factoryErr
+	}
+	dependencies.openLeaderReader = func(
+		vnextOwnerSchedulerAuthorityConfig,
+	) (vnextOwnerSchedulerLeaderReader, func() error, error) {
+		t.Fatal("restore factory failure reached independent etcd open")
+		return nil, nil, nil
+	}
+	runtime, err := openVNextReaderPrepareRuntimeTest(config, dependencies)
+	if runtime != nil || !errors.Is(err, factoryErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("partial restore factory returned runtime=%#v err=%v", runtime, err)
+	}
+	if atomic.LoadInt64(&restoreCloseCalls) != 1 ||
+		atomic.LoadInt64(&releaseCalls) != 1 {
+		t.Fatalf("partial restore cleanup close/release=%d/%d, want 1/1",
+			atomic.LoadInt64(&restoreCloseCalls), atomic.LoadInt64(&releaseCalls))
+	}
+}
+
+func TestVNextReaderPrepareRuntimeRejectsInvalidRestoreResourceContract(
+	t *testing.T,
+) {
+	config := validVNextReaderPrepareRuntimeConfig(t)
+	fixture := newVNextReaderTestFixture(t)
+	foreignStore, _ := vnextReaderArmTestRestore(t, fixture)
+	tests := []struct {
+		name       string
+		wantError  string
+		wantCloses int64
+		factory    func(*vnextReaderActivationStore) (
+			*vnextReaderRestoreRPC, func() error, error)
+	}{
+		{
+			name:      "RPC-without-close",
+			wantError: "returned no close function",
+			factory: func(
+				store *vnextReaderActivationStore,
+			) (*vnextReaderRestoreRPC, func() error, error) {
+				return vnextReaderPrepareRuntimeTestRestoreRPC(
+					t, fixture, store), nil, nil
+			},
+		},
+		{
+			name:       "nil-RPC-with-close",
+			wantError:  "nil local VNext Reader restore RPC",
+			wantCloses: 1,
+			factory: func(
+				*vnextReaderActivationStore,
+			) (*vnextReaderRestoreRPC, func() error, error) {
+				return nil, func() error { return nil }, nil
+			},
+		},
+		{
+			name:       "foreign-activation-store",
+			wantError:  "does not use the runtime activation store",
+			wantCloses: 1,
+			factory: func(
+				*vnextReaderActivationStore,
+			) (*vnextReaderRestoreRPC, func() error, error) {
+				return vnextReaderPrepareRuntimeTestRestoreRPC(
+					t, fixture, foreignStore), func() error { return nil }, nil
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dependencies := defaultVNextReaderPrepareRuntimeDependencies()
+			dependencies.processIncarnationPath = "/test/process-incarnation"
+			dependencies.processIncarnationLocker =
+				&vnextReaderPrepareRuntimeTestIncarnationLocker{}
+			var closeCalls int64
+			dependencies.newRestoreRPC = func(
+				store *vnextReaderActivationStore,
+			) (*vnextReaderRestoreRPC, func() error, error) {
+				rpc, closeResource, err := test.factory(store)
+				if closeResource == nil {
+					return rpc, nil, err
+				}
+				return rpc, func() error {
+					atomic.AddInt64(&closeCalls, 1)
+					return closeResource()
+				}, err
+			}
+			dependencies.openLeaderReader = func(
+				vnextOwnerSchedulerAuthorityConfig,
+			) (vnextOwnerSchedulerLeaderReader, func() error, error) {
+				t.Fatal("invalid restore resource contract reached etcd open")
+				return nil, nil, nil
+			}
+			runtime, err := openVNextReaderPrepareRuntimeTest(
+				config, dependencies)
+			if runtime != nil || err == nil ||
+				!strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("invalid restore contract returned runtime=%#v err=%v",
+					runtime, err)
+			}
+			if got := atomic.LoadInt64(&closeCalls); got != test.wantCloses {
+				t.Fatalf("invalid restore contract close calls=%d, want %d",
+					got, test.wantCloses)
+			}
+		})
 	}
 }
 
@@ -1166,10 +1337,25 @@ func TestVNextReaderPrepareRuntimeVerifierFailureClosesOnlyOpenedEtcd(
 	}
 }
 
-func TestVNextReaderPrepareRuntimeShutdownDrainsBeforeEtcdClose(t *testing.T) {
+func TestVNextReaderPrepareRuntimeShutdownDrainsBeforeRestoreAndEtcdClose(
+	t *testing.T,
+) {
 	config := validVNextReaderPrepareRuntimeConfig(t)
+	fixture := newVNextReaderTestFixture(t)
 	events := &vnextReaderPrepareRuntimeTestEvents{}
 	dependencies, closeCalls := vnextReaderPrepareRuntimeTestDependencies(events, nil)
+	var restoreRPC *vnextReaderRestoreRPC
+	var restoreCloseCalls int64
+	dependencies.newRestoreRPC = func(
+		store *vnextReaderActivationStore,
+	) (*vnextReaderRestoreRPC, func() error, error) {
+		restoreRPC = vnextReaderPrepareRuntimeTestRestoreRPC(t, fixture, store)
+		return restoreRPC, func() error {
+			atomic.AddInt64(&restoreCloseCalls, 1)
+			events.add("restore-close")
+			return nil
+		}, nil
+	}
 	dependencies.processIncarnationLocker =
 		&vnextReaderPrepareRuntimeTestIncarnationLocker{
 			acquire: func(string) (vnextReaderProcessIncarnationLock, error) {
@@ -1207,8 +1393,21 @@ func TestVNextReaderPrepareRuntimeShutdownDrainsBeforeEtcdClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open Reader PREPARE runtime: %v", err)
 	}
+	if runtime.localRestoreRPC() != restoreRPC ||
+		restoreRPC.reader.activationStore != runtime.activationStore {
+		t.Fatal("runtime did not retain the exact activation-bound local restore RPC")
+	}
 	if err := runtime.Stop(); err != nil {
 		t.Fatalf("stop Reader PREPARE listener: %v", err)
+	}
+	if runtime.localRestoreRPC() != nil {
+		t.Fatal("stopped runtime continued admitting local restore RPC lookups")
+	}
+	runtime.activationStore.mu.RLock()
+	firstReadClosed := runtime.activationStore.firstReadAdmissionClosed
+	runtime.activationStore.mu.RUnlock()
+	if !firstReadClosed {
+		t.Fatal("runtime Stop did not close first-read admission")
 	}
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- runtime.Close() }()
@@ -1219,6 +1418,9 @@ func TestVNextReaderPrepareRuntimeShutdownDrainsBeforeEtcdClose(t *testing.T) {
 	}
 	if atomic.LoadInt64(closeCalls) != 0 {
 		t.Fatal("independent etcd reader closed while a handler was draining")
+	}
+	if atomic.LoadInt64(&restoreCloseCalls) != 0 {
+		t.Fatal("local restore resource closed while a handler was draining")
 	}
 	if got := events.snapshot(); !reflect.DeepEqual(
 		got, []string{"listener-stop", "handler-wait"}) {
@@ -1234,7 +1436,7 @@ func TestVNextReaderPrepareRuntimeShutdownDrainsBeforeEtcdClose(t *testing.T) {
 		t.Fatal("runtime Close did not finish after handler drain")
 	}
 	wantEvents := []string{
-		"listener-stop", "handler-wait", "etcd-close",
+		"listener-stop", "handler-wait", "restore-close", "etcd-close",
 		"incarnation-remove", "incarnation-unlock",
 	}
 	if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
@@ -1245,10 +1447,12 @@ func TestVNextReaderPrepareRuntimeShutdownDrainsBeforeEtcdClose(t *testing.T) {
 	}
 	if atomic.LoadInt64(&server.stopCalls) != 1 ||
 		atomic.LoadInt64(&server.waitCalls) != 1 ||
-		atomic.LoadInt64(closeCalls) != 1 {
-		t.Fatalf("idempotent cleanup calls stop=%d wait=%d etcd=%d",
+		atomic.LoadInt64(closeCalls) != 1 ||
+		atomic.LoadInt64(&restoreCloseCalls) != 1 {
+		t.Fatalf("idempotent cleanup calls stop=%d wait=%d restore=%d etcd=%d",
 			atomic.LoadInt64(&server.stopCalls),
-			atomic.LoadInt64(&server.waitCalls), atomic.LoadInt64(closeCalls))
+			atomic.LoadInt64(&server.waitCalls),
+			atomic.LoadInt64(&restoreCloseCalls), atomic.LoadInt64(closeCalls))
 	}
 }
 
@@ -1275,6 +1479,11 @@ func TestVNextReaderPrepareRuntimeStartsRealMTLSListener(t *testing.T) {
 		runtime.activationCommitRPC == nil || runtime.activationStatusRPC == nil {
 		_ = runtime.Close()
 		t.Fatal("successful startup omitted a required Reader component")
+	}
+	if runtime.restoreRPC != nil || runtime.closeRestoreRPC != nil ||
+		runtime.localRestoreRPC() != nil {
+		_ = runtime.Close()
+		t.Fatal("production runtime installed an unreviewed local restore implementation")
 	}
 	if len(server.tlsConfig.NextProtos) != 6 ||
 		server.tlsConfig.NextProtos[0] != vnextReaderPrepareALPN ||
