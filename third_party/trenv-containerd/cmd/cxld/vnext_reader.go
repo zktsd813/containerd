@@ -103,9 +103,22 @@ type vnextReaderVerifiedPublication struct {
 	ExactBytes  []byte
 }
 
+// vnextReaderExecutionTarget is minted only after the portable request and
+// Scheduler authorization have passed exact TargetContainerID matching. It is
+// a narrow value with no mutator: restore code must use this target directly
+// rather than infer a container from the DAX directory or publication graph.
+type vnextReaderExecutionTarget struct {
+	targetContainerID string
+}
+
+func (target vnextReaderExecutionTarget) TargetContainerID() string {
+	return target.targetContainerID
+}
+
 type vnextReaderRunner interface {
 	RunAuthorizedVNextPublication(
 		context.Context,
+		vnextReaderExecutionTarget,
 		*vnextLocalDAXDirectory,
 		vnextReaderVerifiedPublication,
 	) error
@@ -115,6 +128,7 @@ type vnextReaderRunner interface {
 // ephemeral TRREMAP006 lifecycle without importing legacy command execution.
 type vnextReaderCRIUInvoke func(
 	context.Context,
+	vnextReaderExecutionTarget,
 	string,
 	vnextReaderVerifiedPublication,
 ) error
@@ -130,11 +144,16 @@ type vnextReaderCRIURemapRunner struct {
 
 func (runner vnextReaderCRIURemapRunner) RunAuthorizedVNextPublication(
 	ctx context.Context,
+	target vnextReaderExecutionTarget,
 	directory *vnextLocalDAXDirectory,
 	verified vnextReaderVerifiedPublication,
 ) error {
 	if runner.Invoke == nil {
 		return errors.New("VNext reader CRIU invocation is unavailable")
+	}
+	if err := validateVNextReaderIdentity(
+		"VNext reader execution target", target.TargetContainerID()); err != nil {
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -145,7 +164,7 @@ func (runner vnextReaderCRIURemapRunner) RunAuthorizedVNextPublication(
 		return fmt.Errorf("materialize authorized VNext CRIU remap: %w", err)
 	}
 	defer cleanup()
-	if err := runner.Invoke(ctx, path, verified); err != nil {
+	if err := runner.Invoke(ctx, target, path, verified); err != nil {
 		return fmt.Errorf("run authorized VNext CRIU restore adapter: %w", err)
 	}
 	return nil
@@ -208,7 +227,8 @@ func (reader *vnextAuthorizedReader) Restore(
 		return vnextReaderVerifiedPublication{}, fmt.Errorf(
 			"authorize exact ACTIVE_ARMED VNext restore before DAX read: %w", err)
 	}
-	pages, err := reader.validateAuthorization(request.Request, authorization)
+	pages, target, err := reader.validateAuthorization(
+		request.Request, authorization)
 	if err != nil {
 		return vnextReaderVerifiedPublication{}, fmt.Errorf(
 			"validate VNext restore authorization before DAX read: %w", err)
@@ -220,7 +240,7 @@ func (reader *vnextAuthorizedReader) Restore(
 		return vnextReaderVerifiedPublication{}, err
 	}
 	if err := reader.runner.RunAuthorizedVNextPublication(
-		ctx, reader.directory, verified); err != nil {
+		ctx, target, reader.directory, verified); err != nil {
 		return vnextReaderVerifiedPublication{}, err
 	}
 	return verified, nil
@@ -234,7 +254,7 @@ type vnextReaderResolvedPage struct {
 func (reader *vnextAuthorizedReader) validateAuthorization(
 	request vnextReaderRequest,
 	authorization vnextReaderAuthorization,
-) ([]vnextReaderResolvedPage, error) {
+) ([]vnextReaderResolvedPage, vnextReaderExecutionTarget, error) {
 	for _, identity := range []struct {
 		name    string
 		request string
@@ -247,7 +267,7 @@ func (reader *vnextAuthorizedReader) validateAuthorization(
 		{"target container ID", request.TargetContainerID, authorization.TargetContainerID},
 	} {
 		if identity.request != identity.granted {
-			return nil, fmt.Errorf(
+			return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
 				"authorized %s %q does not match request %q",
 				identity.name, identity.granted, identity.request)
 		}
@@ -262,17 +282,19 @@ func (reader *vnextAuthorizedReader) validateAuthorization(
 		{"authorized PageMap ID", root.PageMapID},
 	} {
 		if err := validateVNextReaderIdentity(identity.name, identity.value); err != nil {
-			return nil, err
+			return nil, vnextReaderExecutionTarget{}, err
 		}
 	}
 	if root.RootVersion == 0 || root.RootVersion > cxlcheckpoint.MaxSignedLong {
-		return nil, fmt.Errorf("authorized root version %d is invalid", root.RootVersion)
+		return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
+			"authorized root version %d is invalid", root.RootVersion)
 	}
 	if root.PageMapVersion == 0 || root.PageMapVersion > cxlcheckpoint.MaxSignedLong {
-		return nil, fmt.Errorf("authorized PageMap version %d is invalid", root.PageMapVersion)
+		return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
+			"authorized PageMap version %d is invalid", root.PageMapVersion)
 	}
 	if root.ContractID != cxlcheckpoint.V6CompatibilityID {
-		return nil, fmt.Errorf(
+		return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
 			"authorized contract %q is not the exact V6 compatibility identity",
 			root.ContractID)
 	}
@@ -280,12 +302,12 @@ func (reader *vnextAuthorizedReader) validateAuthorization(
 	if locator.PublicationByteLength == 0 ||
 		locator.PublicationByteLength > uint64(cxlcheckpoint.PublicationEnvelopeHeaderBytes)+
 			cxlcheckpoint.MaxPayloadBytes {
-		return nil, fmt.Errorf(
+		return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
 			"authorized publication length %d is outside the V6 envelope limit",
 			locator.PublicationByteLength)
 	}
 	if len(locator.PageRuns) == 0 || len(locator.PageRuns) > vnextReaderMaxLocatorRuns {
-		return nil, fmt.Errorf(
+		return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
 			"authorized locator run count %d is outside 1..%d",
 			len(locator.PageRuns), vnextReaderMaxLocatorRuns)
 	}
@@ -302,37 +324,42 @@ func (reader *vnextAuthorizedReader) validateAuthorization(
 	for index, run := range locator.PageRuns {
 		pageID := run.FirstPage
 		if err := validateVNextReaderIdentity("locator Owner ID", pageID.OwnerID); err != nil {
-			return nil, fmt.Errorf("locator run %d: %w", index, err)
+			return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
+				"locator run %d: %w", index, err)
 		}
 		if err := validateVNextReaderDeviceID(pageID.DeviceUUID); err != nil {
-			return nil, fmt.Errorf("locator run %d: %w", index, err)
+			return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
+				"locator run %d: %w", index, err)
 		}
 		if pageID.AllocationRecordID == 0 ||
 			pageID.AllocationRecordID > cxlcheckpoint.MaxSignedLong {
-			return nil, fmt.Errorf("locator run %d has invalid allocation record ID", index)
+			return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
+				"locator run %d has invalid allocation record ID", index)
 		}
 		if run.PageCount == 0 || run.PageCount > cxlcheckpoint.MaxSignedLong ||
 			pageID.DataPageIndex > cxlcheckpoint.MaxSignedLong-run.PageCount {
-			return nil, fmt.Errorf("locator run %d has an invalid or overflowing page range", index)
+			return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
+				"locator run %d has an invalid or overflowing page range", index)
 		}
 		if locatedPages > expectedPages || run.PageCount > expectedPages-locatedPages {
-			return nil, fmt.Errorf(
+			return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
 				"locator run %d exceeds the %d pages required by the exact length",
 				index, expectedPages)
 		}
 		if locatedPages > cxlcheckpoint.MaxSignedLong-run.PageCount {
-			return nil, errors.New("authorized locator page coverage overflows")
+			return nil, vnextReaderExecutionTarget{}, errors.New(
+				"authorized locator page coverage overflows")
 		}
 		locatedPages += run.PageCount
 		binding, exists := reader.directory.byUUID[pageID.DeviceUUID]
 		if !exists {
-			return nil, fmt.Errorf(
+			return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
 				"locator run %d has no local DAX binding for device %q",
 				index, pageID.DeviceUUID)
 		}
 		end := pageID.DataPageIndex + run.PageCount
 		if binding.OwnerID != pageID.OwnerID || end > binding.DataPageCount {
-			return nil, fmt.Errorf(
+			return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
 				"locator run %d does not match local Owner identity or capacity", index)
 		}
 		if index > 0 {
@@ -341,7 +368,8 @@ func (reader *vnextAuthorizedReader) validateAuthorization(
 				previous.FirstPage.DeviceUUID == pageID.DeviceUUID &&
 				previous.FirstPage.AllocationRecordID == pageID.AllocationRecordID &&
 				previous.FirstPage.DataPageIndex+previous.PageCount == pageID.DataPageIndex {
-				return nil, fmt.Errorf("locator runs %d and %d are not coalesced", index-1, index)
+				return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
+					"locator runs %d and %d are not coalesced", index-1, index)
 			}
 		}
 		key := pageID.OwnerID + "\x00" + pageID.DeviceUUID
@@ -359,7 +387,7 @@ func (reader *vnextAuthorizedReader) validateAuthorization(
 		}
 	}
 	if locatedPages != expectedPages {
-		return nil, fmt.Errorf(
+		return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
 			"authorized locator covers %d pages, exact length requires %d",
 			locatedPages, expectedPages)
 	}
@@ -372,11 +400,14 @@ func (reader *vnextAuthorizedReader) validateAuthorization(
 		})
 		for index := 1; index < len(ranges); index++ {
 			if ranges[index-1].end > ranges[index].start {
-				return nil, fmt.Errorf("authorized locator has overlapping ranges on %q", key)
+				return nil, vnextReaderExecutionTarget{}, fmt.Errorf(
+					"authorized locator has overlapping ranges on %q", key)
 			}
 		}
 	}
-	return resolved, nil
+	return resolved, vnextReaderExecutionTarget{
+		targetContainerID: authorization.TargetContainerID,
+	}, nil
 }
 
 func (reader *vnextAuthorizedReader) fetchAuthorizedPublication(

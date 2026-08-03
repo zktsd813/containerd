@@ -452,24 +452,54 @@ func (source *vnextReaderCountingSource) counts() (int, int) {
 }
 
 type vnextReaderTestRunner struct {
-	mu     sync.Mutex
-	calls  int
-	events *[]string
-	err    error
+	mu      sync.Mutex
+	calls   int
+	targets []vnextReaderExecutionTarget
+	events  *[]string
+	err     error
 }
 
 func (runner *vnextReaderTestRunner) RunAuthorizedVNextPublication(
 	_ context.Context,
+	target vnextReaderExecutionTarget,
 	_ *vnextLocalDAXDirectory,
 	_ vnextReaderVerifiedPublication,
 ) error {
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
 	runner.calls++
+	runner.targets = append(runner.targets, target)
 	if runner.events != nil {
 		*runner.events = append(*runner.events, "runner")
 	}
 	return runner.err
+}
+
+func TestVNextReaderPassesExactValidatedExecutionTargetToRunner(t *testing.T) {
+	fixture := newVNextReaderTestFixture(t)
+	activationStore, request := vnextReaderArmTestRestore(t, fixture)
+	source := &vnextReaderCountingSource{
+		delegate: vnextRegularFileReaderDAXSource{},
+	}
+	runner := &vnextReaderTestRunner{}
+	reader, err := newVNextAuthorizedReader(
+		fixture.directory, activationStore, source, runner)
+	if err != nil {
+		t.Fatalf("construct authorized VNext reader: %v", err)
+	}
+	if _, err := reader.Restore(context.Background(), request); err != nil {
+		t.Fatalf("restore with exact execution target: %v", err)
+	}
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if runner.calls != 1 || len(runner.targets) != 1 {
+		t.Fatalf("runner calls/targets=%d/%d, want 1/1",
+			runner.calls, len(runner.targets))
+	}
+	if got := runner.targets[0].TargetContainerID(); got != fixture.request.TargetContainerID {
+		t.Fatalf("runner target=%q, want exact validated target %q",
+			got, fixture.request.TargetContainerID)
+	}
 }
 
 func TestVNextReaderRequiresActiveArmedBeforeCrossDeviceExactReadAndMaterializesRemap(t *testing.T) {
@@ -483,14 +513,17 @@ func TestVNextReaderRequiresActiveArmedBeforeCrossDeviceExactReadAndMaterializes
 	workDirectory := t.TempDir()
 	var materializedPath string
 	var remapBytes []byte
+	var invokedTarget vnextReaderExecutionTarget
 	runner := vnextReaderCRIURemapRunner{
 		WorkDirectory: workDirectory,
 		Invoke: func(
 			_ context.Context,
+			target vnextReaderExecutionTarget,
 			path string,
 			verified vnextReaderVerifiedPublication,
 		) error {
 			events = append(events, "runner")
+			invokedTarget = target
 			materializedPath = path
 			if !bytes.Equal(verified.ExactBytes, fixture.storage.ExactBytes) {
 				return errors.New("runner received padded or changed publication bytes")
@@ -537,6 +570,10 @@ func TestVNextReaderRequiresActiveArmedBeforeCrossDeviceExactReadAndMaterializes
 	if materializedPath == "" {
 		t.Fatal("CRIU remap runner was not invoked")
 	}
+	if invokedTarget.TargetContainerID() != fixture.request.TargetContainerID {
+		t.Fatalf("CRIU Invoke target=%q, want exact validated target %q",
+			invokedTarget.TargetContainerID(), fixture.request.TargetContainerID)
+	}
 	if _, err := os.Stat(materializedPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("ephemeral CRIU remap was not removed: %v", err)
 	}
@@ -554,9 +591,18 @@ func TestVNextReaderRejectsInactiveOrMismatchedActivationBeforeDAXRead(t *testin
 			},
 		},
 		{
-			name: "wrong target identity",
+			name: "substituted request target identity",
 			mutate: func(request *vnextReaderActivatedRestoreRequest) {
 				request.Request.TargetContainerID = "different-container"
+			},
+		},
+		{
+			name: "substituted authorization target identity",
+			mutate: func(request *vnextReaderActivatedRestoreRequest) {
+				request.Activation = cloneVNextReaderActivationIntent(
+					request.Activation)
+				request.Activation.Request.Acquired.Authorization.
+					TargetContainerID = "different-container"
 			},
 		},
 		{
@@ -600,12 +646,17 @@ func TestVNextReaderLocatorRunLimitAccepts256(t *testing.T) {
 		fixture.authorization, vnextReaderMaxLocatorRuns)
 	reader := &vnextAuthorizedReader{directory: fixture.directory}
 
-	pages, err := reader.validateAuthorization(fixture.request, authorization)
+	pages, target, err := reader.validateAuthorization(
+		fixture.request, authorization)
 	if err != nil {
 		t.Fatalf("validate %d locator runs: %v", vnextReaderMaxLocatorRuns, err)
 	}
 	if len(pages) != vnextReaderMaxLocatorRuns {
 		t.Fatalf("resolved locator pages = %d, want %d", len(pages), vnextReaderMaxLocatorRuns)
+	}
+	if target.TargetContainerID() != fixture.request.TargetContainerID {
+		t.Fatalf("resolved execution target=%q, want %q",
+			target.TargetContainerID(), fixture.request.TargetContainerID)
 	}
 }
 
@@ -615,9 +666,13 @@ func TestVNextReaderLocatorRunLimitRejects257(t *testing.T) {
 		fixture.authorization, vnextReaderMaxLocatorRuns+1)
 	reader := &vnextAuthorizedReader{directory: fixture.directory}
 
-	_, err := reader.validateAuthorization(fixture.request, authorization)
+	_, target, err := reader.validateAuthorization(
+		fixture.request, authorization)
 	if err == nil || !strings.Contains(err.Error(), "outside 1..256") {
 		t.Fatalf("validate %d locator runs = %v, want run-count rejection", vnextReaderMaxLocatorRuns+1, err)
+	}
+	if target != (vnextReaderExecutionTarget{}) {
+		t.Fatalf("failed authorization minted execution target %#v", target)
 	}
 }
 
