@@ -80,8 +80,8 @@ type vnextReaderAuthorization struct {
 
 // vnextReaderDAXSource is intentionally below the authorization boundary.
 // Implementations must perform no read in their constructor. The bounded
-// implementation in this file supports O_RDONLY regular-file devices; a real
-// devdax reader needs a separate read-only mmap/cache-invalidation adapter.
+// implementation in this file supports O_RDONLY regular-file devices; the
+// real read-only mmap/cache-invalidation adapter is in vnext_reader_devdax.go.
 type vnextReaderDAXSource interface {
 	ReadVNextDescriptor(
 		context.Context,
