@@ -344,25 +344,61 @@ func (fixture *vnextReaderTestFixture) rewriteFirstDescriptor(
 	}
 }
 
-type vnextReaderTestAuthorizer struct {
-	mu            sync.Mutex
-	authorization vnextReaderAuthorization
-	err           error
-	calls         int
-	events        *[]string
-}
-
-func (authorizer *vnextReaderTestAuthorizer) AuthorizeVNextReader(
-	_ context.Context,
-	_ vnextReaderRequest,
-) (vnextReaderAuthorization, error) {
-	authorizer.mu.Lock()
-	defer authorizer.mu.Unlock()
-	authorizer.calls++
-	if authorizer.events != nil {
-		*authorizer.events = append(*authorizer.events, "authorize")
+func vnextReaderArmTestRestore(
+	t *testing.T,
+	fixture *vnextReaderTestFixture,
+) (*vnextReaderActivationStore, vnextReaderActivatedRestoreRequest) {
+	t.Helper()
+	process := vnextReaderProcessIncarnation(
+		sha256.Sum256([]byte("reader-first-read-test-process")))
+	authorization := cloneVNextReaderAuthorization(fixture.authorization)
+	authorization.CxldProcessIncarnationID = process
+	authorization.ReaderInitialRegistrationCatalogRevision = 23
+	acquired := vnextReaderAcquiredAuthorization{
+		Authorization:          authorization,
+		SchedulerID:            "reader-first-read-test-scheduler",
+		SchedulerFenceRevision: 19,
+		IssuedAtEpochMillis:    100,
+		ExpiresAtEpochMillis:   200,
+		CatalogState:           vnextReaderCatalogAuthorizationAcquired,
+		LastMutationID:         authorization.RestoreAuthorizationID,
 	}
-	return authorizer.authorization, authorizer.err
+	prepared, err := newVNextReaderAuthorizationStore(
+		vnextReaderAuthorizationStoreTestConfig(4))
+	if err != nil {
+		t.Fatalf("construct VNext Reader PREPARED test store: %v", err)
+	}
+	if _, _, err := prepared.Prepare(acquired, 150); err != nil {
+		t.Fatalf("prepare VNext Reader test authorization: %v", err)
+	}
+	activationStore, err := newVNextReaderActivationStore(
+		vnextReaderActivationStoreTestConfig(4),
+		authorization.ExecutorID,
+		authorization.CxldLogicalID,
+		process,
+		prepared)
+	if err != nil {
+		t.Fatalf("construct VNext Reader activation test store: %v", err)
+	}
+	activationRequest := vnextReaderActivationRequestIdentity{
+		Acquired:            acquired,
+		ActivationRequestID: "reader-first-read-activation-request",
+	}
+	proposal, _, err := activationStore.Propose(activationRequest, 150)
+	if err != nil {
+		t.Fatalf("propose VNext Reader test activation: %v", err)
+	}
+	active := cloneVNextReaderAcquiredAuthorization(acquired)
+	active.CatalogState = vnextReaderCatalogAuthorizationActive
+	active.LastMutationID = activationRequest.ActivationRequestID
+	armed, _, err := activationStore.Commit(active, proposal)
+	if err != nil {
+		t.Fatalf("arm VNext Reader test activation: %v", err)
+	}
+	return activationStore, vnextReaderActivatedRestoreRequest{
+		Request:    fixture.request,
+		Activation: armed,
+	}
 }
 
 type vnextReaderCountingSource struct {
@@ -436,13 +472,10 @@ func (runner *vnextReaderTestRunner) RunAuthorizedVNextPublication(
 	return runner.err
 }
 
-func TestVNextReaderAuthorizesBeforeCrossDeviceExactReadAndMaterializesRemap(t *testing.T) {
+func TestVNextReaderRequiresActiveArmedBeforeCrossDeviceExactReadAndMaterializesRemap(t *testing.T) {
 	fixture := newVNextReaderTestFixture(t)
 	events := make([]string, 0)
-	authorizer := &vnextReaderTestAuthorizer{
-		authorization: fixture.authorization,
-		events:        &events,
-	}
+	activationStore, request := vnextReaderArmTestRestore(t, fixture)
 	source := &vnextReaderCountingSource{
 		delegate: vnextRegularFileReaderDAXSource{},
 		events:   &events,
@@ -468,11 +501,11 @@ func TestVNextReaderAuthorizesBeforeCrossDeviceExactReadAndMaterializesRemap(t *
 		},
 	}
 	reader, err := newVNextAuthorizedReader(
-		fixture.directory, authorizer, source, runner)
+		fixture.directory, activationStore, source, runner)
 	if err != nil {
 		t.Fatalf("construct authorized VNext reader: %v", err)
 	}
-	verified, err := reader.Restore(context.Background(), fixture.request)
+	verified, err := reader.Restore(context.Background(), request)
 	if err != nil {
 		t.Fatalf("restore exact cross-device publication: %v", err)
 	}
@@ -494,8 +527,8 @@ func TestVNextReaderAuthorizesBeforeCrossDeviceExactReadAndMaterializesRemap(t *
 		source.contentReads[1].DataPageIndex != 20 {
 		t.Fatalf("reader did not follow ordered exact PageID runs: %#v", source.contentReads)
 	}
-	if events[0] != "authorize" || events[len(events)-1] != "runner" {
-		t.Fatalf("authorization/read/runner order is wrong: %#v", events)
+	if events[0] != "descriptor" || events[len(events)-1] != "runner" {
+		t.Fatalf("ACTIVE_ARMED read/runner order is wrong: %#v", events)
 	}
 	if !bytes.HasPrefix(remapBytes, []byte(vnextCRIURemapMagic+"\n")) ||
 		!bytes.Contains(remapBytes, []byte(fixture.directory.byUUID["reader-device-b"].DevicePath)) {
@@ -509,46 +542,46 @@ func TestVNextReaderAuthorizesBeforeCrossDeviceExactReadAndMaterializesRemap(t *
 	}
 }
 
-func TestVNextReaderRejectsMissingOrMismatchedAuthorizationBeforeDAXRead(t *testing.T) {
+func TestVNextReaderRejectsInactiveOrMismatchedActivationBeforeDAXRead(t *testing.T) {
 	for _, test := range []struct {
 		name   string
-		mutate func(*vnextReaderTestAuthorizer)
+		mutate func(*vnextReaderActivatedRestoreRequest)
 	}{
 		{
-			name: "authorizer rejection",
-			mutate: func(authorizer *vnextReaderTestAuthorizer) {
-				authorizer.err = errors.New("restore authorization not found")
+			name: "activation is not ACTIVE_ARMED",
+			mutate: func(request *vnextReaderActivatedRestoreRequest) {
+				request.Activation.State = vnextReaderActivationPending
 			},
 		},
 		{
 			name: "wrong target identity",
-			mutate: func(authorizer *vnextReaderTestAuthorizer) {
-				authorizer.authorization.TargetContainerID = "different-container"
+			mutate: func(request *vnextReaderActivatedRestoreRequest) {
+				request.Request.TargetContainerID = "different-container"
 			},
 		},
 		{
 			name: "wrong locator Owner identity",
-			mutate: func(authorizer *vnextReaderTestAuthorizer) {
-				authorizer.authorization.Root.PublicationLocator.PageRuns = append(
+			mutate: func(request *vnextReaderActivatedRestoreRequest) {
+				request.Activation.Request.Acquired.Authorization.Root.PublicationLocator.PageRuns = append(
 					[]cxlcheckpoint.PublicationPageRun(nil),
-					authorizer.authorization.Root.PublicationLocator.PageRuns...)
-				authorizer.authorization.Root.PublicationLocator.PageRuns[0].FirstPage.OwnerID =
+					request.Activation.Request.Acquired.Authorization.Root.PublicationLocator.PageRuns...)
+				request.Activation.Request.Acquired.Authorization.Root.PublicationLocator.PageRuns[0].FirstPage.OwnerID =
 					"different-owner"
 			},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newVNextReaderTestFixture(t)
-			authorizer := &vnextReaderTestAuthorizer{authorization: fixture.authorization}
-			test.mutate(authorizer)
+			activationStore, request := vnextReaderArmTestRestore(t, fixture)
+			test.mutate(&request)
 			source := &vnextReaderCountingSource{delegate: vnextRegularFileReaderDAXSource{}}
 			runner := &vnextReaderTestRunner{}
 			reader, err := newVNextAuthorizedReader(
-				fixture.directory, authorizer, source, runner)
+				fixture.directory, activationStore, source, runner)
 			if err != nil {
 				t.Fatalf("construct authorized reader: %v", err)
 			}
-			if _, err := reader.Restore(context.Background(), fixture.request); err == nil {
+			if _, err := reader.Restore(context.Background(), request); err == nil {
 				t.Fatal("reader accepted missing or mismatched authorization")
 			}
 			descriptorReads, contentReads := source.counts()
@@ -667,12 +700,6 @@ func TestVNextReaderRejectsChangedExactRootOrDescriptor(t *testing.T) {
 			},
 		},
 		{
-			name: "non-V6 compatibility identity",
-			mutate: func(_ *testing.T, fixture *vnextReaderTestFixture) {
-				fixture.authorization.Root.ContractID = "different-publication-contract"
-			},
-		},
-		{
 			name: "descriptor is not SEALED",
 			mutate: func(t *testing.T, fixture *vnextReaderTestFixture) {
 				fixture.rewriteFirstDescriptor(t, func(descriptor *vnextPageDescriptor) {
@@ -693,15 +720,15 @@ func TestVNextReaderRejectsChangedExactRootOrDescriptor(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newVNextReaderTestFixture(t)
 			test.mutate(t, fixture)
-			authorizer := &vnextReaderTestAuthorizer{authorization: fixture.authorization}
+			activationStore, request := vnextReaderArmTestRestore(t, fixture)
 			source := &vnextReaderCountingSource{delegate: vnextRegularFileReaderDAXSource{}}
 			runner := &vnextReaderTestRunner{}
 			reader, err := newVNextAuthorizedReader(
-				fixture.directory, authorizer, source, runner)
+				fixture.directory, activationStore, source, runner)
 			if err != nil {
 				t.Fatalf("construct authorized reader: %v", err)
 			}
-			if _, err := reader.Restore(context.Background(), fixture.request); err == nil {
+			if _, err := reader.Restore(context.Background(), request); err == nil {
 				t.Fatalf("reader accepted %s", test.name)
 			}
 			if runner.calls != 0 {

@@ -30,6 +30,15 @@ type vnextReaderRequest struct {
 	TargetContainerID      string
 }
 
+// vnextReaderActivatedRestoreRequest carries the complete process-local
+// ACTIVE_ARMED evidence together with the portable restore identity. The
+// activation store must match this value exactly before any local DAX binding
+// is resolved or any descriptor is read.
+type vnextReaderActivatedRestoreRequest struct {
+	Request    vnextReaderRequest
+	Activation vnextReaderActivationIntent
+}
+
 // vnextReaderPublicationLocator is the exact Scheduler-authorized byte
 // identity. PageRuns are ordered in publication byte order and cover only
 // ceil(PublicationByteLength/4096), never the complete reserved slot.
@@ -67,25 +76,6 @@ type vnextReaderAuthorization struct {
 	ReaderInitialRegistrationCatalogRevision uint64
 	TargetContainerID                        string
 	Root                                     vnextReaderTrustedRoot
-}
-
-type vnextReaderAuthorizer interface {
-	AuthorizeVNextReader(
-		context.Context,
-		vnextReaderRequest,
-	) (vnextReaderAuthorization, error)
-}
-
-type vnextReaderAuthorizerFunc func(
-	context.Context,
-	vnextReaderRequest,
-) (vnextReaderAuthorization, error)
-
-func (authorize vnextReaderAuthorizerFunc) AuthorizeVNextReader(
-	ctx context.Context,
-	request vnextReaderRequest,
-) (vnextReaderAuthorization, error) {
-	return authorize(ctx, request)
 }
 
 // vnextReaderDAXSource is intentionally below the authorization boundary.
@@ -162,23 +152,23 @@ func (runner vnextReaderCRIURemapRunner) RunAuthorizedVNextPublication(
 }
 
 type vnextAuthorizedReader struct {
-	directory  *vnextLocalDAXDirectory
-	authorizer vnextReaderAuthorizer
-	source     vnextReaderDAXSource
-	runner     vnextReaderRunner
+	directory       *vnextLocalDAXDirectory
+	activationStore *vnextReaderActivationStore
+	source          vnextReaderDAXSource
+	runner          vnextReaderRunner
 }
 
 func newVNextAuthorizedReader(
 	directory *vnextLocalDAXDirectory,
-	authorizer vnextReaderAuthorizer,
+	activationStore *vnextReaderActivationStore,
 	source vnextReaderDAXSource,
 	runner vnextReaderRunner,
 ) (*vnextAuthorizedReader, error) {
 	if directory == nil || len(directory.byUUID) == 0 {
 		return nil, errors.New("VNext reader local DAX directory is unavailable")
 	}
-	if authorizer == nil {
-		return nil, errors.New("VNext reader authorizer is unavailable")
+	if activationStore == nil {
+		return nil, errors.New("VNext reader activation store is unavailable")
 	}
 	if source == nil {
 		return nil, errors.New("VNext reader DAX source is unavailable")
@@ -187,45 +177,45 @@ func newVNextAuthorizedReader(
 		return nil, errors.New("VNext reader runner is unavailable")
 	}
 	return &vnextAuthorizedReader{
-		directory:  directory,
-		authorizer: authorizer,
-		source:     source,
-		runner:     runner,
+		directory:       directory,
+		activationStore: activationStore,
+		source:          source,
+		runner:          runner,
 	}, nil
 }
 
-// Restore authorizes before the first source call, fetches only the exact
-// locator pages, and hands a fully verified publication to the injected
-// restore runner. It never invokes an Owner RPC and never accepts a local path
-// from request or publication data.
+// Restore proves an exact ACTIVE_ARMED activation before the first source
+// call, fetches only the exact locator pages, and hands a fully verified
+// publication to the injected restore runner. It never invokes an Owner RPC
+// and never accepts a local path from request or publication data.
 func (reader *vnextAuthorizedReader) Restore(
 	ctx context.Context,
-	request vnextReaderRequest,
+	request vnextReaderActivatedRestoreRequest,
 ) (vnextReaderVerifiedPublication, error) {
-	if reader == nil || reader.directory == nil || reader.authorizer == nil ||
+	if reader == nil || reader.directory == nil || reader.activationStore == nil ||
 		reader.source == nil || reader.runner == nil {
 		return vnextReaderVerifiedPublication{}, errors.New("VNext reader is unavailable")
 	}
-	if err := validateVNextReaderRequest(request); err != nil {
+	if err := validateVNextReaderRequest(request.Request); err != nil {
 		return vnextReaderVerifiedPublication{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return vnextReaderVerifiedPublication{}, err
 	}
 
-	authorization, err := reader.authorizer.AuthorizeVNextReader(ctx, request)
+	authorization, permit, err := reader.activationStore.authorizeFirstRead(request)
 	if err != nil {
 		return vnextReaderVerifiedPublication{}, fmt.Errorf(
-			"authorize VNext restore before DAX read: %w", err)
+			"authorize exact ACTIVE_ARMED VNext restore before DAX read: %w", err)
 	}
-	authorization = cloneVNextReaderAuthorization(authorization)
-	pages, err := reader.validateAuthorization(request, authorization)
+	pages, err := reader.validateAuthorization(request.Request, authorization)
 	if err != nil {
 		return vnextReaderVerifiedPublication{}, fmt.Errorf(
 			"validate VNext restore authorization before DAX read: %w", err)
 	}
 
-	verified, err := reader.fetchAuthorizedPublication(ctx, authorization, pages)
+	verified, err := reader.fetchAuthorizedPublication(
+		ctx, authorization, pages, permit)
 	if err != nil {
 		return vnextReaderVerifiedPublication{}, err
 	}
@@ -393,6 +383,7 @@ func (reader *vnextAuthorizedReader) fetchAuthorizedPublication(
 	ctx context.Context,
 	authorization vnextReaderAuthorization,
 	pages []vnextReaderResolvedPage,
+	permit *vnextReaderFirstReadPermit,
 ) (vnextReaderVerifiedPublication, error) {
 	root := authorization.Root
 	locator := root.PublicationLocator
@@ -404,6 +395,16 @@ func (reader *vnextAuthorizedReader) fetchAuthorizedPublication(
 	for index, page := range pages {
 		if err := ctx.Err(); err != nil {
 			return vnextReaderVerifiedPublication{}, err
+		}
+		if index == 0 {
+			// Consume the one-shot claim immediately before the first source
+			// operation. All request, activation, locator, and local binding
+			// validation above remains read-free. A source failure after this
+			// point deliberately does not restore the claim.
+			if err := permit.consume(); err != nil {
+				return vnextReaderVerifiedPublication{}, fmt.Errorf(
+					"consume VNext first-read activation permit: %w", err)
+			}
 		}
 		descriptor, err := reader.source.ReadVNextDescriptor(
 			ctx, page.Binding, page.PageID.DataPageIndex)

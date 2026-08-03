@@ -75,6 +75,12 @@ var (
 		"VNext Reader activation request is not pending")
 	errVNextReaderActivationMappingGenerationExhausted = errors.New(
 		"VNext Reader activation mapping generation is exhausted")
+	errVNextReaderActivationNotActiveArmed = errors.New(
+		"VNext Reader activation is not ACTIVE_ARMED")
+	errVNextReaderFirstReadAlreadyClaimed = errors.New(
+		"VNext Reader activation first read is already claimed")
+	errVNextReaderFirstReadAdmissionClosed = errors.New(
+		"VNext Reader activation first-read admission is closed")
 )
 
 // vnextReaderActivationRequestIdentity is the exact request that is safe to
@@ -112,9 +118,18 @@ const (
 )
 
 type vnextReaderActivationStoreEntry struct {
-	kind    vnextReaderActivationStoreEntryKind
-	request vnextReaderActivationRequestIdentity
-	intent  vnextReaderActivationIntent
+	kind             vnextReaderActivationStoreEntryKind
+	request          vnextReaderActivationRequestIdentity
+	intent           vnextReaderActivationIntent
+	firstReadClaimed bool
+}
+
+// vnextReaderFirstReadPermit is an unforgeable process-local handoff between
+// read-free activation/locator validation and the first DAX descriptor read.
+// It is consumed under the same mutex that protects the retained activation.
+type vnextReaderFirstReadPermit struct {
+	store  *vnextReaderActivationStore
+	intent vnextReaderActivationIntent
 }
 
 type vnextReaderActivationStoreConfig struct {
@@ -138,16 +153,17 @@ type vnextReaderActivationPreparedStore interface {
 // because its independent 256-bit incarnation is part of every request and
 // generated mapping ID.
 type vnextReaderActivationStore struct {
-	mu                    sync.RWMutex
-	localExecutorNodeID   string
-	localCxldLogicalID    string
-	localProcess          vnextReaderProcessIncarnation
-	prepared              vnextReaderActivationPreparedStore
-	maxEntries            int
-	maxRetainedBytes      uint64
-	retainedBytes         uint64
-	lastMappingGeneration uint64
-	byRequestID           map[string]vnextReaderActivationStoreEntry
+	mu                       sync.RWMutex
+	localExecutorNodeID      string
+	localCxldLogicalID       string
+	localProcess             vnextReaderProcessIncarnation
+	prepared                 vnextReaderActivationPreparedStore
+	maxEntries               int
+	maxRetainedBytes         uint64
+	retainedBytes            uint64
+	lastMappingGeneration    uint64
+	byRequestID              map[string]vnextReaderActivationStoreEntry
+	firstReadAdmissionClosed bool
 }
 
 func newVNextReaderActivationStore(
@@ -394,6 +410,157 @@ func (store *vnextReaderActivationStore) Commit(
 		return vnextReaderActivationIntent{}, 0,
 			errors.New("VNext Reader activation state is invalid")
 	}
+}
+
+// authorizeFirstRead is the read-free half of the VNext data-plane boundary.
+// It accepts no short authorization-ID lookup: the caller must present the
+// complete retained ACTIVE_ARMED intent and the portable restore request. The
+// returned permit still grants no read until consume rechecks and claims the
+// exact entry under the activation-store mutex.
+func (store *vnextReaderActivationStore) authorizeFirstRead(
+	request vnextReaderActivatedRestoreRequest,
+) (vnextReaderAuthorization, *vnextReaderFirstReadPermit, error) {
+	if store == nil {
+		return vnextReaderAuthorization{}, nil,
+			errors.New("VNext Reader activation store is unavailable")
+	}
+	if err := validateVNextReaderRequest(request.Request); err != nil {
+		return vnextReaderAuthorization{}, nil, err
+	}
+	if err := store.validateRequest(request.Activation.Request); err != nil {
+		return vnextReaderAuthorization{}, nil, err
+	}
+	if err := validateVNextReaderActivationEvidence(
+		request.Activation, request.Activation.Request); err != nil {
+		return vnextReaderAuthorization{}, nil,
+			fmt.Errorf("validate VNext Reader activation evidence: %w", err)
+	}
+	if request.Activation.State != vnextReaderActivationActiveArmed {
+		return vnextReaderAuthorization{}, nil,
+			errVNextReaderActivationNotActiveArmed
+	}
+	if request.Activation.CxldReceipt !=
+		store.canonicalEvidenceReceipt(request.Activation) {
+		return vnextReaderAuthorization{}, nil,
+			errors.New("VNext Reader activation evidence receipt is not canonical")
+	}
+	authorization := request.Activation.Request.Acquired.Authorization
+	if err := validateVNextReaderActivationRestoreIdentity(
+		request.Request, authorization); err != nil {
+		return vnextReaderAuthorization{}, nil, err
+	}
+
+	intent := cloneVNextReaderActivationIntent(request.Activation)
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if store.firstReadAdmissionClosed {
+		return vnextReaderAuthorization{}, nil,
+			errVNextReaderFirstReadAdmissionClosed
+	}
+	current, exists := store.byRequestID[intent.Request.ActivationRequestID]
+	if !exists || current.kind == vnextReaderActivationStoreEntryNotFoundFenced {
+		return vnextReaderAuthorization{}, nil,
+			errVNextReaderActivationNotActiveArmed
+	}
+	if current.kind != vnextReaderActivationStoreEntryIntent {
+		return vnextReaderAuthorization{}, nil,
+			errors.New("VNext Reader activation store entry kind is invalid")
+	}
+	if err := store.validateExistingRequest(current.request, intent.Request); err != nil {
+		return vnextReaderAuthorization{}, nil, err
+	}
+	if current.intent.State != vnextReaderActivationActiveArmed {
+		return vnextReaderAuthorization{}, nil,
+			errVNextReaderActivationNotActiveArmed
+	}
+	if intent.State != current.intent.State ||
+		!equalVNextReaderActivationIntentIgnoringState(current.intent, intent) ||
+		current.intent.CxldReceipt != store.canonicalEvidenceReceipt(current.intent) {
+		return vnextReaderAuthorization{}, nil,
+			errVNextReaderActivationConflict
+	}
+	if current.firstReadClaimed {
+		return vnextReaderAuthorization{}, nil,
+			errVNextReaderFirstReadAlreadyClaimed
+	}
+	return cloneVNextReaderAuthorization(current.intent.Request.Acquired.Authorization),
+		&vnextReaderFirstReadPermit{
+			store:  store,
+			intent: cloneVNextReaderActivationIntent(current.intent),
+		}, nil
+}
+
+// consume performs the only state transition that grants the first source
+// operation. The claim is one-shot and is never rolled back, including when a
+// descriptor/content read or the restore runner later fails.
+func (permit *vnextReaderFirstReadPermit) consume() error {
+	if permit == nil || permit.store == nil {
+		return errors.New("VNext Reader first-read permit is unavailable")
+	}
+	store := permit.store
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.firstReadAdmissionClosed {
+		return errVNextReaderFirstReadAdmissionClosed
+	}
+	current, exists := store.byRequestID[permit.intent.Request.ActivationRequestID]
+	if !exists || current.kind == vnextReaderActivationStoreEntryNotFoundFenced {
+		return errVNextReaderActivationNotActiveArmed
+	}
+	if current.kind != vnextReaderActivationStoreEntryIntent {
+		return errors.New("VNext Reader activation store entry kind is invalid")
+	}
+	if current.intent.State != vnextReaderActivationActiveArmed {
+		return errVNextReaderActivationNotActiveArmed
+	}
+	if permit.intent.State != current.intent.State ||
+		!equalVNextReaderActivationIntentIgnoringState(current.intent, permit.intent) ||
+		current.intent.CxldReceipt != store.canonicalEvidenceReceipt(current.intent) {
+		return errVNextReaderActivationConflict
+	}
+	if current.firstReadClaimed {
+		return errVNextReaderFirstReadAlreadyClaimed
+	}
+	current.firstReadClaimed = true
+	store.byRequestID[permit.intent.Request.ActivationRequestID] = current
+	return nil
+}
+
+// CloseFirstReadAdmission prevents both new authorization and consumption of
+// a permit that was validated before shutdown. It is idempotent and does not
+// erase retained activation history.
+func (store *vnextReaderActivationStore) CloseFirstReadAdmission() {
+	if store == nil {
+		return
+	}
+	store.mu.Lock()
+	store.firstReadAdmissionClosed = true
+	store.mu.Unlock()
+}
+
+func validateVNextReaderActivationRestoreIdentity(
+	request vnextReaderRequest,
+	authorization vnextReaderAuthorization,
+) error {
+	for _, identity := range []struct {
+		name      string
+		requested string
+		activated string
+	}{
+		{"restore authorization ID", request.RestoreAuthorizationID, authorization.RestoreAuthorizationID},
+		{"checkpoint ID", request.CheckpointID, authorization.CheckpointID},
+		{"executor ID", request.ExecutorID, authorization.ExecutorID},
+		{"cxld logical ID", request.CxldLogicalID, authorization.CxldLogicalID},
+		{"target container ID", request.TargetContainerID, authorization.TargetContainerID},
+	} {
+		if identity.requested != identity.activated {
+			return fmt.Errorf(
+				"activated %s %q does not match restore request %q: %w",
+				identity.name, identity.activated, identity.requested,
+				errVNextReaderActivationConflict)
+		}
+	}
+	return nil
 }
 
 func (store *vnextReaderActivationStore) replayProposalLocked(
