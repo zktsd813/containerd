@@ -26,7 +26,7 @@ const (
 type vnextReaderPrepareRuntimeInput struct {
 	Enabled                     string
 	LocalExecutorNodeID         string
-	LocalCxldInstanceID         string
+	LocalCxldLogicalID          string
 	StoreMaxEntries             string
 	StoreMaxRetainedBytes       string
 	TLSListenAddress            string
@@ -70,7 +70,7 @@ type vnextReaderPrepareRuntimeTLSConfig struct {
 type vnextReaderPrepareRuntimeConfig struct {
 	Enabled              bool
 	LocalExecutorNodeID  string
-	LocalCxldInstanceID  string
+	LocalCxldLogicalID   string
 	Store                vnextReaderAuthorizationStoreConfig
 	TLS                  vnextReaderPrepareRuntimeTLSConfig
 	SchedulerByPrincipal map[string]string
@@ -106,13 +106,15 @@ type vnextReaderPrepareRuntimeDependencies struct {
 	newService func(
 		string,
 		string,
-		*vnextReaderAuthorizationStore,
+		vnextReaderProcessIncarnation,
+		vnextReaderPrepareStore,
 		vnextReaderPrepareClock,
 		vnextReaderPrepareAuthorityVerifier,
 	) (*vnextReaderPrepareService, error)
 	newStatusService func(
 		string,
 		string,
+		vnextReaderProcessIncarnation,
 		vnextReaderPreparedStatusStore,
 		vnextReaderPreparedStatusAuthorityVerifier,
 	) (*vnextReaderPreparedStatusService, error)
@@ -221,7 +223,7 @@ func parseVNextReaderPrepareRuntimeInput(
 			"VNext Reader PREPARE enabled must be exactly true or false")
 	}
 	config.LocalExecutorNodeID = input.LocalExecutorNodeID
-	config.LocalCxldInstanceID = input.LocalCxldInstanceID
+	config.LocalCxldLogicalID = input.LocalCxldLogicalID
 	storeEntries, err := parseVNextReaderPrepareRuntimePositiveUint(
 		"authorization store max entries", input.StoreMaxEntries,
 		uint64(vnextReaderAuthorizationStoreMaxEntries))
@@ -436,7 +438,7 @@ func canonicalVNextReaderPrepareRuntimeConfig(
 		return vnextReaderPrepareRuntimeConfig{}, err
 	}
 	if err := validateVNextReaderIdentity(
-		"local Reader PREPARE cxld instance ID", config.LocalCxldInstanceID); err != nil {
+		"local Reader PREPARE cxld logical ID", config.LocalCxldLogicalID); err != nil {
 		return vnextReaderPrepareRuntimeConfig{}, err
 	}
 	if config.Store.MaxEntries <= 0 ||
@@ -498,8 +500,8 @@ func canonicalVNextReaderPrepareRuntimeConfig(
 	}
 	config.LocalExecutorNodeID = cloneVNextReaderRetainedString(
 		config.LocalExecutorNodeID)
-	config.LocalCxldInstanceID = cloneVNextReaderRetainedString(
-		config.LocalCxldInstanceID)
+	config.LocalCxldLogicalID = cloneVNextReaderRetainedString(
+		config.LocalCxldLogicalID)
 	config.TLS.ListenAddress = cloneVNextReaderRetainedString(config.TLS.ListenAddress)
 	config.TLS.ServerCertificatePath = cloneVNextReaderRetainedString(
 		config.TLS.ServerCertificatePath)
@@ -761,7 +763,8 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 	}
 	service, err := dependencies.newService(
 		canonical.LocalExecutorNodeID,
-		canonical.LocalCxldInstanceID,
+		canonical.LocalCxldLogicalID,
+		processIncarnation,
 		store,
 		dependencies.clock,
 		verifier)
@@ -775,7 +778,8 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 	}
 	statusService, err := dependencies.newStatusService(
 		canonical.LocalExecutorNodeID,
-		canonical.LocalCxldInstanceID,
+		canonical.LocalCxldLogicalID,
+		processIncarnation,
 		store,
 		statusVerifier)
 	if err != nil {
@@ -788,7 +792,7 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 	}
 	identifyService, err := dependencies.newIdentifyService(
 		canonical.LocalExecutorNodeID,
-		canonical.LocalCxldInstanceID,
+		canonical.LocalCxldLogicalID,
 		processIncarnation,
 		canonical.TLS.ExpectedServerURISAN,
 		identifyVerifier)

@@ -27,13 +27,17 @@ func vnextReaderAuthorizationStoreTestAcquired(
 ) vnextReaderAcquiredAuthorization {
 	publicationDigest := sha256.Sum256([]byte("authorization-store-publication"))
 	deviceDigest := sha256.Sum256([]byte("authorization-store-devices"))
+	processIncarnation := vnextReaderProcessIncarnation(
+		sha256.Sum256([]byte("authorization-store-process-incarnation")))
 	return vnextReaderAcquiredAuthorization{
 		Authorization: vnextReaderAuthorization{
-			RestoreAuthorizationID: authorizationID,
-			CheckpointID:           "checkpoint-a",
-			ExecutorID:             "executor-a",
-			CxldInstanceID:         "reader-cxld-a",
-			TargetContainerID:      "target-container-a",
+			RestoreAuthorizationID:                   authorizationID,
+			CheckpointID:                             "checkpoint-a",
+			ExecutorID:                               "executor-a",
+			CxldLogicalID:                            "reader-cxld-a",
+			CxldProcessIncarnationID:                 processIncarnation,
+			ReaderInitialRegistrationCatalogRevision: 23,
+			TargetContainerID:                        "target-container-a",
 			Root: vnextReaderTrustedRoot{
 				RootID:            "root-a",
 				RootVersion:       7,
@@ -157,7 +161,13 @@ func TestVNextReaderAuthorizationStoreLookupRequiresExactIdentity(t *testing.T) 
 			candidate.Authorization.ExecutorID = "different-executor"
 		},
 		"reader cxld": func(candidate *vnextReaderAcquiredAuthorization) {
-			candidate.Authorization.CxldInstanceID = "different-cxld"
+			candidate.Authorization.CxldLogicalID = "different-cxld"
+		},
+		"reader process incarnation": func(candidate *vnextReaderAcquiredAuthorization) {
+			candidate.Authorization.CxldProcessIncarnationID[0] ^= 0xff
+		},
+		"reader birth revision": func(candidate *vnextReaderAcquiredAuthorization) {
+			candidate.Authorization.ReaderInitialRegistrationCatalogRevision++
 		},
 		"target": func(candidate *vnextReaderAcquiredAuthorization) {
 			candidate.Authorization.TargetContainerID = "different-target"
@@ -265,6 +275,8 @@ func TestVNextReaderAuthorizationStoreIdentityAndNumericBounds(t *testing.T) {
 	exactIdentity := vnextReaderAuthorizationStoreTestAcquired("authorization-exact-identity")
 	exactIdentity.SchedulerID = strings.Repeat("s", cxlcheckpoint.MaxIdentityBytes)
 	exactIdentity.SchedulerFenceRevision = cxlcheckpoint.MaxSignedLong
+	exactIdentity.Authorization.ReaderInitialRegistrationCatalogRevision =
+		cxlcheckpoint.MaxSignedLong
 	if _, _, err := store.Prepare(exactIdentity, 150); err != nil {
 		t.Fatalf("exact identity/fence bounds were rejected: %v", err)
 	}
@@ -278,6 +290,26 @@ func TestVNextReaderAuthorizationStoreIdentityAndNumericBounds(t *testing.T) {
 	tooLargeFence.SchedulerFenceRevision = cxlcheckpoint.MaxSignedLong + 1
 	if _, _, err := store.Prepare(tooLargeFence, 150); err == nil {
 		t.Fatal("Scheduler fence above signed ABI was accepted")
+	}
+	zeroIncarnation := vnextReaderAuthorizationStoreTestAcquired(
+		"authorization-zero-incarnation")
+	zeroIncarnation.Authorization.CxldProcessIncarnationID =
+		vnextReaderProcessIncarnation{}
+	if _, _, err := store.Prepare(zeroIncarnation, 150); err == nil {
+		t.Fatal("zero process incarnation was accepted")
+	}
+	zeroBirthRevision := vnextReaderAuthorizationStoreTestAcquired(
+		"authorization-zero-birth-revision")
+	zeroBirthRevision.Authorization.ReaderInitialRegistrationCatalogRevision = 0
+	if _, _, err := store.Prepare(zeroBirthRevision, 150); err == nil {
+		t.Fatal("zero initial registration revision was accepted")
+	}
+	tooLargeBirthRevision := vnextReaderAuthorizationStoreTestAcquired(
+		"authorization-large-birth-revision")
+	tooLargeBirthRevision.Authorization.ReaderInitialRegistrationCatalogRevision =
+		cxlcheckpoint.MaxSignedLong + 1
+	if _, _, err := store.Prepare(tooLargeBirthRevision, 150); err == nil {
+		t.Fatal("initial registration revision above signed ABI was accepted")
 	}
 	missing := vnextReaderAuthorizationStoreTestAcquired("authorization-missing-identity")
 	missing.LastMutationID = ""
@@ -501,7 +533,7 @@ func TestVNextReaderAuthorizationStoreClonesRetainedStringsAndRuns(t *testing.T)
 		acquired.Authorization.RestoreAuthorizationID)
 	acquired.Authorization.CheckpointID = aliased(acquired.Authorization.CheckpointID)
 	acquired.Authorization.ExecutorID = aliased(acquired.Authorization.ExecutorID)
-	acquired.Authorization.CxldInstanceID = aliased(acquired.Authorization.CxldInstanceID)
+	acquired.Authorization.CxldLogicalID = aliased(acquired.Authorization.CxldLogicalID)
 	acquired.Authorization.TargetContainerID = aliased(acquired.Authorization.TargetContainerID)
 	acquired.Authorization.Root.RootID = aliased(acquired.Authorization.Root.RootID)
 	acquired.Authorization.Root.MMTemplateID = aliased(acquired.Authorization.Root.MMTemplateID)
@@ -534,7 +566,7 @@ func TestVNextReaderAuthorizationStoreClonesRetainedStringsAndRuns(t *testing.T)
 		{"authorization ID", acquired.Authorization.RestoreAuthorizationID, stored.Authorization.RestoreAuthorizationID},
 		{"checkpoint ID", acquired.Authorization.CheckpointID, stored.Authorization.CheckpointID},
 		{"executor ID", acquired.Authorization.ExecutorID, stored.Authorization.ExecutorID},
-		{"cxld instance ID", acquired.Authorization.CxldInstanceID, stored.Authorization.CxldInstanceID},
+		{"cxld logical ID", acquired.Authorization.CxldLogicalID, stored.Authorization.CxldLogicalID},
 		{"target container ID", acquired.Authorization.TargetContainerID, stored.Authorization.TargetContainerID},
 		{"root ID", acquired.Authorization.Root.RootID, stored.Authorization.Root.RootID},
 		{"MM template ID", acquired.Authorization.Root.MMTemplateID, stored.Authorization.Root.MMTemplateID},

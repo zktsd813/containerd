@@ -25,6 +25,28 @@ type vnextReaderPrepareTestClock struct {
 	position int
 }
 
+type vnextReaderPrepareTestStore struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (store *vnextReaderPrepareTestStore) Prepare(
+	vnextReaderAcquiredAuthorization,
+	int64,
+) (vnextReaderPreparedAuthorization, vnextReaderPreparationDisposition, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.calls++
+	return vnextReaderPreparedAuthorization{}, 0,
+		errors.New("unexpected PREPARE test-store call")
+}
+
+func (store *vnextReaderPrepareTestStore) callCount() int {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.calls
+}
+
 func (clock *vnextReaderPrepareTestClock) NowEpochMillis() int64 {
 	clock.mu.Lock()
 	defer clock.mu.Unlock()
@@ -135,7 +157,8 @@ func newVNextReaderPrepareTestFixtureWithStore(
 	}
 	service, err := newVNextReaderPrepareService(
 		acquired.Authorization.ExecutorID,
-		acquired.Authorization.CxldInstanceID,
+		acquired.Authorization.CxldLogicalID,
+		acquired.Authorization.CxldProcessIncarnationID,
 		store,
 		clock,
 		verifier)
@@ -223,7 +246,9 @@ func TestVNextReaderPrepareRPCInstallsAndEchoesExactAuthorization(t *testing.T) 
 		response.AuthorityProof.AuthenticatedSchedulerPrincipal !=
 			vnextReaderPrepareTestPrincipal ||
 		response.LocalExecutorNodeID != fixture.acquired.Authorization.ExecutorID ||
-		response.LocalCxldInstanceID != fixture.acquired.Authorization.CxldInstanceID ||
+		response.LocalCxldLogicalID != fixture.acquired.Authorization.CxldLogicalID ||
+		response.LocalProcessIncarnation !=
+			fixture.acquired.Authorization.CxldProcessIncarnationID ||
 		!equalVNextReaderAcquiredAuthorization(
 			response.Prepared.Acquired, fixture.acquired) {
 		t.Fatalf("Reader PREPARE response lost exact identity: %#v", response)
@@ -280,6 +305,17 @@ func TestVNextReaderPrepareStrictRequestCodecRejectsMalformedInput(t *testing.T)
 	unknown["ownerOperation"] = "vnextOwnerReserve"
 	wrongProtocol := cloneMap()
 	wrongProtocol["protocol"] = vnextReaderPrepareProtocol + "-other"
+	oldProtocol := cloneMap()
+	oldProtocol["protocol"] = "cxld.vnext-reader-prepare." + "v1"
+	oldCxldField := cloneMap()
+	oldAuthorization := oldCxldField["acquired"].(map[string]interface{})["authorization"].(map[string]interface{})
+	oldAuthorization["executorCxld"+"Id"] = oldAuthorization["executorCxldLogicalId"]
+	delete(oldAuthorization, "executorCxldLogicalId")
+	missingProcess := cloneMap()
+	delete(missingProcess["acquired"].(map[string]interface{})["authorization"].(map[string]interface{}),
+		"executorCxldProcessIncarnationId")
+	zeroBirthRevision := cloneMap()
+	zeroBirthRevision["acquired"].(map[string]interface{})["authorization"].(map[string]interface{})["readerInitialRegistrationCatalogRevision"] = float64(0)
 	wrongState := cloneMap()
 	wrongState["acquired"].(map[string]interface{})["catalogState"] = "active"
 	nullRuns := cloneMap()
@@ -329,22 +365,26 @@ func TestVNextReaderPrepareStrictRequestCodecRejectsMalformedInput(t *testing.T)
 	}
 
 	cases := map[string][]byte{
-		"empty":             nil,
-		"oversize":          bytes.Repeat([]byte{'x'}, vnextReaderPrepareMaxFrameBytes+1),
-		"invalid UTF-8":     {0xff},
-		"null authority":    marshalMap(nullAuthority),
-		"missing operation": marshalMap(missingOperation),
-		"unknown field":     marshalMap(unknown),
-		"wrong protocol":    marshalMap(wrongProtocol),
-		"wrong state enum":  marshalMap(wrongState),
-		"null page runs":    marshalMap(nullRuns),
-		"short cluster":     marshalMap(shortCluster),
-		"uppercase cluster": marshalMap(uppercaseCluster),
-		"zero cluster":      marshalMap(zeroCluster),
-		"uppercase digest":  uppercaseDigest,
-		"duplicate field":   duplicateProtocol,
-		"trailing value":    append(append([]byte(nil), fixture.frame...), []byte(` {}`)...),
-		"257 page runs":     tooManyRunsBody,
+		"empty":               nil,
+		"oversize":            bytes.Repeat([]byte{'x'}, vnextReaderPrepareMaxFrameBytes+1),
+		"invalid UTF-8":       {0xff},
+		"null authority":      marshalMap(nullAuthority),
+		"missing operation":   marshalMap(missingOperation),
+		"unknown field":       marshalMap(unknown),
+		"wrong protocol":      marshalMap(wrongProtocol),
+		"old v1 protocol":     marshalMap(oldProtocol),
+		"old cxld field":      marshalMap(oldCxldField),
+		"missing process":     marshalMap(missingProcess),
+		"zero birth revision": marshalMap(zeroBirthRevision),
+		"wrong state enum":    marshalMap(wrongState),
+		"null page runs":      marshalMap(nullRuns),
+		"short cluster":       marshalMap(shortCluster),
+		"uppercase cluster":   marshalMap(uppercaseCluster),
+		"zero cluster":        marshalMap(zeroCluster),
+		"uppercase digest":    uppercaseDigest,
+		"duplicate field":     duplicateProtocol,
+		"trailing value":      append(append([]byte(nil), fixture.frame...), []byte(` {}`)...),
+		"257 page runs":       tooManyRunsBody,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -361,7 +401,7 @@ func TestVNextReaderPrepareCanonicalDigestBindsEveryPayloadClass(t *testing.T) {
 	want := vnextReaderPrepareCanonicalRequestDigest(base)
 	// A stable fixture catches accidental field-order or domain changes across
 	// the future Scala/Go transport implementation.
-	const wantHex = "0c3dcc871d56bccdde7dd989a8111707a6945bd61f7101300af11f0e9a33b601"
+	const wantHex = "d3e66b9433ef007cb9c32be0b82d0363de67a015cb35e355442b63ff7478117d"
 	if got := hex.EncodeToString(want[:]); got != wantHex {
 		t.Fatalf("canonical Reader PREPARE fixture digest = %s, want %s", got, wantHex)
 	}
@@ -377,7 +417,13 @@ func TestVNextReaderPrepareCanonicalDigestBindsEveryPayloadClass(t *testing.T) {
 			value.Authorization.ExecutorID += "-other"
 		},
 		"cxld": func(value *vnextReaderAcquiredAuthorization) {
-			value.Authorization.CxldInstanceID += "-other"
+			value.Authorization.CxldLogicalID += "-other"
+		},
+		"process incarnation": func(value *vnextReaderAcquiredAuthorization) {
+			value.Authorization.CxldProcessIncarnationID[0] ^= 0xff
+		},
+		"initial registration revision": func(value *vnextReaderAcquiredAuthorization) {
+			value.Authorization.ReaderInitialRegistrationCatalogRevision++
 		},
 		"target": func(value *vnextReaderAcquiredAuthorization) {
 			value.Authorization.TargetContainerID += "-other"
@@ -521,7 +567,7 @@ func TestVNextReaderPrepareRejectsStaleProofPrincipalFenceAndLocalIdentity(t *te
 			value.Authorization.ExecutorID += "-remote"
 		},
 		"wrong cxld": func(value *vnextReaderAcquiredAuthorization) {
-			value.Authorization.CxldInstanceID += "-remote"
+			value.Authorization.CxldLogicalID += "-remote"
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -541,6 +587,33 @@ func TestVNextReaderPrepareRejectsStaleProofPrincipalFenceAndLocalIdentity(t *te
 					fixture.verifier.callCount())
 			}
 		})
+	}
+}
+
+func TestVNextReaderPrepareIncarnationMismatchNeverCallsStoreOrVerifier(t *testing.T) {
+	fixture := newVNextReaderPrepareTestFixture(t)
+	store := &vnextReaderPrepareTestStore{}
+	fixture.service.store = store
+
+	acquired := cloneVNextReaderAcquiredAuthorization(fixture.acquired)
+	acquired.Authorization.CxldProcessIncarnationID[0] ^= 0xff
+	request := vnextReaderPrepareTestRequest(acquired)
+	frame := vnextReaderPrepareTestFrame(t, request)
+	_, failure := fixture.rpc.Handle(
+		context.Background(), vnextReaderPrepareTestPrincipal, frame)
+	if failure == nil || failure.Code != vnextReaderPrepareIncarnationMismatch ||
+		failure.Acceptance != vnextReaderPrepareDefinitelyNotAccepted {
+		t.Fatalf("incarnation mismatch failure = %#v", failure)
+	}
+	if store.callCount() != 0 || fixture.verifier.callCount() != 0 {
+		t.Fatalf("incarnation mismatch reached store/verifier: %d/%d",
+			store.callCount(), fixture.verifier.callCount())
+	}
+	fixture.clock.mu.Lock()
+	clockCalls := fixture.clock.position
+	fixture.clock.mu.Unlock()
+	if clockCalls != 0 {
+		t.Fatalf("incarnation mismatch reached receiver clock %d times", clockCalls)
 	}
 }
 
@@ -849,7 +922,10 @@ func TestVNextReaderPrepareResponseEncoderRejectsMalformedAcquiredEcho(t *testin
 			value.RequestDigest[0] ^= 0xff
 		},
 		"wrong local identity": func(value *vnextReaderPrepareResponse) {
-			value.LocalCxldInstanceID += "-other"
+			value.LocalCxldLogicalID += "-other"
+		},
+		"wrong local process incarnation": func(value *vnextReaderPrepareResponse) {
+			value.LocalProcessIncarnation[0] ^= 0xff
 		},
 		"wrong disposition": func(value *vnextReaderPrepareResponse) {
 			value.Disposition = 0
@@ -901,7 +977,7 @@ func TestVNextReaderPrepareAuthoritySignaturePreimageIsStableAndComplete(t *test
 		t.Fatalf("build Reader authority signature preimage: %v", err)
 	}
 	digest := sha256.Sum256(preimage)
-	const wantDigestHex = "f4f6613001882b5f929379731c3a48d3e8903543670632390eacb62352132b95"
+	const wantDigestHex = "034e67ecfec7239efd92ed050ae9edacfd5a9a1f1361f70048580ca36f6b7803"
 	if got := hex.EncodeToString(digest[:]); got != wantDigestHex {
 		t.Fatalf("Reader authority preimage fixture digest = %s, want %s",
 			got, wantDigestHex)
@@ -962,7 +1038,7 @@ func TestVNextReaderPrepareAuthoritySignaturePreimageIsStableAndComplete(t *test
 	if err != nil {
 		t.Fatalf("derive base authority receipt: %v", err)
 	}
-	const wantAuthorityReceiptHex = "6e26a3f40db0f3f2ef55cf71ddda06af32a3c4d75fc1ab6e6d3d6dd1fef65dc6"
+	const wantAuthorityReceiptHex = "875e08b5337b025cf8df0ba8908b464b55223f65576708c59812fe8d1efafc55"
 	if got := hex.EncodeToString(baseReceipt[:]); got != wantAuthorityReceiptHex {
 		t.Fatalf("Reader authority receipt fixture = %s, want %s",
 			got, wantAuthorityReceiptHex)
@@ -1054,6 +1130,9 @@ func TestVNextReaderPrepareStrictResponseCodecRejectsSubstitution(t *testing.T) 
 		return value
 	}
 	mutations := map[string]func(map[string]interface{}){
+		"old v1 protocol": func(value map[string]interface{}) {
+			value["protocol"] = "cxld.vnext-reader-prepare." + "v1"
+		},
 		"state": func(value map[string]interface{}) {
 			value["state"] = "ACTIVE"
 		},
@@ -1062,6 +1141,13 @@ func TestVNextReaderPrepareStrictResponseCodecRejectsSubstitution(t *testing.T) 
 		},
 		"local executor": func(value map[string]interface{}) {
 			value["localExecutorNodeId"] = "executor-other"
+		},
+		"old local cxld field": func(value map[string]interface{}) {
+			value["localCxldInstance"+"Id"] = value["localCxldLogicalId"]
+			delete(value, "localCxldLogicalId")
+		},
+		"missing local process": func(value map[string]interface{}) {
+			delete(value, "localProcessIncarnationId")
 		},
 		"request digest": func(value map[string]interface{}) {
 			value["requestDigest"] = strings.ToUpper(value["requestDigest"].(string))
@@ -1152,8 +1238,9 @@ func TestVNextReaderPrepareServiceHasZeroDAXOwnerCRIULifecycleDependencies(t *te
 	serviceType := reflect.TypeOf(*fixture.service)
 	wantFields := map[string]reflect.Type{
 		"localExecutorNodeID": reflect.TypeOf(""),
-		"localCxldInstanceID": reflect.TypeOf(""),
-		"store":               reflect.TypeOf((*vnextReaderAuthorizationStore)(nil)),
+		"localCxldLogicalID":  reflect.TypeOf(""),
+		"processIncarnation":  reflect.TypeOf(vnextReaderProcessIncarnation{}),
+		"store":               reflect.TypeOf((*vnextReaderPrepareStore)(nil)).Elem(),
 		"clock":               reflect.TypeOf((*vnextReaderPrepareClock)(nil)).Elem(),
 		"authorityVerifier": reflect.TypeOf(
 			(*vnextReaderPrepareAuthorityVerifier)(nil)).Elem(),
@@ -1203,6 +1290,8 @@ func TestVNextReaderPrepareConstructorFailsClosed(t *testing.T) {
 	}
 	clock := &vnextReaderPrepareTestClock{values: []int64{150}}
 	verifier := &vnextReaderPrepareTestVerifier{}
+	processIncarnation := vnextReaderAuthorizationStoreTestAcquired(
+		"constructor-process").Authorization.CxldProcessIncarnationID
 	cases := []struct {
 		name     string
 		executor string
@@ -1220,7 +1309,8 @@ func TestVNextReaderPrepareConstructorFailsClosed(t *testing.T) {
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			if service, err := newVNextReaderPrepareService(
-				test.executor, test.cxld, test.store, test.clock, test.verifier); err == nil || service != nil {
+				test.executor, test.cxld, processIncarnation,
+				test.store, test.clock, test.verifier); err == nil || service != nil {
 				t.Fatalf("constructor = %#v / %v, want fail closed", service, err)
 			}
 		})
@@ -1273,5 +1363,5 @@ func BenchmarkVNextReaderPrepareCanonicalDigest(b *testing.B) {
 
 func Example_vnextReaderPrepareProtocol() {
 	fmt.Printf("%s %s", vnextReaderPrepareProtocol, vnextReaderPrepareOperation)
-	// Output: cxld.vnext-reader-prepare.v1 vnextReaderPrepareAuthorization
+	// Output: cxld.vnext-reader-prepare.v2 vnextReaderPrepareAuthorization
 }

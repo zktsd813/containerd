@@ -2516,10 +2516,10 @@ func main() {
 		"vnext-reader-prepare-local-executor-node-id",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_LOCAL_EXECUTOR_NODE_ID", ""),
 		"exact local executor node identity for Reader PREPARE/STATUS_AND_FENCE")
-	vnextReaderPrepareLocalCxldInstanceID := flag.String(
-		"vnext-reader-prepare-local-cxld-instance-id",
-		envExactDefault("CXLD_VNEXT_READER_PREPARE_LOCAL_CXLD_INSTANCE_ID", ""),
-		"exact local cxld instance identity for Reader PREPARE/STATUS_AND_FENCE")
+	vnextReaderPrepareLocalCxldLogicalID := flag.String(
+		"vnext-reader-prepare-local-cxld-logical-id",
+		envExactDefault("CXLD_VNEXT_READER_PREPARE_LOCAL_CXLD_LOGICAL_ID", ""),
+		"exact local cxld logical identity for Reader PREPARE/STATUS_AND_FENCE")
 	vnextReaderPrepareStoreMaxEntries := flag.String(
 		"vnext-reader-prepare-store-max-entries",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_STORE_MAX_ENTRIES", ""),
@@ -2605,7 +2605,7 @@ func main() {
 		vnextReaderPrepareRuntimeInput{
 			Enabled:                     *vnextReaderPrepareEnabled,
 			LocalExecutorNodeID:         *vnextReaderPrepareLocalExecutorNodeID,
-			LocalCxldInstanceID:         *vnextReaderPrepareLocalCxldInstanceID,
+			LocalCxldLogicalID:          *vnextReaderPrepareLocalCxldLogicalID,
 			StoreMaxEntries:             *vnextReaderPrepareStoreMaxEntries,
 			StoreMaxRetainedBytes:       *vnextReaderPrepareStoreMaxRetainedBytes,
 			TLSListenAddress:            *vnextReaderPrepareTLSListen,

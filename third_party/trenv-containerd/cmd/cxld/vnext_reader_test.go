@@ -76,14 +76,14 @@ func newVNextReaderTestFixture(t *testing.T) *vnextReaderTestFixture {
 		RestoreAuthorizationID: "reader-restore-authorization",
 		CheckpointID:           fixture.publication.CheckpointID,
 		ExecutorID:             "reader-executor",
-		CxldInstanceID:         "reader-cxld",
+		CxldLogicalID:          "reader-cxld",
 		TargetContainerID:      "reader-container",
 	}
 	fixture.authorization = vnextReaderAuthorization{
 		RestoreAuthorizationID: fixture.request.RestoreAuthorizationID,
 		CheckpointID:           fixture.request.CheckpointID,
 		ExecutorID:             fixture.request.ExecutorID,
-		CxldInstanceID:         fixture.request.CxldInstanceID,
+		CxldLogicalID:          fixture.request.CxldLogicalID,
 		TargetContainerID:      fixture.request.TargetContainerID,
 		Root: vnextReaderTrustedRoot{
 			RootID:            fixture.publication.Root.RootID,

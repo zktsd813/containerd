@@ -812,6 +812,7 @@ func validVNextReaderPrepareTLSErrorCode(code vnextReaderPrepareErrorCode) bool 
 	case vnextReaderPrepareInvalidRequest,
 		vnextReaderPrepareAuthorityError,
 		vnextReaderPrepareIdentityError,
+		vnextReaderPrepareIncarnationMismatch,
 		vnextReaderPrepareConflictError,
 		vnextReaderPrepareCapacityError,
 		vnextReaderPrepareUnavailable:

@@ -265,6 +265,7 @@ func validVNextReaderPreparedStatusTLSErrorCode(
 	case vnextReaderPreparedStatusInvalidRequest,
 		vnextReaderPreparedStatusAuthorityError,
 		vnextReaderPreparedStatusIdentityError,
+		vnextReaderPreparedStatusIncarnationMismatch,
 		vnextReaderPreparedStatusConflictError,
 		vnextReaderPreparedStatusCapacityError,
 		vnextReaderPreparedStatusUnavailable:

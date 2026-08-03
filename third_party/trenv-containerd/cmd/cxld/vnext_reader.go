@@ -26,7 +26,7 @@ type vnextReaderRequest struct {
 	RestoreAuthorizationID string
 	CheckpointID           string
 	ExecutorID             string
-	CxldInstanceID         string
+	CxldLogicalID          string
 	TargetContainerID      string
 }
 
@@ -56,15 +56,17 @@ type vnextReaderTrustedRoot struct {
 
 // vnextReaderAuthorization is the trusted result returned by the Scheduler
 // authorization adapter. Echoing the portable request identities prevents a
-// stale authorization for another executor, cxld instance, or container from
+// stale authorization for another executor, cxld logical slot, or container from
 // reaching the DAX read path.
 type vnextReaderAuthorization struct {
-	RestoreAuthorizationID string
-	CheckpointID           string
-	ExecutorID             string
-	CxldInstanceID         string
-	TargetContainerID      string
-	Root                   vnextReaderTrustedRoot
+	RestoreAuthorizationID                   string
+	CheckpointID                             string
+	ExecutorID                               string
+	CxldLogicalID                            string
+	CxldProcessIncarnationID                 vnextReaderProcessIncarnation
+	ReaderInitialRegistrationCatalogRevision uint64
+	TargetContainerID                        string
+	Root                                     vnextReaderTrustedRoot
 }
 
 type vnextReaderAuthorizer interface {
@@ -251,7 +253,7 @@ func (reader *vnextAuthorizedReader) validateAuthorization(
 		{"restore authorization ID", request.RestoreAuthorizationID, authorization.RestoreAuthorizationID},
 		{"checkpoint ID", request.CheckpointID, authorization.CheckpointID},
 		{"executor ID", request.ExecutorID, authorization.ExecutorID},
-		{"cxld instance ID", request.CxldInstanceID, authorization.CxldInstanceID},
+		{"cxld logical ID", request.CxldLogicalID, authorization.CxldLogicalID},
 		{"target container ID", request.TargetContainerID, authorization.TargetContainerID},
 	} {
 		if identity.request != identity.granted {
@@ -543,7 +545,7 @@ func validateVNextReaderRequest(request vnextReaderRequest) error {
 		{"restore authorization ID", request.RestoreAuthorizationID},
 		{"checkpoint ID", request.CheckpointID},
 		{"executor ID", request.ExecutorID},
-		{"cxld instance ID", request.CxldInstanceID},
+		{"cxld logical ID", request.CxldLogicalID},
 		{"target container ID", request.TargetContainerID},
 	} {
 		if err := validateVNextReaderIdentity(identity.name, identity.value); err != nil {

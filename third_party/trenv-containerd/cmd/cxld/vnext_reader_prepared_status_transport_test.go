@@ -315,8 +315,11 @@ func TestVNextReaderPrepareAndStatusTLSRejectsWrongOrMissingALPNBeforeDispatch(
 	server, _, _ := startVNextReaderPrepareAndStatusTLSTestServer(
 		t, material, prepareHandler, statusHandler, nil)
 	for name, protocols := range map[string][]string{
-		"wrong":   {vnextOwnerTLSALPN},
-		"missing": nil,
+		"wrong":            {vnextOwnerTLSALPN},
+		"old PREPARE v1":   {"cxld-vnext-reader/" + "1"},
+		"wrong PREPARE v2": {"cxld-vnext-reader-prepare/" + "2"},
+		"old STATUS v1":    {"cxld-vnext-reader-prepared-status/" + "1"},
+		"missing":          nil,
 	} {
 		t.Run(name, func(t *testing.T) {
 			config := vnextReaderPrepareTLSTestClientConfig(
@@ -369,6 +372,53 @@ func TestVNextReaderPreparedStatusTLSFailureCodecIsOperationSpecific(
 	}
 	if _, err := decodeStrictVNextReaderPreparedStatusTLSFailure(prepareBody); err == nil {
 		t.Fatal("STATUS_AND_FENCE failure codec accepted PREPARE identity")
+	}
+}
+
+func TestVNextReaderIncarnationMismatchFailureFramesAreExactAndBounded(t *testing.T) {
+	prepareBody, err := marshalVNextReaderPrepareTLSFailure(
+		vnextReaderPrepareFailure(
+			vnextReaderPrepareIncarnationMismatch,
+			vnextReaderPrepareDefinitelyNotAccepted,
+			errors.New("private PREPARE mismatch detail")))
+	if err != nil || len(prepareBody) == 0 ||
+		len(prepareBody) > vnextReaderPrepareMaxFrameBytes {
+		t.Fatalf("marshal bounded PREPARE mismatch = %d/%v", len(prepareBody), err)
+	}
+	prepareWire, err := decodeStrictVNextReaderPrepareTLSFailure(prepareBody)
+	if err != nil || prepareWire.ErrorCode != vnextReaderPrepareIncarnationMismatch ||
+		prepareWire.Acceptance != vnextReaderPrepareDefinitelyNotAccepted ||
+		bytes.Contains(prepareBody, []byte("private")) {
+		t.Fatalf("PREPARE mismatch failure frame = %#v/%v/%s",
+			prepareWire, err, prepareBody)
+	}
+	wantPrepareBody := []byte(`{"protocol":"cxld.vnext-reader-prepare.v2","operation":"vnextReaderPrepareAuthorization","errorCode":"INCARNATION_MISMATCH","acceptance":"DEFINITELY_NOT_ACCEPTED"}`)
+	if !bytes.Equal(prepareBody, wantPrepareBody) {
+		t.Fatalf("PREPARE mismatch failure JSON = %s, want %s",
+			prepareBody, wantPrepareBody)
+	}
+
+	statusBody, err := marshalVNextReaderPreparedStatusTLSFailure(
+		vnextReaderPreparedStatusFailure(
+			vnextReaderPreparedStatusIncarnationMismatch,
+			vnextReaderPreparedStatusDefinitelyNotAccepted,
+			errors.New("private STATUS mismatch detail")))
+	if err != nil || len(statusBody) == 0 ||
+		len(statusBody) > vnextReaderPreparedStatusMaxFrameBytes {
+		t.Fatalf("marshal bounded STATUS mismatch = %d/%v", len(statusBody), err)
+	}
+	statusWire, err := decodeStrictVNextReaderPreparedStatusTLSFailure(statusBody)
+	if err != nil ||
+		statusWire.ErrorCode != vnextReaderPreparedStatusIncarnationMismatch ||
+		statusWire.Acceptance != vnextReaderPreparedStatusDefinitelyNotAccepted ||
+		bytes.Contains(statusBody, []byte("private")) {
+		t.Fatalf("STATUS mismatch failure frame = %#v/%v/%s",
+			statusWire, err, statusBody)
+	}
+	wantStatusBody := []byte(`{"protocol":"cxld.vnext-reader-prepared-status-and-fence.v2","operation":"vnextReaderPreparedStatusAndFence","errorCode":"INCARNATION_MISMATCH","acceptance":"DEFINITELY_NOT_ACCEPTED"}`)
+	if !bytes.Equal(statusBody, wantStatusBody) {
+		t.Fatalf("STATUS mismatch failure JSON = %s, want %s",
+			statusBody, wantStatusBody)
 	}
 }
 

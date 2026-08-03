@@ -317,7 +317,7 @@ func validateVNextReaderAcquiredAuthorizationIdentityAndInterval(
 		RestoreAuthorizationID: acquired.Authorization.RestoreAuthorizationID,
 		CheckpointID:           acquired.Authorization.CheckpointID,
 		ExecutorID:             acquired.Authorization.ExecutorID,
-		CxldInstanceID:         acquired.Authorization.CxldInstanceID,
+		CxldLogicalID:          acquired.Authorization.CxldLogicalID,
 		TargetContainerID:      acquired.Authorization.TargetContainerID,
 	}); err != nil {
 		return fmt.Errorf("validate VNext Reader ACQUIRED identity: %w", err)
@@ -342,6 +342,19 @@ func validateVNextReaderAcquiredAuthorizationIdentityAndInterval(
 		return fmt.Errorf(
 			"Scheduler fence revision %d is outside 1..%d",
 			acquired.SchedulerFenceRevision, cxlcheckpoint.MaxSignedLong)
+	}
+	if err := validateVNextReaderProcessIncarnation(
+		acquired.Authorization.CxldProcessIncarnationID); err != nil {
+		return fmt.Errorf(
+			"validate VNext Reader ACQUIRED process incarnation: %w", err)
+	}
+	if acquired.Authorization.ReaderInitialRegistrationCatalogRevision == 0 ||
+		acquired.Authorization.ReaderInitialRegistrationCatalogRevision >
+			cxlcheckpoint.MaxSignedLong {
+		return fmt.Errorf(
+			"Reader initial registration catalog revision %d is outside 1..%d",
+			acquired.Authorization.ReaderInitialRegistrationCatalogRevision,
+			cxlcheckpoint.MaxSignedLong)
 	}
 	if acquired.CatalogState != vnextReaderCatalogAuthorizationAcquired {
 		return fmt.Errorf(
@@ -484,7 +497,8 @@ func vnextReaderAuthorizationRetainedCharge(
 		authorization.RestoreAuthorizationID,
 		authorization.CheckpointID,
 		authorization.ExecutorID,
-		authorization.CxldInstanceID,
+		authorization.CxldLogicalID,
+		authorization.CxldProcessIncarnationID.String(),
 		authorization.TargetContainerID,
 		root.RootID,
 		root.MMTemplateID,
@@ -498,6 +512,12 @@ func vnextReaderAuthorizationRetainedCharge(
 		if err := addString(value); err != nil {
 			return 0, err
 		}
+	}
+	// Explicitly charge the immutable birth revision. The canonical 64-byte
+	// incarnation text above is deliberately more conservative than the compact
+	// 32-byte in-memory representation.
+	if err := add(8); err != nil {
+		return 0, err
 	}
 	runCount := uint64(len(root.PublicationLocator.PageRuns))
 	if runCount > ^uint64(0)/vnextReaderAuthorizationStorePerRunChargeBytes {
@@ -534,8 +554,12 @@ func cloneVNextReaderAcquiredAuthorization(
 		authorization.CheckpointID)
 	cloned.Authorization.ExecutorID = cloneVNextReaderRetainedString(
 		authorization.ExecutorID)
-	cloned.Authorization.CxldInstanceID = cloneVNextReaderRetainedString(
-		authorization.CxldInstanceID)
+	cloned.Authorization.CxldLogicalID = cloneVNextReaderRetainedString(
+		authorization.CxldLogicalID)
+	cloned.Authorization.CxldProcessIncarnationID =
+		authorization.CxldProcessIncarnationID
+	cloned.Authorization.ReaderInitialRegistrationCatalogRevision =
+		authorization.ReaderInitialRegistrationCatalogRevision
 	cloned.Authorization.TargetContainerID = cloneVNextReaderRetainedString(
 		authorization.TargetContainerID)
 
@@ -600,7 +624,11 @@ func equalVNextReaderAcquiredAuthorization(
 	if leftAuthorization.RestoreAuthorizationID != rightAuthorization.RestoreAuthorizationID ||
 		leftAuthorization.CheckpointID != rightAuthorization.CheckpointID ||
 		leftAuthorization.ExecutorID != rightAuthorization.ExecutorID ||
-		leftAuthorization.CxldInstanceID != rightAuthorization.CxldInstanceID ||
+		leftAuthorization.CxldLogicalID != rightAuthorization.CxldLogicalID ||
+		leftAuthorization.CxldProcessIncarnationID !=
+			rightAuthorization.CxldProcessIncarnationID ||
+		leftAuthorization.ReaderInitialRegistrationCatalogRevision !=
+			rightAuthorization.ReaderInitialRegistrationCatalogRevision ||
 		leftAuthorization.TargetContainerID != rightAuthorization.TargetContainerID {
 		return false
 	}

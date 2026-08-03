@@ -23,15 +23,15 @@ const (
 	// Reader PREPARE is deliberately not an Owner operation or an Owner TLS
 	// route. A future authenticated transport must negotiate this distinct ALPN
 	// and pass the authenticated Scheduler principal to Handle.
-	vnextReaderPrepareProtocol  = "cxld.vnext-reader-prepare.v1"
+	vnextReaderPrepareProtocol  = "cxld.vnext-reader-prepare.v2"
 	vnextReaderPrepareOperation = "vnextReaderPrepareAuthorization"
-	vnextReaderPrepareALPN      = "cxld-vnext-reader/1"
+	vnextReaderPrepareALPN      = "cxld-vnext-reader/2"
 
-	vnextReaderPrepareAuthorityDomain          = "cxld-vnext-reader-prepare-authority-v1"
-	vnextReaderPrepareAuthoritySignatureDomain = "cxld-vnext-reader-prepare-authority-signature-v1"
-	vnextReaderPrepareAuthorityReceiptDomain   = "cxld-vnext-reader-prepare-authority-receipt-v1"
-	vnextReaderPrepareRequestDigestDomain      = "cxld-vnext-reader-prepare-request-digest-v1"
-	vnextReaderPrepareReceiptDomain            = "cxld-vnext-reader-prepare-receipt-v1"
+	vnextReaderPrepareAuthorityDomain          = "cxld-vnext-reader-prepare-authority-v2"
+	vnextReaderPrepareAuthoritySignatureDomain = "cxld-vnext-reader-prepare-authority-signature-v2"
+	vnextReaderPrepareAuthorityReceiptDomain   = "cxld-vnext-reader-prepare-authority-receipt-v2"
+	vnextReaderPrepareRequestDigestDomain      = "cxld-vnext-reader-prepare-request-digest-v2"
+	vnextReaderPrepareReceiptDomain            = "cxld-vnext-reader-prepare-receipt-v2"
 
 	// Two maximum-size portable identities per locator run require a little
 	// over two MiB before encoding. encoding/json HTML-escapes '<', '>', and
@@ -97,30 +97,39 @@ type vnextReaderPrepareClock interface {
 	NowEpochMillis() int64
 }
 
+type vnextReaderPrepareStore interface {
+	Prepare(
+		vnextReaderAcquiredAuthorization,
+		int64,
+	) (vnextReaderPreparedAuthorization, vnextReaderPreparationDisposition, error)
+}
+
 type vnextReaderPrepareRequest struct {
 	Acquired  vnextReaderAcquiredAuthorization
 	Authority vnextReaderPrepareAuthorityEnvelope
 }
 
 type vnextReaderPrepareResponse struct {
-	RequestDigest       [sha256.Size]byte
-	AuthorityProof      vnextReaderPrepareAuthorityProof
-	LocalExecutorNodeID string
-	LocalCxldInstanceID string
-	Prepared            vnextReaderPreparedAuthorization
-	Disposition         vnextReaderPreparationDisposition
-	Receipt             [sha256.Size]byte
+	RequestDigest           [sha256.Size]byte
+	AuthorityProof          vnextReaderPrepareAuthorityProof
+	LocalExecutorNodeID     string
+	LocalCxldLogicalID      string
+	LocalProcessIncarnation vnextReaderProcessIncarnation
+	Prepared                vnextReaderPreparedAuthorization
+	Disposition             vnextReaderPreparationDisposition
+	Receipt                 [sha256.Size]byte
 }
 
 type vnextReaderPrepareErrorCode string
 
 const (
-	vnextReaderPrepareInvalidRequest vnextReaderPrepareErrorCode = "INVALID_REQUEST"
-	vnextReaderPrepareAuthorityError vnextReaderPrepareErrorCode = "AUTHORITY_REJECTED"
-	vnextReaderPrepareIdentityError  vnextReaderPrepareErrorCode = "IDENTITY_REJECTED"
-	vnextReaderPrepareConflictError  vnextReaderPrepareErrorCode = "CONFLICT"
-	vnextReaderPrepareCapacityError  vnextReaderPrepareErrorCode = "CAPACITY_EXHAUSTED"
-	vnextReaderPrepareUnavailable    vnextReaderPrepareErrorCode = "UNAVAILABLE"
+	vnextReaderPrepareInvalidRequest      vnextReaderPrepareErrorCode = "INVALID_REQUEST"
+	vnextReaderPrepareAuthorityError      vnextReaderPrepareErrorCode = "AUTHORITY_REJECTED"
+	vnextReaderPrepareIdentityError       vnextReaderPrepareErrorCode = "IDENTITY_REJECTED"
+	vnextReaderPrepareIncarnationMismatch vnextReaderPrepareErrorCode = "INCARNATION_MISMATCH"
+	vnextReaderPrepareConflictError       vnextReaderPrepareErrorCode = "CONFLICT"
+	vnextReaderPrepareCapacityError       vnextReaderPrepareErrorCode = "CAPACITY_EXHAUSTED"
+	vnextReaderPrepareUnavailable         vnextReaderPrepareErrorCode = "UNAVAILABLE"
 )
 
 type vnextReaderPrepareAcceptance string
@@ -170,16 +179,18 @@ func vnextReaderPrepareFailure(
 
 type vnextReaderPrepareService struct {
 	localExecutorNodeID string
-	localCxldInstanceID string
-	store               *vnextReaderAuthorizationStore
+	localCxldLogicalID  string
+	processIncarnation  vnextReaderProcessIncarnation
+	store               vnextReaderPrepareStore
 	clock               vnextReaderPrepareClock
 	authorityVerifier   vnextReaderPrepareAuthorityVerifier
 }
 
 func newVNextReaderPrepareService(
 	localExecutorNodeID string,
-	localCxldInstanceID string,
-	store *vnextReaderAuthorizationStore,
+	localCxldLogicalID string,
+	processIncarnation vnextReaderProcessIncarnation,
+	store vnextReaderPrepareStore,
 	clock vnextReaderPrepareClock,
 	authorityVerifier vnextReaderPrepareAuthorityVerifier,
 ) (*vnextReaderPrepareService, error) {
@@ -188,10 +199,13 @@ func newVNextReaderPrepareService(
 		return nil, err
 	}
 	if err := validateVNextReaderIdentity(
-		"local Reader cxld instance ID", localCxldInstanceID); err != nil {
+		"local Reader cxld logical ID", localCxldLogicalID); err != nil {
 		return nil, err
 	}
-	if store == nil {
+	if err := validateVNextReaderProcessIncarnation(processIncarnation); err != nil {
+		return nil, fmt.Errorf("validate local Reader process incarnation: %w", err)
+	}
+	if vnextReaderPreparedStatusNilInterface(store) {
 		return nil, errors.New("VNext Reader PREPARE authorization store is unavailable")
 	}
 	if clock == nil {
@@ -202,7 +216,8 @@ func newVNextReaderPrepareService(
 	}
 	return &vnextReaderPrepareService{
 		localExecutorNodeID: cloneVNextReaderRetainedString(localExecutorNodeID),
-		localCxldInstanceID: cloneVNextReaderRetainedString(localCxldInstanceID),
+		localCxldLogicalID:  cloneVNextReaderRetainedString(localCxldLogicalID),
+		processIncarnation:  processIncarnation,
 		store:               store,
 		clock:               clock,
 		authorityVerifier:   authorityVerifier,
@@ -217,8 +232,8 @@ func (service *vnextReaderPrepareService) Prepare(
 	authenticatedSchedulerPrincipal string,
 	request vnextReaderPrepareRequest,
 ) (vnextReaderPrepareResponse, *vnextReaderPrepareRPCError) {
-	if service == nil || service.store == nil || service.clock == nil ||
-		service.authorityVerifier == nil {
+	if service == nil || vnextReaderPreparedStatusNilInterface(service.store) ||
+		service.clock == nil || service.authorityVerifier == nil {
 		return vnextReaderPrepareResponse{}, vnextReaderPrepareFailure(
 			vnextReaderPrepareUnavailable,
 			vnextReaderPrepareDefinitelyNotAccepted,
@@ -248,23 +263,33 @@ func (service *vnextReaderPrepareService) Prepare(
 	authenticatedSchedulerPrincipal = cloneVNextReaderRetainedString(
 		authenticatedSchedulerPrincipal)
 
-	firstNow := service.clock.NowEpochMillis()
-	if err := validateVNextReaderPrepareAcquired(request.Acquired, firstNow); err != nil {
-		return vnextReaderPrepareResponse{}, vnextReaderPrepareFailure(
-			vnextReaderPrepareInvalidRequest,
-			vnextReaderPrepareDefinitelyNotAccepted, err)
-	}
 	if request.Acquired.Authorization.ExecutorID != service.localExecutorNodeID ||
-		request.Acquired.Authorization.CxldInstanceID != service.localCxldInstanceID {
+		request.Acquired.Authorization.CxldLogicalID != service.localCxldLogicalID {
 		return vnextReaderPrepareResponse{}, vnextReaderPrepareFailure(
 			vnextReaderPrepareIdentityError,
 			vnextReaderPrepareDefinitelyNotAccepted,
 			fmt.Errorf(
 				"authorization targets executor/cxld %q/%q, local identity is %q/%q",
 				request.Acquired.Authorization.ExecutorID,
-				request.Acquired.Authorization.CxldInstanceID,
+				request.Acquired.Authorization.CxldLogicalID,
 				service.localExecutorNodeID,
-				service.localCxldInstanceID))
+				service.localCxldLogicalID))
+	}
+	if request.Acquired.Authorization.CxldProcessIncarnationID !=
+		service.processIncarnation {
+		return vnextReaderPrepareResponse{}, vnextReaderPrepareFailure(
+			vnextReaderPrepareIncarnationMismatch,
+			vnextReaderPrepareDefinitelyNotAccepted,
+			fmt.Errorf(
+				"authorization targets process incarnation %q, local process incarnation is %q",
+				request.Acquired.Authorization.CxldProcessIncarnationID.String(),
+				service.processIncarnation.String()))
+	}
+	firstNow := service.clock.NowEpochMillis()
+	if err := validateVNextReaderPrepareAcquired(request.Acquired, firstNow); err != nil {
+		return vnextReaderPrepareResponse{}, vnextReaderPrepareFailure(
+			vnextReaderPrepareInvalidRequest,
+			vnextReaderPrepareDefinitelyNotAccepted, err)
 	}
 	if err := validateVNextReaderPrepareAuthorityEnvelope(request.Authority); err != nil {
 		return vnextReaderPrepareResponse{}, vnextReaderPrepareFailure(
@@ -326,12 +351,13 @@ func (service *vnextReaderPrepareService) Prepare(
 		return vnextReaderPrepareResponse{}, mapVNextReaderPrepareStoreError(err)
 	}
 	response := vnextReaderPrepareResponse{
-		RequestDigest:       requestDigest,
-		AuthorityProof:      cloneVNextReaderPrepareAuthorityProof(proof),
-		LocalExecutorNodeID: service.localExecutorNodeID,
-		LocalCxldInstanceID: service.localCxldInstanceID,
-		Prepared:            prepared,
-		Disposition:         disposition,
+		RequestDigest:           requestDigest,
+		AuthorityProof:          cloneVNextReaderPrepareAuthorityProof(proof),
+		LocalExecutorNodeID:     service.localExecutorNodeID,
+		LocalCxldLogicalID:      service.localCxldLogicalID,
+		LocalProcessIncarnation: service.processIncarnation,
+		Prepared:                prepared,
+		Disposition:             disposition,
 	}
 	response.Receipt = vnextReaderPrepareCanonicalReceipt(response)
 	return response, nil
@@ -600,7 +626,11 @@ func vnextReaderWriteCanonicalAcquired(
 	vnextReaderPrepareWriteString(buffer, authorization.RestoreAuthorizationID)
 	vnextReaderPrepareWriteString(buffer, authorization.CheckpointID)
 	vnextReaderPrepareWriteString(buffer, authorization.ExecutorID)
-	vnextReaderPrepareWriteString(buffer, authorization.CxldInstanceID)
+	vnextReaderPrepareWriteString(buffer, authorization.CxldLogicalID)
+	vnextReaderPrepareWriteString(
+		buffer, authorization.CxldProcessIncarnationID.String())
+	vnextReaderPrepareWriteU64(
+		buffer, authorization.ReaderInitialRegistrationCatalogRevision)
 	vnextReaderPrepareWriteString(buffer, authorization.TargetContainerID)
 	root := authorization.Root
 	vnextReaderPrepareWriteString(buffer, root.RootID)
@@ -705,7 +735,9 @@ func vnextReaderPrepareCanonicalReceipt(
 	buffer.Write(proof.RequestDigest[:])
 	buffer.Write(proof.AuthorityReceipt[:])
 	vnextReaderPrepareWriteString(&buffer, response.LocalExecutorNodeID)
-	vnextReaderPrepareWriteString(&buffer, response.LocalCxldInstanceID)
+	vnextReaderPrepareWriteString(&buffer, response.LocalCxldLogicalID)
+	vnextReaderPrepareWriteString(
+		&buffer, response.LocalProcessIncarnation.String())
 	vnextReaderPrepareWriteString(&buffer, string(vnextReaderPreparationPrepared))
 	vnextReaderPrepareWriteString(&buffer,
 		vnextReaderPrepareDispositionName(response.Disposition))
@@ -784,12 +816,14 @@ type vnextReaderPrepareRootWire struct {
 }
 
 type vnextReaderPrepareAuthorizationWire struct {
-	RestoreAuthorizationID string                     `json:"restoreAuthorizationId"`
-	CheckpointID           string                     `json:"checkpointId"`
-	ExecutorNodeID         string                     `json:"executorNodeId"`
-	ExecutorCxldID         string                     `json:"executorCxldId"`
-	TargetContainerID      string                     `json:"targetContainerId"`
-	Root                   vnextReaderPrepareRootWire `json:"root"`
+	RestoreAuthorizationID                   string                     `json:"restoreAuthorizationId"`
+	CheckpointID                             string                     `json:"checkpointId"`
+	ExecutorNodeID                           string                     `json:"executorNodeId"`
+	ExecutorCxldLogicalID                    string                     `json:"executorCxldLogicalId"`
+	ExecutorCxldProcessIncarnationID         string                     `json:"executorCxldProcessIncarnationId"`
+	ReaderInitialRegistrationCatalogRevision uint64                     `json:"readerInitialRegistrationCatalogRevision"`
+	TargetContainerID                        string                     `json:"targetContainerId"`
+	Root                                     vnextReaderPrepareRootWire `json:"root"`
 }
 
 type vnextReaderPrepareAcquiredWire struct {
@@ -832,16 +866,17 @@ type vnextReaderPrepareAuthorityProofWire struct {
 }
 
 type vnextReaderPrepareResponseWire struct {
-	Protocol            string                               `json:"protocol"`
-	Operation           string                               `json:"operation"`
-	RequestDigest       string                               `json:"requestDigest"`
-	AuthorityProof      vnextReaderPrepareAuthorityProofWire `json:"authorityProof"`
-	LocalExecutorNodeID string                               `json:"localExecutorNodeId"`
-	LocalCxldInstanceID string                               `json:"localCxldInstanceId"`
-	State               string                               `json:"state"`
-	Disposition         string                               `json:"disposition"`
-	Acquired            vnextReaderPrepareAcquiredWire       `json:"acquired"`
-	Receipt             string                               `json:"receipt"`
+	Protocol                  string                               `json:"protocol"`
+	Operation                 string                               `json:"operation"`
+	RequestDigest             string                               `json:"requestDigest"`
+	AuthorityProof            vnextReaderPrepareAuthorityProofWire `json:"authorityProof"`
+	LocalExecutorNodeID       string                               `json:"localExecutorNodeId"`
+	LocalCxldLogicalID        string                               `json:"localCxldLogicalId"`
+	LocalProcessIncarnationID string                               `json:"localProcessIncarnationId"`
+	State                     string                               `json:"state"`
+	Disposition               string                               `json:"disposition"`
+	Acquired                  vnextReaderPrepareAcquiredWire       `json:"acquired"`
+	Receipt                   string                               `json:"receipt"`
 }
 
 func decodeVNextReaderPrepareRequest(raw []byte) (
@@ -936,16 +971,17 @@ func marshalVNextReaderPrepareResponse(
 		return nil, errors.New("Reader PREPARE response receipt is inconsistent")
 	}
 	wire := vnextReaderPrepareResponseWire{
-		Protocol:            vnextReaderPrepareProtocol,
-		Operation:           vnextReaderPrepareOperation,
-		RequestDigest:       hex.EncodeToString(response.RequestDigest[:]),
-		AuthorityProof:      vnextReaderPrepareAuthorityProofWireFromInternal(response.AuthorityProof),
-		LocalExecutorNodeID: response.LocalExecutorNodeID,
-		LocalCxldInstanceID: response.LocalCxldInstanceID,
-		State:               string(vnextReaderPreparationPrepared),
-		Disposition:         disposition,
-		Acquired:            vnextReaderPrepareAcquiredWireFromInternal(response.Prepared.Acquired),
-		Receipt:             hex.EncodeToString(response.Receipt[:]),
+		Protocol:                  vnextReaderPrepareProtocol,
+		Operation:                 vnextReaderPrepareOperation,
+		RequestDigest:             hex.EncodeToString(response.RequestDigest[:]),
+		AuthorityProof:            vnextReaderPrepareAuthorityProofWireFromInternal(response.AuthorityProof),
+		LocalExecutorNodeID:       response.LocalExecutorNodeID,
+		LocalCxldLogicalID:        response.LocalCxldLogicalID,
+		LocalProcessIncarnationID: response.LocalProcessIncarnation.String(),
+		State:                     string(vnextReaderPreparationPrepared),
+		Disposition:               disposition,
+		Acquired:                  vnextReaderPrepareAcquiredWireFromInternal(response.Prepared.Acquired),
+		Receipt:                   hex.EncodeToString(response.Receipt[:]),
 	}
 	return marshalBoundedVNextReaderPrepareJSON(wire)
 }
@@ -991,11 +1027,18 @@ func decodeVNextReaderPrepareResponse(raw []byte) (
 	if err != nil {
 		return vnextReaderPrepareResponse{}, err
 	}
+	processIncarnation, err := parseVNextReaderProcessIncarnation(
+		wire.LocalProcessIncarnationID)
+	if err != nil {
+		return vnextReaderPrepareResponse{}, fmt.Errorf(
+			"decode response local process incarnation: %w", err)
+	}
 	response := vnextReaderPrepareResponse{
-		RequestDigest:       requestDigest,
-		AuthorityProof:      proof,
-		LocalExecutorNodeID: wire.LocalExecutorNodeID,
-		LocalCxldInstanceID: wire.LocalCxldInstanceID,
+		RequestDigest:           requestDigest,
+		AuthorityProof:          proof,
+		LocalExecutorNodeID:     wire.LocalExecutorNodeID,
+		LocalCxldLogicalID:      wire.LocalCxldLogicalID,
+		LocalProcessIncarnation: processIncarnation,
 		Prepared: vnextReaderPreparedAuthorization{
 			Acquired: acquired, PreparationState: vnextReaderPreparationPrepared,
 		},
@@ -1024,7 +1067,7 @@ func validateVNextReaderPrepareResponseIdentity(
 		value string
 	}{
 		{"response local executor node ID", response.LocalExecutorNodeID},
-		{"response local cxld instance ID", response.LocalCxldInstanceID},
+		{"response local cxld logical ID", response.LocalCxldLogicalID},
 		{"response authenticated Scheduler principal",
 			response.AuthorityProof.AuthenticatedSchedulerPrincipal},
 		{"response Scheduler ID", response.AuthorityProof.SchedulerID},
@@ -1033,10 +1076,16 @@ func validateVNextReaderPrepareResponseIdentity(
 			return err
 		}
 	}
+	if err := validateVNextReaderProcessIncarnation(
+		response.LocalProcessIncarnation); err != nil {
+		return fmt.Errorf("validate response local process incarnation: %w", err)
+	}
 	acquired := response.Prepared.Acquired
 	proof := response.AuthorityProof
 	if response.LocalExecutorNodeID != acquired.Authorization.ExecutorID ||
-		response.LocalCxldInstanceID != acquired.Authorization.CxldInstanceID ||
+		response.LocalCxldLogicalID != acquired.Authorization.CxldLogicalID ||
+		response.LocalProcessIncarnation !=
+			acquired.Authorization.CxldProcessIncarnationID ||
 		proof.SchedulerID != acquired.SchedulerID ||
 		proof.SchedulerFenceRevision != acquired.SchedulerFenceRevision ||
 		proof.RequestDigest != response.RequestDigest ||
@@ -1075,13 +1124,21 @@ func (wire vnextReaderPrepareAuthorizationWire) internal() (
 	if err != nil {
 		return vnextReaderAuthorization{}, err
 	}
+	incarnation, err := parseVNextReaderProcessIncarnation(
+		wire.ExecutorCxldProcessIncarnationID)
+	if err != nil {
+		return vnextReaderAuthorization{}, fmt.Errorf(
+			"decode executor cxld process incarnation: %w", err)
+	}
 	return vnextReaderAuthorization{
-		RestoreAuthorizationID: wire.RestoreAuthorizationID,
-		CheckpointID:           wire.CheckpointID,
-		ExecutorID:             wire.ExecutorNodeID,
-		CxldInstanceID:         wire.ExecutorCxldID,
-		TargetContainerID:      wire.TargetContainerID,
-		Root:                   root,
+		RestoreAuthorizationID:                   wire.RestoreAuthorizationID,
+		CheckpointID:                             wire.CheckpointID,
+		ExecutorID:                               wire.ExecutorNodeID,
+		CxldLogicalID:                            wire.ExecutorCxldLogicalID,
+		CxldProcessIncarnationID:                 incarnation,
+		ReaderInitialRegistrationCatalogRevision: wire.ReaderInitialRegistrationCatalogRevision,
+		TargetContainerID:                        wire.TargetContainerID,
+		Root:                                     root,
 	}, nil
 }
 
@@ -1218,11 +1275,13 @@ func vnextReaderPrepareAcquiredWireFromInternal(
 	}
 	return vnextReaderPrepareAcquiredWire{
 		Authorization: vnextReaderPrepareAuthorizationWire{
-			RestoreAuthorizationID: authorization.RestoreAuthorizationID,
-			CheckpointID:           authorization.CheckpointID,
-			ExecutorNodeID:         authorization.ExecutorID,
-			ExecutorCxldID:         authorization.CxldInstanceID,
-			TargetContainerID:      authorization.TargetContainerID,
+			RestoreAuthorizationID:                   authorization.RestoreAuthorizationID,
+			CheckpointID:                             authorization.CheckpointID,
+			ExecutorNodeID:                           authorization.ExecutorID,
+			ExecutorCxldLogicalID:                    authorization.CxldLogicalID,
+			ExecutorCxldProcessIncarnationID:         authorization.CxldProcessIncarnationID.String(),
+			ReaderInitialRegistrationCatalogRevision: authorization.ReaderInitialRegistrationCatalogRevision,
+			TargetContainerID:                        authorization.TargetContainerID,
 			Root: vnextReaderPrepareRootWire{
 				RootID:            root.RootID,
 				RootVersion:       root.RootVersion,

@@ -139,6 +139,47 @@ func TestVNextReaderIdentifyRPCReturnsCanonicalBoundIdentity(t *testing.T) {
 	}
 }
 
+func TestVNextReaderIdentifyV1AdvertisesOnlyCanonicalPrepareAndStatusV2(t *testing.T) {
+	if vnextReaderIdentifyProtocol != "cxld.vnext-reader-identify.v1" ||
+		vnextReaderIdentifyALPN != "cxld-vnext-reader-identify/1" {
+		t.Fatalf("IDENTIFY hard-cut identity = %q/%q",
+			vnextReaderIdentifyProtocol, vnextReaderIdentifyALPN)
+	}
+	if vnextReaderPrepareProtocol != "cxld.vnext-reader-prepare.v2" ||
+		vnextReaderPrepareALPN != "cxld-vnext-reader/2" ||
+		vnextReaderPrepareAuthorityDomain != "cxld-vnext-reader-prepare-authority-v2" ||
+		vnextReaderPrepareAuthoritySignatureDomain != "cxld-vnext-reader-prepare-authority-signature-v2" ||
+		vnextReaderPrepareAuthorityReceiptDomain != "cxld-vnext-reader-prepare-authority-receipt-v2" ||
+		vnextReaderPrepareRequestDigestDomain != "cxld-vnext-reader-prepare-request-digest-v2" ||
+		vnextReaderPrepareReceiptDomain != "cxld-vnext-reader-prepare-receipt-v2" {
+		t.Fatal("PREPARE v2 protocol, ALPN, or canonical domain drifted")
+	}
+	if vnextReaderPreparedStatusProtocol !=
+		"cxld.vnext-reader-prepared-status-and-fence.v2" ||
+		vnextReaderPreparedStatusALPN != "cxld-vnext-reader-prepared-status/2" ||
+		vnextReaderPreparedStatusAuthorityDomain !=
+			"cxld-vnext-reader-prepared-status-and-fence-authority-v2" ||
+		vnextReaderPreparedStatusAuthoritySignatureDomain !=
+			"cxld-vnext-reader-prepared-status-and-fence-authority-signature-v2" ||
+		vnextReaderPreparedStatusAuthorityReceiptDomain !=
+			"cxld-vnext-reader-prepared-status-and-fence-authority-receipt-v2" ||
+		vnextReaderPreparedStatusRequestDigestDomain !=
+			"cxld-vnext-reader-prepared-status-and-fence-request-digest-v2" ||
+		vnextReaderPreparedStatusResponseReceiptDomain !=
+			"cxld-vnext-reader-prepared-status-and-fence-response-receipt-v2" {
+		t.Fatal("STATUS_AND_FENCE v2 protocol, ALPN, or canonical domain drifted")
+	}
+	capabilities := vnextReaderIdentifyCurrentCapabilities()
+	if err := validateVNextReaderIdentifyCapabilities(capabilities); err != nil {
+		t.Fatalf("validate canonical IDENTIFY capabilities: %v", err)
+	}
+	digest := vnextReaderIdentifyCanonicalCapabilitiesDigest(capabilities)
+	const wantDigest = "2ed26b1132cb10ea75c11fd3663a9b837e277451889926231336c2fd2f5193d1"
+	if got := fmt.Sprintf("%x", digest); got != wantDigest {
+		t.Fatalf("IDENTIFY v1 capabilities digest = %s, want %s", got, wantDigest)
+	}
+}
+
 func mustMarshalVNextReaderIdentifyResponse(
 	t *testing.T,
 	response vnextReaderIdentifyResponse,

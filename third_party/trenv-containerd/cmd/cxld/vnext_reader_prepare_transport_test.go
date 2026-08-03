@@ -412,6 +412,12 @@ func TestVNextReaderPrepareTLSRejectsALPNVersionChainAndAmbiguousSAN(t *testing.
 		"wrong ALPN": func(config *tls.Config) {
 			config.NextProtos = []string{vnextOwnerTLSALPN}
 		},
+		"old PREPARE v1 ALPN": func(config *tls.Config) {
+			config.NextProtos = []string{"cxld-vnext-reader/" + "1"}
+		},
+		"noncanonical PREPARE v2 ALPN": func(config *tls.Config) {
+			config.NextProtos = []string{"cxld-vnext-reader-prepare/" + "2"}
+		},
 		"TLS 1.2": func(config *tls.Config) {
 			config.MinVersion = tls.VersionTLS12
 			config.MaxVersion = tls.VersionTLS12

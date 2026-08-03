@@ -131,7 +131,7 @@ func validVNextReaderPrepareRuntimeInput(
 	return vnextReaderPrepareRuntimeInput{
 		Enabled:                     "true",
 		LocalExecutorNodeID:         "reader-node-0",
-		LocalCxldInstanceID:         "reader-cxld-0",
+		LocalCxldLogicalID:          "reader-cxld-0",
 		StoreMaxEntries:             "8",
 		StoreMaxRetainedBytes:       "1048576",
 		TLSListenAddress:            "127.0.0.1:0",
@@ -644,7 +644,9 @@ func TestVNextReaderPrepareRuntimePublishesIdentityBeforeListener(
 		t.Fatalf("open runtime with ordered identity publication: %v", err)
 	}
 	if published != want || runtime.processIncarnation != want ||
-		runtime.identifyService.processIncarnation != want {
+		runtime.identifyService.processIncarnation != want ||
+		runtime.service.processIncarnation != want ||
+		runtime.statusService.processIncarnation != want {
 		_ = runtime.Close()
 		t.Fatal("runtime components did not share the one generated incarnation")
 	}
@@ -921,7 +923,7 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 		t.Fatalf("runtime did not retain the exact injected daemon admissions")
 	}
 	if runtime.service.localExecutorNodeID != config.LocalExecutorNodeID ||
-		runtime.service.localCxldInstanceID != config.LocalCxldInstanceID ||
+		runtime.service.localCxldLogicalID != config.LocalCxldLogicalID ||
 		tlsConfig.ExpectedServerURISAN != config.TLS.ExpectedServerURISAN {
 		t.Fatal("runtime did not retain the exact trusted local IDs and server URI SAN")
 	}

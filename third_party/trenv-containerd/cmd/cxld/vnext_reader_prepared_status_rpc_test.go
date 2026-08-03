@@ -149,7 +149,8 @@ func newVNextReaderPreparedStatusTestFixtureWithStore(
 	}
 	service, err := newVNextReaderPreparedStatusService(
 		acquired.Authorization.ExecutorID,
-		acquired.Authorization.CxldInstanceID,
+		acquired.Authorization.CxldLogicalID,
+		acquired.Authorization.CxldProcessIncarnationID,
 		store,
 		verifier)
 	if err != nil {
@@ -288,6 +289,7 @@ func TestVNextReaderPreparedStatusAllPreStoreChecksAreDefinitive(t *testing.T) {
 	wantCodes := map[string]vnextReaderPreparedStatusErrorCode{
 		"non-URI principal":        vnextReaderPreparedStatusAuthorityError,
 		"local target":             vnextReaderPreparedStatusIdentityError,
+		"process incarnation":      vnextReaderPreparedStatusIncarnationMismatch,
 		"zero device digest":       vnextReaderPreparedStatusInvalidRequest,
 		"zero publication digest":  vnextReaderPreparedStatusInvalidRequest,
 		"authority request digest": vnextReaderPreparedStatusAuthorityError,
@@ -309,6 +311,13 @@ func TestVNextReaderPreparedStatusAllPreStoreChecksAreDefinitive(t *testing.T) {
 			request := fixture.request
 			request.Acquired = cloneVNextReaderAcquiredAuthorization(request.Acquired)
 			request.Acquired.Authorization.ExecutorID = "executor-other"
+			return context.Background(), vnextReaderPreparedStatusTestPrincipal, request
+		},
+		"process incarnation": func(_ *testing.T, fixture *vnextReaderPreparedStatusTestFixture) (
+			context.Context, string, vnextReaderPreparedStatusRequest) {
+			request := fixture.request
+			request.Acquired = cloneVNextReaderAcquiredAuthorization(request.Acquired)
+			request.Acquired.Authorization.CxldProcessIncarnationID[0] ^= 0xff
 			return context.Background(), vnextReaderPreparedStatusTestPrincipal, request
 		},
 		"zero device digest": func(_ *testing.T, fixture *vnextReaderPreparedStatusTestFixture) (
@@ -378,6 +387,10 @@ func TestVNextReaderPreparedStatusAllPreStoreChecksAreDefinitive(t *testing.T) {
 				t.Fatalf("pre-store rejection mutated/called store: calls=%d entries=%d bytes=%d",
 					fixture.store.callCount(), len(fixture.inner.byID),
 					fixture.inner.retainedBytes)
+			}
+			if name == "process incarnation" && fixture.verifier.callCount() != 0 {
+				t.Fatalf("incarnation mismatch reached verifier %d times",
+					fixture.verifier.callCount())
 			}
 		})
 	}
@@ -586,16 +599,28 @@ func TestVNextReaderPreparedStatusCodecIsExactAndBounded(t *testing.T) {
 		[]byte(`"operation":"`+vnextReaderPreparedStatusOperation+`"`),
 		[]byte(`"operation":1`),
 		1)
+	oldProtocol := bytes.Replace(
+		fixture.frame,
+		[]byte(vnextReaderPreparedStatusProtocol),
+		[]byte("cxld.vnext-reader-prepared-status-and-fence."+"v1"),
+		1)
+	oldCxldField := bytes.Replace(
+		fixture.frame,
+		[]byte(`"executorCxldLogicalId"`),
+		[]byte(`"executorCxld`+`Id"`),
+		1)
 	malformed := map[string][]byte{
-		"empty":        nil,
-		"null":         []byte(`null`),
-		"unknown":      unknown,
-		"missing":      missingFrame,
-		"duplicate":    duplicate,
-		"wrong type":   wrongType,
-		"trailing":     append(append([]byte(nil), fixture.frame...), []byte(` {}`)...),
-		"invalid utf8": []byte{0xff},
-		"oversize":     make([]byte, vnextReaderPreparedStatusMaxFrameBytes+1),
+		"empty":           nil,
+		"null":            []byte(`null`),
+		"unknown":         unknown,
+		"missing":         missingFrame,
+		"duplicate":       duplicate,
+		"wrong type":      wrongType,
+		"old v1 protocol": oldProtocol,
+		"old cxld field":  oldCxldField,
+		"trailing":        append(append([]byte(nil), fixture.frame...), []byte(` {}`)...),
+		"invalid utf8":    []byte{0xff},
+		"oversize":        make([]byte, vnextReaderPreparedStatusMaxFrameBytes+1),
 	}
 	for name, frame := range malformed {
 		t.Run(name, func(t *testing.T) {
@@ -652,14 +677,27 @@ func TestVNextReaderPreparedStatusStrictResponseCodecRejectsMalformedShape(
 		[]byte(`"localExecutorNodeId":"`),
 		[]byte(`"localExecutorNodeId":1,"discarded":"`),
 		1)
+	oldLocalCxldField := bytes.Replace(
+		body,
+		[]byte(`"localCxldLogicalId"`),
+		[]byte(`"localCxldInstance`+`Id"`),
+		1)
+	missingLocalProcess := bytes.Replace(
+		body,
+		[]byte(`,"localProcessIncarnationId":"`+
+			fixture.acquired.Authorization.CxldProcessIncarnationID.String()+`"`),
+		nil,
+		1)
 	malformed := map[string][]byte{
-		"unknown":      unknown,
-		"missing":      missingBody,
-		"duplicate":    duplicate,
-		"wrong type":   wrongType,
-		"trailing":     append(append([]byte(nil), body...), []byte(` {}`)...),
-		"invalid utf8": {0xff},
-		"oversize":     make([]byte, vnextReaderPreparedStatusMaxFrameBytes+1),
+		"unknown":               unknown,
+		"missing":               missingBody,
+		"duplicate":             duplicate,
+		"wrong type":            wrongType,
+		"old local cxld field":  oldLocalCxldField,
+		"missing local process": missingLocalProcess,
+		"trailing":              append(append([]byte(nil), body...), []byte(` {}`)...),
+		"invalid utf8":          {0xff},
+		"oversize":              make([]byte, vnextReaderPreparedStatusMaxFrameBytes+1),
 	}
 	for name, candidate := range malformed {
 		t.Run(name, func(t *testing.T) {
@@ -722,7 +760,9 @@ func TestVNextReaderPreparedStatusConstructorFailsClosed(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			service, err := newVNextReaderPreparedStatusService(
-				test.executor, test.cxld, test.store, test.verifier)
+				test.executor, test.cxld,
+				fixture.acquired.Authorization.CxldProcessIncarnationID,
+				test.store, test.verifier)
 			if err == nil || service != nil {
 				t.Fatalf("invalid constructor=%#v/%v", service, err)
 			}
@@ -735,7 +775,7 @@ func vnextReaderPreparedStatusMaxAcquired() vnextReaderAcquiredAuthorization {
 	acquired := vnextReaderAuthorizationStoreTestAcquired(value)
 	acquired.Authorization.CheckpointID = value
 	acquired.Authorization.ExecutorID = value
-	acquired.Authorization.CxldInstanceID = value
+	acquired.Authorization.CxldLogicalID = value
 	acquired.Authorization.TargetContainerID = value
 	acquired.Authorization.Root.RootID = value
 	acquired.Authorization.Root.MMTemplateID = value
@@ -797,9 +837,10 @@ func TestVNextReaderPreparedStatusMaximumPortableResponseFitsBound(t *testing.T)
 			RequestDigest:                   request.Authority.RequestDigest,
 			AuthorityReceipt:                proofReceipt,
 		},
-		LocalExecutorNodeID: acquired.Authorization.ExecutorID,
-		LocalCxldInstanceID: acquired.Authorization.CxldInstanceID,
-		Acquired:            acquired,
+		LocalExecutorNodeID:     acquired.Authorization.ExecutorID,
+		LocalCxldLogicalID:      acquired.Authorization.CxldLogicalID,
+		LocalProcessIncarnation: acquired.Authorization.CxldProcessIncarnationID,
+		Acquired:                acquired,
 	}
 	for _, state := range []vnextReaderPreparedStatusAndFenceState{
 		vnextReaderPreparedStatusExactPrepared,
@@ -900,7 +941,7 @@ func TestVNextReaderPreparedStatusProtocolAndAPIHaveNoLifecycleAuthority(t *test
 	}
 }
 
-func TestVNextReaderPreparedStatusConfiguredCxldTargetIsReceiptBound(t *testing.T) {
+func TestVNextReaderPreparedStatusExactProcessIncarnationIsReceiptBound(t *testing.T) {
 	fixture := newVNextReaderPreparedStatusTestFixture(t)
 	response, failure := fixture.service.StatusAndFence(
 		context.Background(), vnextReaderPreparedStatusTestPrincipal,
@@ -909,17 +950,13 @@ func TestVNextReaderPreparedStatusConfiguredCxldTargetIsReceiptBound(t *testing.
 		t.Fatal(failure)
 	}
 	original := response.Receipt
-	response.LocalCxldInstanceID = "cxld-after-restart"
+	response.LocalProcessIncarnation[0] ^= 0xff
 	if vnextReaderPreparedStatusCanonicalResponseReceipt(response) == original {
-		t.Fatal("response receipt did not bind the configured cxld target ID")
+		t.Fatal("response receipt did not bind the local process incarnation")
 	}
 	if err := validateVNextReaderPreparedStatusResponse(response); err == nil {
-		t.Fatal("response with a different configured cxld target was accepted")
+		t.Fatal("response with a different process incarnation was accepted")
 	}
-	// This deliberately does not claim restart safety. Reusing the same
-	// configured ID after restart is not detectable, because this slice has no
-	// durable or process-start incarnation field. Therefore no response state
-	// can serve as release/reclaim evidence across restart.
 }
 
 func TestVNextReaderPreparedStatusResponseWireRejectsReceiptSubstitution(t *testing.T) {

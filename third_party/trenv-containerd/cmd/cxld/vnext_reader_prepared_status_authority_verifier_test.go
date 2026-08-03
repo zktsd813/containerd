@@ -201,7 +201,8 @@ func TestVNextReaderPreparedStatusRealAuthorityServiceCallsReadAndStoreOnce(
 	store := &vnextReaderPreparedStatusTestStore{inner: inner}
 	service, err := newVNextReaderPreparedStatusService(
 		fixture.request.Acquired.Authorization.ExecutorID,
-		fixture.request.Acquired.Authorization.CxldInstanceID,
+		fixture.request.Acquired.Authorization.CxldLogicalID,
+		fixture.request.Acquired.Authorization.CxldProcessIncarnationID,
 		store,
 		fixture.verifier)
 	if err != nil {
@@ -611,11 +612,12 @@ func TestVNextReaderPreparedStatusStableCrossLanguageFixtureValues(t *testing.T)
 		t.Fatal(err)
 	}
 	base := vnextReaderPreparedStatusResponse{
-		RequestDigest:       fixture.request.Authority.RequestDigest,
-		AuthorityProof:      proof,
-		LocalExecutorNodeID: fixture.request.Acquired.Authorization.ExecutorID,
-		LocalCxldInstanceID: fixture.request.Acquired.Authorization.CxldInstanceID,
-		Acquired:            fixture.request.Acquired,
+		RequestDigest:           fixture.request.Authority.RequestDigest,
+		AuthorityProof:          proof,
+		LocalExecutorNodeID:     fixture.request.Acquired.Authorization.ExecutorID,
+		LocalCxldLogicalID:      fixture.request.Acquired.Authorization.CxldLogicalID,
+		LocalProcessIncarnation: fixture.request.Acquired.Authorization.CxldProcessIncarnationID,
+		Acquired:                fixture.request.Acquired,
 		Result: vnextReaderPreparedStatusAndFenceResult{
 			State: vnextReaderPreparedStatusNotPreparedFenced,
 		},
@@ -634,11 +636,11 @@ func TestVNextReaderPreparedStatusStableCrossLanguageFixtureValues(t *testing.T)
 	// domains and canonical field order. They must be updated only together
 	// with every Scheduler signer/verifier implementation.
 	want := map[string]string{
-		"request digest":            "38a2ae1f2d59b2d23dda37e79b218823ab1788599ce090e385cf264ae2ba8d79",
-		"signature preimage":        "324374896e5cc8b45234c7c513ff766e3f12dc47618b576a401b0d1a6649eeb9",
-		"authority receipt":         "82d5edfb4b4061eebcedfa44744a43b6f4ec248638cf03cfedc943af62bfd2e2",
-		"fenced response receipt":   "a22eaa89a9cebea5a0cd7d702ec1d27e578db401aabdcd5bae96f7306e302b8a",
-		"prepared response receipt": "e951b162eb840135fc0b456d4ba091b4ed351ce0fdc0e33660066fcfcaf09a77",
+		"request digest":            "7ede654090934e2401f2dd97419acf0797b343cb21df6316effd6b50aa9cb13c",
+		"signature preimage":        "30c9dd1d2c6242c4f0f42fd693643f4dd28472addb0c5f42eb1471872c919244",
+		"authority receipt":         "79a4836335e5db6815ec8ac757c7e8a12291c6f76f3c1fe674fab42481395915",
+		"fenced response receipt":   "7a65e845ade1b8326bd07571449a5d81ac327dd385cf3337b8dc7162f61b6133",
+		"prepared response receipt": "4ba28fc08141d17e1aeb18f6fdbe0262dfd09674577a4cdd07256ed9bc30ff01",
 	}
 	got := map[string]string{
 		"request digest":            fmt.Sprintf("%x", fixture.request.Authority.RequestDigest),
