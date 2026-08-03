@@ -52,17 +52,21 @@ func startVNextReaderIdentifyTLSTestServer(
 	t.Helper()
 	prepareFixture := newVNextReaderPrepareTestFixture(t)
 	statusFixture := newVNextReaderPreparedStatusTestFixture(t)
+	activationFixture := vnextReaderActivationRPCTestNewFixture(t, 8)
 	config := vnextReaderPrepareTLSTestConfig(material)
 	if mutate != nil {
 		mutate(&config)
 	}
 	requestAdmission := make(chan struct{}, 8)
 	largeAdmission := make(chan struct{}, 1)
-	server, err := startVNextReaderPrepareStatusAndIdentifyTLSServer(
+	server, err := startVNextReaderPrepareStatusIdentifyAndActivationTLSServer(
 		config, prepareFixture.rpc, statusFixture.rpc, identifyRPC,
+		newVNextReaderActivationProposalRPC(activationFixture.service),
+		newVNextReaderActivationCommitRPC(activationFixture.service),
+		newVNextReaderActivationStatusRPC(activationFixture.service),
 		requestAdmission, largeAdmission)
 	if err != nil {
-		t.Fatalf("start VNext Reader three-ALPN TLS test server: %v", err)
+		t.Fatalf("start VNext Reader six-ALPN TLS test server: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := server.Close(); err != nil {
@@ -108,11 +112,28 @@ func TestVNextReaderIdentifyTLSExactALPNDispatchesAuthenticatedRPC(
 	handler := &vnextReaderIdentifyTLSTestHandler{inner: fixture.rpc}
 	server, requestAdmission, largeAdmission :=
 		startVNextReaderIdentifyTLSTestServer(t, material, handler, nil)
-	if len(server.tlsConfig.NextProtos) != 3 ||
+	if len(server.tlsConfig.NextProtos) != 6 ||
 		server.tlsConfig.NextProtos[0] != vnextReaderPrepareALPN ||
 		server.tlsConfig.NextProtos[1] != vnextReaderPreparedStatusALPN ||
-		server.tlsConfig.NextProtos[2] != vnextReaderIdentifyALPN {
-		t.Fatalf("three-operation Reader ALPNs = %#v", server.tlsConfig.NextProtos)
+		server.tlsConfig.NextProtos[2] != vnextReaderIdentifyALPN ||
+		server.tlsConfig.NextProtos[3] != vnextReaderActivationProposalALPN ||
+		server.tlsConfig.NextProtos[4] != vnextReaderActivationCommitALPN ||
+		server.tlsConfig.NextProtos[5] != vnextReaderActivationStatusALPN {
+		t.Fatalf("six-operation Reader ALPNs = %#v", server.tlsConfig.NextProtos)
+	}
+	servedALPNs := make(map[string]struct{}, len(server.tlsConfig.NextProtos))
+	for _, alpn := range server.tlsConfig.NextProtos {
+		servedALPNs[alpn] = struct{}{}
+	}
+	capabilities := vnextReaderIdentifyCurrentCapabilities()
+	if len(capabilities) != len(servedALPNs) {
+		t.Fatalf("advertised capabilities=%d served ALPNs=%d",
+			len(capabilities), len(servedALPNs))
+	}
+	for _, capability := range capabilities {
+		if _, served := servedALPNs[capability.ALPN]; !served {
+			t.Fatalf("IDENTIFY advertised unserved ALPN %q", capability.ALPN)
+		}
 	}
 	conn := dialVNextReaderPrepareTLSTest(
 		t, server.Addr().String(),

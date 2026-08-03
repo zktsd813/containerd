@@ -2511,15 +2511,15 @@ func main() {
 	vnextReaderPrepareEnabled := flag.String(
 		"vnext-reader-prepare-enabled",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_ENABLED", "false"),
-		"exact true or false; enables strict VNext Reader PREPARE and STATUS_AND_FENCE over one mTLS listener")
+		"exact true or false; enables strict six-operation VNext Reader control over one mTLS listener")
 	vnextReaderPrepareLocalExecutorNodeID := flag.String(
 		"vnext-reader-prepare-local-executor-node-id",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_LOCAL_EXECUTOR_NODE_ID", ""),
-		"exact local executor node identity for Reader PREPARE/STATUS_AND_FENCE")
+		"exact local executor node identity for six-operation Reader control")
 	vnextReaderPrepareLocalCxldLogicalID := flag.String(
 		"vnext-reader-prepare-local-cxld-logical-id",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_LOCAL_CXLD_LOGICAL_ID", ""),
-		"exact local cxld logical identity for Reader PREPARE/STATUS_AND_FENCE")
+		"exact local cxld logical identity for six-operation Reader control")
 	vnextReaderPrepareStoreMaxEntries := flag.String(
 		"vnext-reader-prepare-store-max-entries",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_STORE_MAX_ENTRIES", ""),
@@ -2528,22 +2528,30 @@ func main() {
 		"vnext-reader-prepare-store-max-retained-bytes",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_STORE_MAX_RETAINED_BYTES", ""),
 		"bounded canonical positive shared Reader retained-byte budget")
+	vnextReaderActivationStoreMaxEntries := flag.String(
+		"vnext-reader-activation-store-max-entries",
+		envExactDefault("CXLD_VNEXT_READER_ACTIVATION_STORE_MAX_ENTRIES", ""),
+		"bounded canonical positive process-local Reader activation decision count")
+	vnextReaderActivationStoreMaxRetainedBytes := flag.String(
+		"vnext-reader-activation-store-max-retained-bytes",
+		envExactDefault("CXLD_VNEXT_READER_ACTIVATION_STORE_MAX_RETAINED_BYTES", ""),
+		"bounded canonical positive process-local Reader activation retained-byte budget")
 	vnextReaderPrepareTLSListen := flag.String(
 		"vnext-reader-prepare-tls-listen",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_TLS_LISTEN", ""),
-		"strict VNext Reader PREPARE/STATUS_AND_FENCE mTLS listen address")
+		"strict six-operation VNext Reader control mTLS listen address")
 	vnextReaderPrepareTLSServerCertificate := flag.String(
 		"vnext-reader-prepare-tls-server-cert",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_TLS_SERVER_CERT", ""),
-		"PEM server certificate for the strict Reader PREPARE/STATUS_AND_FENCE listener")
+		"PEM server certificate for the strict six-operation Reader listener")
 	vnextReaderPrepareTLSServerPrivateKey := flag.String(
 		"vnext-reader-prepare-tls-server-key",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_TLS_SERVER_KEY", ""),
-		"PEM server private key for the strict Reader PREPARE/STATUS_AND_FENCE listener")
+		"PEM server private key for the strict six-operation Reader listener")
 	vnextReaderPrepareTLSClientCA := flag.String(
 		"vnext-reader-prepare-tls-client-ca",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_TLS_CLIENT_CA", ""),
-		"PEM CA used to authenticate Reader PREPARE/STATUS_AND_FENCE Scheduler clients")
+		"PEM CA used to authenticate six-operation Reader Scheduler clients")
 	vnextReaderPrepareTLSExpectedServerURISAN := flag.String(
 		"vnext-reader-prepare-tls-server-uri-san",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_TLS_SERVER_URI_SAN", ""),
@@ -2571,11 +2579,11 @@ func main() {
 	vnextReaderPrepareEtcdEndpoints := flag.String(
 		"vnext-reader-prepare-etcd-endpoints",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_ETCD_ENDPOINTS", ""),
-		"comma-separated canonical HTTPS etcd endpoints dedicated to Reader PREPARE/STATUS_AND_FENCE")
+		"comma-separated canonical HTTPS etcd endpoints dedicated to six-operation Reader control")
 	vnextReaderPrepareEtcdLeaderKey := flag.String(
 		"vnext-reader-prepare-scheduler-leader-key",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_SCHEDULER_LEADER_KEY", ""),
-		"exact immutable-lease Scheduler leader key read by Reader PREPARE/STATUS_AND_FENCE")
+		"exact immutable-lease Scheduler leader key read by six-operation Reader control")
 	vnextReaderPrepareEtcdClusterID := flag.String(
 		"vnext-reader-prepare-etcd-cluster-id",
 		envExactDefault("CXLD_VNEXT_READER_PREPARE_ETCD_CLUSTER_ID", ""),
@@ -2603,32 +2611,34 @@ func main() {
 	flag.Parse()
 	vnextReaderPrepareConfig, err := parseVNextReaderPrepareRuntimeInput(
 		vnextReaderPrepareRuntimeInput{
-			Enabled:                     *vnextReaderPrepareEnabled,
-			LocalExecutorNodeID:         *vnextReaderPrepareLocalExecutorNodeID,
-			LocalCxldLogicalID:          *vnextReaderPrepareLocalCxldLogicalID,
-			StoreMaxEntries:             *vnextReaderPrepareStoreMaxEntries,
-			StoreMaxRetainedBytes:       *vnextReaderPrepareStoreMaxRetainedBytes,
-			TLSListenAddress:            *vnextReaderPrepareTLSListen,
-			TLSServerCertificatePath:    *vnextReaderPrepareTLSServerCertificate,
-			TLSServerPrivateKeyPath:     *vnextReaderPrepareTLSServerPrivateKey,
-			TLSClientCAPath:             *vnextReaderPrepareTLSClientCA,
-			TLSExpectedServerURISAN:     *vnextReaderPrepareTLSExpectedServerURISAN,
-			PrincipalBindings:           *vnextReaderPreparePrincipalBindings,
-			TLSHandshakeTimeoutMillis:   *vnextReaderPrepareTLSHandshakeTimeoutMillis,
-			TLSRequestReadTimeoutMillis: *vnextReaderPrepareTLSRequestReadTimeoutMillis,
-			TLSHandlerTimeoutMillis:     *vnextReaderPrepareTLSHandlerTimeoutMillis,
-			TLSResponseWriteMillis:      *vnextReaderPrepareTLSResponseWriteMillis,
-			EtcdEndpoints:               *vnextReaderPrepareEtcdEndpoints,
-			EtcdLeaderKey:               *vnextReaderPrepareEtcdLeaderKey,
-			EtcdClusterID:               *vnextReaderPrepareEtcdClusterID,
-			EtcdCAPath:                  *vnextReaderPrepareEtcdCA,
-			EtcdClientCertificatePath:   *vnextReaderPrepareEtcdClientCertificate,
-			EtcdClientPrivateKeyPath:    *vnextReaderPrepareEtcdClientPrivateKey,
-			EtcdDialTimeoutMillis:       *vnextReaderPrepareEtcdDialTimeoutMillis,
-			EtcdReadTimeoutMillis:       *vnextReaderPrepareEtcdReadTimeoutMillis,
+			Enabled:                         *vnextReaderPrepareEnabled,
+			LocalExecutorNodeID:             *vnextReaderPrepareLocalExecutorNodeID,
+			LocalCxldLogicalID:              *vnextReaderPrepareLocalCxldLogicalID,
+			StoreMaxEntries:                 *vnextReaderPrepareStoreMaxEntries,
+			StoreMaxRetainedBytes:           *vnextReaderPrepareStoreMaxRetainedBytes,
+			ActivationStoreMaxEntries:       *vnextReaderActivationStoreMaxEntries,
+			ActivationStoreMaxRetainedBytes: *vnextReaderActivationStoreMaxRetainedBytes,
+			TLSListenAddress:                *vnextReaderPrepareTLSListen,
+			TLSServerCertificatePath:        *vnextReaderPrepareTLSServerCertificate,
+			TLSServerPrivateKeyPath:         *vnextReaderPrepareTLSServerPrivateKey,
+			TLSClientCAPath:                 *vnextReaderPrepareTLSClientCA,
+			TLSExpectedServerURISAN:         *vnextReaderPrepareTLSExpectedServerURISAN,
+			PrincipalBindings:               *vnextReaderPreparePrincipalBindings,
+			TLSHandshakeTimeoutMillis:       *vnextReaderPrepareTLSHandshakeTimeoutMillis,
+			TLSRequestReadTimeoutMillis:     *vnextReaderPrepareTLSRequestReadTimeoutMillis,
+			TLSHandlerTimeoutMillis:         *vnextReaderPrepareTLSHandlerTimeoutMillis,
+			TLSResponseWriteMillis:          *vnextReaderPrepareTLSResponseWriteMillis,
+			EtcdEndpoints:                   *vnextReaderPrepareEtcdEndpoints,
+			EtcdLeaderKey:                   *vnextReaderPrepareEtcdLeaderKey,
+			EtcdClusterID:                   *vnextReaderPrepareEtcdClusterID,
+			EtcdCAPath:                      *vnextReaderPrepareEtcdCA,
+			EtcdClientCertificatePath:       *vnextReaderPrepareEtcdClientCertificate,
+			EtcdClientPrivateKeyPath:        *vnextReaderPrepareEtcdClientPrivateKey,
+			EtcdDialTimeoutMillis:           *vnextReaderPrepareEtcdDialTimeoutMillis,
+			EtcdReadTimeoutMillis:           *vnextReaderPrepareEtcdReadTimeoutMillis,
 		})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid VNext Reader PREPARE/STATUS_AND_FENCE configuration: %v\n", err)
+		fmt.Fprintf(os.Stderr, "invalid six-operation VNext Reader control configuration: %v\n", err)
 		os.Exit(1)
 	}
 	vnextSchedulerAuthorityConfig, err := parseVNextOwnerSchedulerAuthorityInput(
@@ -2876,14 +2886,14 @@ func main() {
 			server.close()
 		}
 		fmt.Fprintf(os.Stderr,
-			"failed to start VNext Reader PREPARE/STATUS_AND_FENCE runtime: %v\n", err)
+			"failed to start six-operation VNext Reader control runtime: %v\n", err)
 		os.Exit(1)
 	}
 	if vnextReaderPrepareRuntime != nil {
 		defer func() {
 			if err := vnextReaderPrepareRuntime.Close(); err != nil {
 				fmt.Fprintf(os.Stderr,
-					"failed to close VNext Reader PREPARE/STATUS_AND_FENCE runtime: %v\n", err)
+					"failed to close six-operation VNext Reader control runtime: %v\n", err)
 			}
 		}()
 	}
@@ -2905,7 +2915,7 @@ func main() {
 	if vnextReaderPrepareRuntime != nil {
 		if err := vnextReaderPrepareRuntime.Stop(); err != nil {
 			fmt.Fprintf(os.Stderr,
-				"failed to stop VNext Reader PREPARE/STATUS_AND_FENCE listener: %v\n", err)
+				"failed to stop six-operation VNext Reader control listener: %v\n", err)
 		}
 	}
 	if vnextOwnerTLSServer != nil {
@@ -2927,7 +2937,7 @@ func main() {
 	if vnextReaderPrepareRuntime != nil {
 		if err := vnextReaderPrepareRuntime.Close(); err != nil {
 			fmt.Fprintf(os.Stderr,
-				"failed to close VNext Reader PREPARE/STATUS_AND_FENCE runtime: %v\n", err)
+				"failed to close six-operation VNext Reader control runtime: %v\n", err)
 		}
 	}
 }

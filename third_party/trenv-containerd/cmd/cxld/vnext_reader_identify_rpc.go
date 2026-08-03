@@ -26,7 +26,7 @@ const (
 	vnextReaderIdentifyReceiptDomain            = "cxld-vnext-reader-identify-receipt-v1"
 
 	vnextReaderIdentifyMaxFrameBytes   = 64 << 10
-	vnextReaderIdentifyCapabilityCount = 3
+	vnextReaderIdentifyCapabilityCount = 6
 )
 
 type vnextReaderIdentifyNonce [sha256.Size]byte
@@ -462,6 +462,15 @@ func vnextReaderIdentifyCurrentCapabilities() []vnextReaderIdentifyCapability {
 	// This order is part of the canonical IDENTIFY v1 ABI. Only protocols
 	// actually served by this listener are advertised.
 	return []vnextReaderIdentifyCapability{
+		{Protocol: vnextReaderActivationCommitProtocol,
+			Operation: vnextReaderActivationCommitOperation,
+			ALPN:      vnextReaderActivationCommitALPN},
+		{Protocol: vnextReaderActivationProposalProtocol,
+			Operation: vnextReaderActivationProposalOperation,
+			ALPN:      vnextReaderActivationProposalALPN},
+		{Protocol: vnextReaderActivationStatusProtocol,
+			Operation: vnextReaderActivationStatusOperation,
+			ALPN:      vnextReaderActivationStatusALPN},
 		{Protocol: vnextReaderIdentifyProtocol,
 			Operation: vnextReaderIdentifyOperation, ALPN: vnextReaderIdentifyALPN},
 		{Protocol: vnextReaderPrepareProtocol,

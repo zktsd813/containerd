@@ -129,29 +129,31 @@ func validVNextReaderPrepareRuntimeInput(
 	t.Helper()
 	material := newVNextReaderPrepareTLSTestMaterial(t)
 	return vnextReaderPrepareRuntimeInput{
-		Enabled:                     "true",
-		LocalExecutorNodeID:         "reader-node-0",
-		LocalCxldLogicalID:          "reader-cxld-0",
-		StoreMaxEntries:             "8",
-		StoreMaxRetainedBytes:       "1048576",
-		TLSListenAddress:            "127.0.0.1:0",
-		TLSServerCertificatePath:    material.serverCertificatePath,
-		TLSServerPrivateKeyPath:     material.serverPrivateKeyPath,
-		TLSClientCAPath:             material.caPath,
-		TLSExpectedServerURISAN:     vnextReaderPrepareTLSTestServerURI,
-		PrincipalBindings:           vnextReaderPrepareTestPrincipal + "=scheduler-a",
-		TLSHandshakeTimeoutMillis:   "1000",
-		TLSRequestReadTimeoutMillis: "1000",
-		TLSHandlerTimeoutMillis:     "1000",
-		TLSResponseWriteMillis:      "1000",
-		EtcdEndpoints:               "https://etcd.test:2379",
-		EtcdLeaderKey:               vnextReaderPrepareCurrentTestLeaderKey,
-		EtcdClusterID:               "8000000000000001",
-		EtcdCAPath:                  material.caPath,
-		EtcdClientCertificatePath:   material.clientCertificatePath,
-		EtcdClientPrivateKeyPath:    material.clientPrivateKeyPath,
-		EtcdDialTimeoutMillis:       "1000",
-		EtcdReadTimeoutMillis:       "1000",
+		Enabled:                         "true",
+		LocalExecutorNodeID:             "reader-node-0",
+		LocalCxldLogicalID:              "reader-cxld-0",
+		StoreMaxEntries:                 "8",
+		StoreMaxRetainedBytes:           "1048576",
+		ActivationStoreMaxEntries:       "8",
+		ActivationStoreMaxRetainedBytes: "1048576",
+		TLSListenAddress:                "127.0.0.1:0",
+		TLSServerCertificatePath:        material.serverCertificatePath,
+		TLSServerPrivateKeyPath:         material.serverPrivateKeyPath,
+		TLSClientCAPath:                 material.caPath,
+		TLSExpectedServerURISAN:         vnextReaderPrepareTLSTestServerURI,
+		PrincipalBindings:               vnextReaderPrepareTestPrincipal + "=scheduler-a",
+		TLSHandshakeTimeoutMillis:       "1000",
+		TLSRequestReadTimeoutMillis:     "1000",
+		TLSHandlerTimeoutMillis:         "1000",
+		TLSResponseWriteMillis:          "1000",
+		EtcdEndpoints:                   "https://etcd.test:2379",
+		EtcdLeaderKey:                   vnextReaderPrepareCurrentTestLeaderKey,
+		EtcdClusterID:                   "8000000000000001",
+		EtcdCAPath:                      material.caPath,
+		EtcdClientCertificatePath:       material.clientCertificatePath,
+		EtcdClientPrivateKeyPath:        material.clientPrivateKeyPath,
+		EtcdDialTimeoutMillis:           "1000",
+		EtcdReadTimeoutMillis:           "1000",
 	}
 }
 
@@ -208,10 +210,12 @@ func openVNextReaderPrepareRuntimeTest(
 
 func TestVNextReaderPrepareRuntimeDisabledHasZeroSideEffects(t *testing.T) {
 	input := vnextReaderPrepareRuntimeInput{
-		Enabled:                  "false",
-		LocalExecutorNodeID:      " intentionally ignored ",
-		TLSServerCertificatePath: "SECRET-CONTENT-IS-NOT-A-PATH",
-		EtcdEndpoints:            "not an endpoint",
+		Enabled:                         "false",
+		LocalExecutorNodeID:             " intentionally ignored ",
+		ActivationStoreMaxEntries:       "not-a-number",
+		ActivationStoreMaxRetainedBytes: "also-ignored",
+		TLSServerCertificatePath:        "SECRET-CONTENT-IS-NOT-A-PATH",
+		EtcdEndpoints:                   "not an endpoint",
 	}
 	config, err := parseVNextReaderPrepareRuntimeInput(input)
 	if err != nil {
@@ -253,6 +257,9 @@ func TestVNextReaderPrepareAndStatusRuntimeDependenciesAreAllOrNothing(
 		"store": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.newStore = nil
 		},
+		"activation store": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newActivationStore = nil
+		},
 		"leader reader": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.openLeaderReader = nil
 		},
@@ -265,6 +272,9 @@ func TestVNextReaderPrepareAndStatusRuntimeDependenciesAreAllOrNothing(
 		"IDENTIFY verifier": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.newIdentifyVerifier = nil
 		},
+		"activation verifier": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newActivationVerifier = nil
+		},
 		"PREPARE service": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.newService = nil
 		},
@@ -274,6 +284,9 @@ func TestVNextReaderPrepareAndStatusRuntimeDependenciesAreAllOrNothing(
 		"IDENTIFY service": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.newIdentifyService = nil
 		},
+		"activation service": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newActivationService = nil
+		},
 		"PREPARE RPC": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.newRPC = nil
 		},
@@ -282,6 +295,15 @@ func TestVNextReaderPrepareAndStatusRuntimeDependenciesAreAllOrNothing(
 		},
 		"IDENTIFY RPC": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.newIdentifyRPC = nil
+		},
+		"activation proposal RPC": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newActivationProposalRPC = nil
+		},
+		"activation commit RPC": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newActivationCommitRPC = nil
+		},
+		"activation status RPC": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newActivationStatusRPC = nil
 		},
 		"dual listener": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.startServer = nil
@@ -345,6 +367,16 @@ func TestVNextReaderPrepareRuntimeRejectsNonCanonicalBoundsAndPrincipals(
 		},
 		"zero-store-byte-budget": func(value *vnextReaderPrepareRuntimeInput) {
 			value.StoreMaxRetainedBytes = "0"
+		},
+		"leading-zero-activation-store-capacity": func(value *vnextReaderPrepareRuntimeInput) {
+			value.ActivationStoreMaxEntries = "08"
+		},
+		"zero-activation-store-byte-budget": func(value *vnextReaderPrepareRuntimeInput) {
+			value.ActivationStoreMaxRetainedBytes = "0"
+		},
+		"oversized-activation-store-capacity": func(value *vnextReaderPrepareRuntimeInput) {
+			value.ActivationStoreMaxEntries = strconv.FormatUint(
+				uint64(vnextReaderActivationStoreMaxEntries)+1, 10)
 		},
 		"oversized-timeout": func(value *vnextReaderPrepareRuntimeInput) {
 			value.TLSHandlerTimeoutMillis = "30001"
@@ -445,6 +477,9 @@ func TestVNextReaderPrepareRuntimeLeaderReaderPartialOpenAlwaysCloses(
 				vnextReaderPrepareTransportRPC,
 				vnextReaderPreparedStatusTransportRPC,
 				vnextReaderIdentifyTransportRPC,
+				vnextReaderActivationTransportRPC,
+				vnextReaderActivationTransportRPC,
+				vnextReaderActivationTransportRPC,
 				chan struct{},
 				chan struct{},
 			) (vnextReaderPrepareRuntimeServer, error) {
@@ -542,6 +577,34 @@ func TestVNextReaderPrepareRuntimeRequiresDaemonWideAdmissionsBeforeResources(
 	}
 }
 
+func TestVNextReaderPrepareRuntimeActivationStoreFailurePreventsAuthorityOpen(
+	t *testing.T,
+) {
+	config := validVNextReaderPrepareRuntimeConfig(t)
+	dependencies, _ := vnextReaderPrepareRuntimeTestDependencies(nil, nil)
+	storeErr := errors.New("test activation store construction failure")
+	dependencies.newActivationStore = func(
+		vnextReaderActivationStoreConfig,
+		string,
+		string,
+		vnextReaderProcessIncarnation,
+		vnextReaderActivationPreparedStore,
+	) (*vnextReaderActivationStore, error) {
+		return nil, storeErr
+	}
+	dependencies.openLeaderReader = func(
+		vnextOwnerSchedulerAuthorityConfig,
+	) (vnextOwnerSchedulerLeaderReader, func() error, error) {
+		t.Fatal("activation store failure reached independent authority open")
+		return nil, nil, nil
+	}
+	runtime, err := openVNextReaderPrepareRuntimeTest(config, dependencies)
+	if runtime != nil || !errors.Is(err, storeErr) {
+		t.Fatalf("activation store failure returned runtime=%#v err=%v",
+			runtime, err)
+	}
+}
+
 func TestVNextReaderPrepareRuntimeEntropyFailureAndZeroOpenNothing(
 	t *testing.T,
 ) {
@@ -625,6 +688,9 @@ func TestVNextReaderPrepareRuntimePublishesIdentityBeforeListener(
 		_ vnextReaderPrepareTransportRPC,
 		_ vnextReaderPreparedStatusTransportRPC,
 		identifyRPC vnextReaderIdentifyTransportRPC,
+		_ vnextReaderActivationTransportRPC,
+		_ vnextReaderActivationTransportRPC,
+		_ vnextReaderActivationTransportRPC,
 		_ chan struct{},
 		_ chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
@@ -680,6 +746,9 @@ func TestVNextReaderPrepareRuntimePublicationFailureNeverOpensListener(
 		vnextReaderPrepareTransportRPC,
 		vnextReaderPreparedStatusTransportRPC,
 		vnextReaderIdentifyTransportRPC,
+		vnextReaderActivationTransportRPC,
+		vnextReaderActivationTransportRPC,
+		vnextReaderActivationTransportRPC,
 		chan struct{},
 		chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
@@ -719,6 +788,9 @@ func TestVNextReaderPrepareRuntimeListenerFailureRemovesPublishedIdentityAndUnlo
 		vnextReaderPrepareTransportRPC,
 		vnextReaderPreparedStatusTransportRPC,
 		vnextReaderIdentifyTransportRPC,
+		vnextReaderActivationTransportRPC,
+		vnextReaderActivationTransportRPC,
+		vnextReaderActivationTransportRPC,
 		chan struct{},
 		chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
@@ -767,6 +839,9 @@ func TestVNextReaderPrepareRuntimeLockSerializesStartsThroughGracefulClose(
 			vnextReaderPrepareTransportRPC,
 			vnextReaderPreparedStatusTransportRPC,
 			vnextReaderIdentifyTransportRPC,
+			vnextReaderActivationTransportRPC,
+			vnextReaderActivationTransportRPC,
+			vnextReaderActivationTransportRPC,
 			chan struct{},
 			chan struct{},
 		) (vnextReaderPrepareRuntimeServer, error) {
@@ -815,12 +890,35 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 		vnextReaderPrepareTestPrincipal: "scheduler-a",
 	}
 	dependencies, _ := vnextReaderPrepareRuntimeTestDependencies(nil, nil)
+	defaultNewActivationStore := dependencies.newActivationStore
 	defaultNewVerifier := dependencies.newVerifier
 	defaultNewStatusVerifier := dependencies.newStatusVerifier
 	defaultNewIdentifyVerifier := dependencies.newIdentifyVerifier
+	defaultNewActivationVerifier := dependencies.newActivationVerifier
 	var verifierConfig vnextReaderPrepareCurrentAuthorityConfig
 	var statusVerifierConfig vnextReaderPreparedStatusCurrentAuthorityConfig
 	var identifyVerifierConfig vnextReaderIdentifyCurrentAuthorityConfig
+	var activationVerifierConfig vnextReaderActivationCurrentAuthorityConfig
+	var activationStoreConfig vnextReaderActivationStoreConfig
+	var activationStoreExecutor string
+	var activationStoreLogical string
+	var activationStoreProcess vnextReaderProcessIncarnation
+	var activationPreparedStore vnextReaderActivationPreparedStore
+	dependencies.newActivationStore = func(
+		config vnextReaderActivationStoreConfig,
+		executor string,
+		logical string,
+		process vnextReaderProcessIncarnation,
+		prepared vnextReaderActivationPreparedStore,
+	) (*vnextReaderActivationStore, error) {
+		activationStoreConfig = config
+		activationStoreExecutor = executor
+		activationStoreLogical = logical
+		activationStoreProcess = process
+		activationPreparedStore = prepared
+		return defaultNewActivationStore(
+			config, executor, logical, process, prepared)
+	}
 	dependencies.newVerifier = func(
 		config vnextReaderPrepareCurrentAuthorityConfig,
 		reader vnextOwnerSchedulerLeaderReader,
@@ -842,16 +940,29 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 		identifyVerifierConfig = config
 		return defaultNewIdentifyVerifier(config, reader)
 	}
+	dependencies.newActivationVerifier = func(
+		config vnextReaderActivationCurrentAuthorityConfig,
+		reader vnextOwnerSchedulerLeaderReader,
+	) (vnextReaderActivationAuthorityVerifier, error) {
+		activationVerifierConfig = config
+		return defaultNewActivationVerifier(config, reader)
+	}
 	server := &vnextReaderPrepareRuntimeTestServer{}
 	var tlsConfig vnextReaderPrepareTLSServerConfig
 	var passedPrepareRPC vnextReaderPrepareTransportRPC
 	var passedStatusRPC vnextReaderPreparedStatusTransportRPC
 	var passedIdentifyRPC vnextReaderIdentifyTransportRPC
+	var passedActivationProposalRPC vnextReaderActivationTransportRPC
+	var passedActivationCommitRPC vnextReaderActivationTransportRPC
+	var passedActivationStatusRPC vnextReaderActivationTransportRPC
 	dependencies.startServer = func(
 		config vnextReaderPrepareTLSServerConfig,
 		prepareRPC vnextReaderPrepareTransportRPC,
 		statusRPC vnextReaderPreparedStatusTransportRPC,
 		identifyRPC vnextReaderIdentifyTransportRPC,
+		activationProposalRPC vnextReaderActivationTransportRPC,
+		activationCommitRPC vnextReaderActivationTransportRPC,
+		activationStatusRPC vnextReaderActivationTransportRPC,
 		_ chan struct{},
 		_ chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
@@ -859,6 +970,9 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 		passedPrepareRPC = prepareRPC
 		passedStatusRPC = statusRPC
 		passedIdentifyRPC = identifyRPC
+		passedActivationProposalRPC = activationProposalRPC
+		passedActivationCommitRPC = activationCommitRPC
+		passedActivationStatusRPC = activationStatusRPC
 		return server, nil
 	}
 	requestAdmission, largeAdmission := vnextReaderPrepareRuntimeTestAdmissions()
@@ -881,15 +995,21 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 	if !ok {
 		t.Fatalf("runtime IDENTIFY verifier type = %T", runtime.identifyVerifier)
 	}
+	currentActivationVerifier, ok := runtime.activationVerifier.(*vnextReaderActivationCurrentAuthorityVerifier)
+	if !ok {
+		t.Fatalf("runtime activation verifier type = %T", runtime.activationVerifier)
+	}
 	for name, bindings := range map[string]map[string]string{
-		"runtime":           runtime.schedulerByPrincipal,
-		"verifier-config":   verifierConfig.SchedulerByPrincipal,
-		"verifier-retained": currentVerifier.schedulerByPrincipal,
-		"status-config":     statusVerifierConfig.SchedulerByPrincipal,
-		"status-retained":   currentStatusVerifier.schedulerByPrincipal,
-		"identify-config":   identifyVerifierConfig.SchedulerByPrincipal,
-		"identify-retained": currentIdentifyVerifier.schedulerByPrincipal,
-		"TLS-config":        tlsConfig.SchedulerByPrincipal,
+		"runtime":             runtime.schedulerByPrincipal,
+		"verifier-config":     verifierConfig.SchedulerByPrincipal,
+		"verifier-retained":   currentVerifier.schedulerByPrincipal,
+		"status-config":       statusVerifierConfig.SchedulerByPrincipal,
+		"status-retained":     currentStatusVerifier.schedulerByPrincipal,
+		"identify-config":     identifyVerifierConfig.SchedulerByPrincipal,
+		"identify-retained":   currentIdentifyVerifier.schedulerByPrincipal,
+		"activation-config":   activationVerifierConfig.SchedulerByPrincipal,
+		"activation-retained": currentActivationVerifier.schedulerByPrincipal,
+		"TLS-config":          tlsConfig.SchedulerByPrincipal,
 	} {
 		if !reflect.DeepEqual(bindings, wantBindings) {
 			t.Fatalf("%s principal bindings = %#v, want %#v", name, bindings, wantBindings)
@@ -900,21 +1020,38 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 		verifierConfig.ReadTimeout != statusVerifierConfig.ReadTimeout ||
 		verifierConfig.LeaderKey != identifyVerifierConfig.LeaderKey ||
 		verifierConfig.ExpectedCluster != identifyVerifierConfig.ExpectedCluster ||
-		verifierConfig.ReadTimeout != identifyVerifierConfig.ReadTimeout {
-		t.Fatalf("Reader authority sources differ: prepare=%#v status=%#v identify=%#v",
-			verifierConfig, statusVerifierConfig, identifyVerifierConfig)
+		verifierConfig.ReadTimeout != identifyVerifierConfig.ReadTimeout ||
+		verifierConfig.LeaderKey != activationVerifierConfig.LeaderKey ||
+		verifierConfig.ExpectedCluster != activationVerifierConfig.ExpectedCluster ||
+		verifierConfig.ReadTimeout != activationVerifierConfig.ReadTimeout {
+		t.Fatalf("Reader authority sources differ: prepare=%#v status=%#v identify=%#v activation=%#v",
+			verifierConfig, statusVerifierConfig, identifyVerifierConfig,
+			activationVerifierConfig)
 	}
 	if currentVerifier.reader != currentStatusVerifier.reader ||
-		currentVerifier.reader != currentIdentifyVerifier.reader {
+		currentVerifier.reader != currentIdentifyVerifier.reader ||
+		currentVerifier.reader != currentActivationVerifier.reader {
 		t.Fatal("Reader verifiers did not retain the same independent reader")
 	}
 	if runtime.service.store != runtime.store ||
-		runtime.statusService.store != runtime.store {
-		t.Fatal("PREPARE and STATUS services do not share the exact authorization store")
+		runtime.statusService.store != runtime.store ||
+		runtime.activationStore.prepared != runtime.store ||
+		runtime.activationService.store != runtime.activationStore {
+		t.Fatal("Reader services do not share the exact PREPARED and activation stores")
+	}
+	if activationStoreConfig != config.ActivationStore ||
+		activationStoreExecutor != config.LocalExecutorNodeID ||
+		activationStoreLogical != config.LocalCxldLogicalID ||
+		activationStoreProcess != runtime.processIncarnation ||
+		activationPreparedStore != runtime.store {
+		t.Fatal("activation store did not receive exact bounded config and process identity")
 	}
 	if passedPrepareRPC != runtime.rpc || passedStatusRPC != runtime.statusRPC ||
-		passedIdentifyRPC != runtime.identifyRPC {
-		t.Fatal("listener did not receive the exact three Reader RPCs")
+		passedIdentifyRPC != runtime.identifyRPC ||
+		passedActivationProposalRPC != runtime.activationProposalRPC ||
+		passedActivationCommitRPC != runtime.activationCommitRPC ||
+		passedActivationStatusRPC != runtime.activationStatusRPC {
+		t.Fatal("listener did not receive the exact six Reader RPCs")
 	}
 	if runtime.requestAdmission != requestAdmission ||
 		runtime.largeFrameAdmission != largeAdmission ||
@@ -936,7 +1073,9 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 		!reflect.DeepEqual(
 			currentStatusVerifier.schedulerByPrincipal, wantBindings) ||
 		!reflect.DeepEqual(
-			currentIdentifyVerifier.schedulerByPrincipal, wantBindings) {
+			currentIdentifyVerifier.schedulerByPrincipal, wantBindings) ||
+		!reflect.DeepEqual(
+			currentActivationVerifier.schedulerByPrincipal, wantBindings) {
 		t.Fatal("runtime retained aliases into caller-owned principal configuration")
 	}
 }
@@ -959,6 +1098,9 @@ func TestVNextReaderPrepareRuntimePartialConstructionCleansUpInReverseOrder(
 		vnextReaderPrepareTransportRPC,
 		vnextReaderPreparedStatusTransportRPC,
 		vnextReaderIdentifyTransportRPC,
+		vnextReaderActivationTransportRPC,
+		vnextReaderActivationTransportRPC,
+		vnextReaderActivationTransportRPC,
 		chan struct{},
 		chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
@@ -1004,6 +1146,9 @@ func TestVNextReaderPrepareRuntimeVerifierFailureClosesOnlyOpenedEtcd(
 		vnextReaderPrepareTransportRPC,
 		vnextReaderPreparedStatusTransportRPC,
 		vnextReaderIdentifyTransportRPC,
+		vnextReaderActivationTransportRPC,
+		vnextReaderActivationTransportRPC,
+		vnextReaderActivationTransportRPC,
 		chan struct{},
 		chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
@@ -1050,6 +1195,9 @@ func TestVNextReaderPrepareRuntimeShutdownDrainsBeforeEtcdClose(t *testing.T) {
 		vnextReaderPrepareTransportRPC,
 		vnextReaderPreparedStatusTransportRPC,
 		vnextReaderIdentifyTransportRPC,
+		vnextReaderActivationTransportRPC,
+		vnextReaderActivationTransportRPC,
+		vnextReaderActivationTransportRPC,
 		chan struct{},
 		chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
@@ -1119,14 +1267,22 @@ func TestVNextReaderPrepareRuntimeStartsRealMTLSListener(t *testing.T) {
 	}
 	if runtime.store == nil || runtime.service == nil || runtime.rpc == nil ||
 		runtime.verifier == nil || runtime.statusVerifier == nil ||
-		runtime.statusService == nil || runtime.statusRPC == nil {
+		runtime.statusService == nil || runtime.statusRPC == nil ||
+		runtime.identifyVerifier == nil || runtime.identifyService == nil ||
+		runtime.identifyRPC == nil || runtime.activationStore == nil ||
+		runtime.activationVerifier == nil || runtime.activationService == nil ||
+		runtime.activationProposalRPC == nil ||
+		runtime.activationCommitRPC == nil || runtime.activationStatusRPC == nil {
 		_ = runtime.Close()
 		t.Fatal("successful startup omitted a required Reader component")
 	}
-	if len(server.tlsConfig.NextProtos) != 3 ||
+	if len(server.tlsConfig.NextProtos) != 6 ||
 		server.tlsConfig.NextProtos[0] != vnextReaderPrepareALPN ||
 		server.tlsConfig.NextProtos[1] != vnextReaderPreparedStatusALPN ||
-		server.tlsConfig.NextProtos[2] != vnextReaderIdentifyALPN {
+		server.tlsConfig.NextProtos[2] != vnextReaderIdentifyALPN ||
+		server.tlsConfig.NextProtos[3] != vnextReaderActivationProposalALPN ||
+		server.tlsConfig.NextProtos[4] != vnextReaderActivationCommitALPN ||
+		server.tlsConfig.NextProtos[5] != vnextReaderActivationStatusALPN {
 		_ = runtime.Close()
 		t.Fatalf("production Reader listener ALPNs = %#v",
 			server.tlsConfig.NextProtos)

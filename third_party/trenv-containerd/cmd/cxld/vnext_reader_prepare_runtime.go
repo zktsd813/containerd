@@ -24,29 +24,31 @@ const (
 // any other field is parsed so the disabled path opens and allocates no Reader
 // resource.
 type vnextReaderPrepareRuntimeInput struct {
-	Enabled                     string
-	LocalExecutorNodeID         string
-	LocalCxldLogicalID          string
-	StoreMaxEntries             string
-	StoreMaxRetainedBytes       string
-	TLSListenAddress            string
-	TLSServerCertificatePath    string
-	TLSServerPrivateKeyPath     string
-	TLSClientCAPath             string
-	TLSExpectedServerURISAN     string
-	PrincipalBindings           string
-	TLSHandshakeTimeoutMillis   string
-	TLSRequestReadTimeoutMillis string
-	TLSHandlerTimeoutMillis     string
-	TLSResponseWriteMillis      string
-	EtcdEndpoints               string
-	EtcdLeaderKey               string
-	EtcdClusterID               string
-	EtcdCAPath                  string
-	EtcdClientCertificatePath   string
-	EtcdClientPrivateKeyPath    string
-	EtcdDialTimeoutMillis       string
-	EtcdReadTimeoutMillis       string
+	Enabled                         string
+	LocalExecutorNodeID             string
+	LocalCxldLogicalID              string
+	StoreMaxEntries                 string
+	StoreMaxRetainedBytes           string
+	ActivationStoreMaxEntries       string
+	ActivationStoreMaxRetainedBytes string
+	TLSListenAddress                string
+	TLSServerCertificatePath        string
+	TLSServerPrivateKeyPath         string
+	TLSClientCAPath                 string
+	TLSExpectedServerURISAN         string
+	PrincipalBindings               string
+	TLSHandshakeTimeoutMillis       string
+	TLSRequestReadTimeoutMillis     string
+	TLSHandlerTimeoutMillis         string
+	TLSResponseWriteMillis          string
+	EtcdEndpoints                   string
+	EtcdLeaderKey                   string
+	EtcdClusterID                   string
+	EtcdCAPath                      string
+	EtcdClientCertificatePath       string
+	EtcdClientPrivateKeyPath        string
+	EtcdDialTimeoutMillis           string
+	EtcdReadTimeoutMillis           string
 }
 
 type vnextReaderPrepareRuntimeTLSConfig struct {
@@ -72,6 +74,7 @@ type vnextReaderPrepareRuntimeConfig struct {
 	LocalExecutorNodeID  string
 	LocalCxldLogicalID   string
 	Store                vnextReaderAuthorizationStoreConfig
+	ActivationStore      vnextReaderActivationStoreConfig
 	TLS                  vnextReaderPrepareRuntimeTLSConfig
 	SchedulerByPrincipal map[string]string
 	SchedulerAuthority   vnextOwnerSchedulerAuthorityConfig
@@ -89,6 +92,13 @@ type vnextReaderPrepareRuntimeDependencies struct {
 	processIncarnationLocker vnextReaderProcessIncarnationLockAcquirer
 	newStore                 func(vnextReaderAuthorizationStoreConfig) (
 		*vnextReaderAuthorizationStore, error)
+	newActivationStore func(
+		vnextReaderActivationStoreConfig,
+		string,
+		string,
+		vnextReaderProcessIncarnation,
+		vnextReaderActivationPreparedStore,
+	) (*vnextReaderActivationStore, error)
 	openLeaderReader func(vnextOwnerSchedulerAuthorityConfig) (
 		vnextOwnerSchedulerLeaderReader, func() error, error)
 	newVerifier func(
@@ -103,6 +113,10 @@ type vnextReaderPrepareRuntimeDependencies struct {
 		vnextReaderIdentifyCurrentAuthorityConfig,
 		vnextOwnerSchedulerLeaderReader,
 	) (vnextReaderIdentifyAuthorityVerifier, error)
+	newActivationVerifier func(
+		vnextReaderActivationCurrentAuthorityConfig,
+		vnextOwnerSchedulerLeaderReader,
+	) (vnextReaderActivationAuthorityVerifier, error)
 	newService func(
 		string,
 		string,
@@ -125,6 +139,11 @@ type vnextReaderPrepareRuntimeDependencies struct {
 		string,
 		vnextReaderIdentifyAuthorityVerifier,
 	) (*vnextReaderIdentifyService, error)
+	newActivationService func(
+		*vnextReaderActivationStore,
+		vnextReaderPrepareClock,
+		vnextReaderActivationAuthorityVerifier,
+	) (*vnextReaderActivationService, error)
 	newRPC       func(*vnextReaderPrepareService) vnextReaderPrepareTransportRPC
 	newStatusRPC func(
 		*vnextReaderPreparedStatusService,
@@ -132,11 +151,23 @@ type vnextReaderPrepareRuntimeDependencies struct {
 	newIdentifyRPC func(
 		*vnextReaderIdentifyService,
 	) vnextReaderIdentifyTransportRPC
+	newActivationProposalRPC func(
+		*vnextReaderActivationService,
+	) vnextReaderActivationTransportRPC
+	newActivationCommitRPC func(
+		*vnextReaderActivationService,
+	) vnextReaderActivationTransportRPC
+	newActivationStatusRPC func(
+		*vnextReaderActivationService,
+	) vnextReaderActivationTransportRPC
 	startServer func(
 		vnextReaderPrepareTLSServerConfig,
 		vnextReaderPrepareTransportRPC,
 		vnextReaderPreparedStatusTransportRPC,
 		vnextReaderIdentifyTransportRPC,
+		vnextReaderActivationTransportRPC,
+		vnextReaderActivationTransportRPC,
+		vnextReaderActivationTransportRPC,
 		chan struct{},
 		chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error)
@@ -164,6 +195,12 @@ type vnextReaderPrepareRuntime struct {
 	identifyVerifier       vnextReaderIdentifyAuthorityVerifier
 	identifyService        *vnextReaderIdentifyService
 	identifyRPC            vnextReaderIdentifyTransportRPC
+	activationStore        *vnextReaderActivationStore
+	activationVerifier     vnextReaderActivationAuthorityVerifier
+	activationService      *vnextReaderActivationService
+	activationProposalRPC  vnextReaderActivationTransportRPC
+	activationCommitRPC    vnextReaderActivationTransportRPC
+	activationStatusRPC    vnextReaderActivationTransportRPC
 	server                 vnextReaderPrepareRuntimeServer
 	closeLeaderReader      func() error
 	requestAdmission       chan struct{}
@@ -239,6 +276,23 @@ func parseVNextReaderPrepareRuntimeInput(
 	config.Store = vnextReaderAuthorizationStoreConfig{
 		MaxEntries:       int(storeEntries),
 		MaxRetainedBytes: storeBytes,
+	}
+	activationStoreEntries, err := parseVNextReaderPrepareRuntimePositiveUint(
+		"activation store max entries", input.ActivationStoreMaxEntries,
+		uint64(vnextReaderActivationStoreMaxEntries))
+	if err != nil {
+		return vnextReaderPrepareRuntimeConfig{}, err
+	}
+	activationStoreBytes, err := parseVNextReaderPrepareRuntimePositiveUint(
+		"activation store retained bytes",
+		input.ActivationStoreMaxRetainedBytes,
+		vnextReaderActivationStoreMaxRetainedBytes)
+	if err != nil {
+		return vnextReaderPrepareRuntimeConfig{}, err
+	}
+	config.ActivationStore = vnextReaderActivationStoreConfig{
+		MaxEntries:       int(activationStoreEntries),
+		MaxRetainedBytes: activationStoreBytes,
 	}
 	config.TLS = vnextReaderPrepareRuntimeTLSConfig{
 		ListenAddress:         input.TLSListenAddress,
@@ -448,6 +502,14 @@ func canonicalVNextReaderPrepareRuntimeConfig(
 		return vnextReaderPrepareRuntimeConfig{}, errors.New(
 			"VNext Reader PREPARE store limits are outside bounded ranges")
 	}
+	if config.ActivationStore.MaxEntries <= 0 ||
+		config.ActivationStore.MaxEntries > vnextReaderActivationStoreMaxEntries ||
+		config.ActivationStore.MaxRetainedBytes == 0 ||
+		config.ActivationStore.MaxRetainedBytes >
+			vnextReaderActivationStoreMaxRetainedBytes {
+		return vnextReaderPrepareRuntimeConfig{}, errors.New(
+			"VNext Reader activation store limits are outside bounded ranges")
+	}
 	if err := validateVNextReaderPrepareTLSListenAddress(
 		config.TLS.ListenAddress); err != nil {
 		return vnextReaderPrepareRuntimeConfig{}, err
@@ -535,6 +597,7 @@ func defaultVNextReaderPrepareRuntimeDependencies() vnextReaderPrepareRuntimeDep
 		processIncarnationWriter: &vnextReaderProcessIncarnationFilePublisher{},
 		processIncarnationLocker: &vnextReaderProcessIncarnationFileLockAcquirer{},
 		newStore:                 newVNextReaderAuthorizationStore,
+		newActivationStore:       newVNextReaderActivationStore,
 		openLeaderReader:         openVNextReaderPrepareIndependentLeaderReader,
 		newVerifier: func(
 			config vnextReaderPrepareCurrentAuthorityConfig,
@@ -554,9 +617,16 @@ func defaultVNextReaderPrepareRuntimeDependencies() vnextReaderPrepareRuntimeDep
 		) (vnextReaderIdentifyAuthorityVerifier, error) {
 			return newVNextReaderIdentifyCurrentAuthorityVerifier(config, reader)
 		},
-		newService:         newVNextReaderPrepareService,
-		newStatusService:   newVNextReaderPreparedStatusService,
-		newIdentifyService: newVNextReaderIdentifyService,
+		newActivationVerifier: func(
+			config vnextReaderActivationCurrentAuthorityConfig,
+			reader vnextOwnerSchedulerLeaderReader,
+		) (vnextReaderActivationAuthorityVerifier, error) {
+			return newVNextReaderActivationCurrentAuthorityVerifier(config, reader)
+		},
+		newService:           newVNextReaderPrepareService,
+		newStatusService:     newVNextReaderPreparedStatusService,
+		newIdentifyService:   newVNextReaderIdentifyService,
+		newActivationService: newVNextReaderActivationService,
 		newRPC: func(service *vnextReaderPrepareService) vnextReaderPrepareTransportRPC {
 			return newVNextReaderPrepareRPC(service)
 		},
@@ -570,16 +640,35 @@ func defaultVNextReaderPrepareRuntimeDependencies() vnextReaderPrepareRuntimeDep
 		) vnextReaderIdentifyTransportRPC {
 			return newVNextReaderIdentifyRPC(service)
 		},
+		newActivationProposalRPC: func(
+			service *vnextReaderActivationService,
+		) vnextReaderActivationTransportRPC {
+			return newVNextReaderActivationProposalRPC(service)
+		},
+		newActivationCommitRPC: func(
+			service *vnextReaderActivationService,
+		) vnextReaderActivationTransportRPC {
+			return newVNextReaderActivationCommitRPC(service)
+		},
+		newActivationStatusRPC: func(
+			service *vnextReaderActivationService,
+		) vnextReaderActivationTransportRPC {
+			return newVNextReaderActivationStatusRPC(service)
+		},
 		startServer: func(
 			config vnextReaderPrepareTLSServerConfig,
 			rpc vnextReaderPrepareTransportRPC,
 			statusRPC vnextReaderPreparedStatusTransportRPC,
 			identifyRPC vnextReaderIdentifyTransportRPC,
+			activationProposalRPC vnextReaderActivationTransportRPC,
+			activationCommitRPC vnextReaderActivationTransportRPC,
+			activationStatusRPC vnextReaderActivationTransportRPC,
 			requestAdmission chan struct{},
 			largeAdmission chan struct{},
 		) (vnextReaderPrepareRuntimeServer, error) {
-			return startVNextReaderPrepareStatusAndIdentifyTLSServer(
+			return startVNextReaderPrepareStatusIdentifyAndActivationTLSServer(
 				config, rpc, statusRPC, identifyRPC,
+				activationProposalRPC, activationCommitRPC, activationStatusRPC,
 				requestAdmission, largeAdmission)
 		},
 		clock: vnextReaderPrepareSystemClock{},
@@ -593,13 +682,19 @@ func validateVNextReaderPrepareRuntimeDependencies(
 		dependencies.processIncarnationPath == "" ||
 		vnextReaderPreparedStatusNilInterface(dependencies.processIncarnationWriter) ||
 		vnextReaderPreparedStatusNilInterface(dependencies.processIncarnationLocker) ||
-		dependencies.newStore == nil || dependencies.openLeaderReader == nil ||
+		dependencies.newStore == nil || dependencies.newActivationStore == nil ||
+		dependencies.openLeaderReader == nil ||
 		dependencies.newVerifier == nil || dependencies.newStatusVerifier == nil ||
 		dependencies.newIdentifyVerifier == nil ||
+		dependencies.newActivationVerifier == nil ||
 		dependencies.newService == nil || dependencies.newStatusService == nil ||
 		dependencies.newIdentifyService == nil ||
+		dependencies.newActivationService == nil ||
 		dependencies.newRPC == nil || dependencies.newStatusRPC == nil ||
 		dependencies.newIdentifyRPC == nil ||
+		dependencies.newActivationProposalRPC == nil ||
+		dependencies.newActivationCommitRPC == nil ||
+		dependencies.newActivationStatusRPC == nil ||
 		dependencies.startServer == nil ||
 		dependencies.clock == nil {
 		return errors.New(
@@ -681,6 +776,20 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 		return nil, releaseProcessLock(errors.New(
 			"VNext Reader PREPARE store constructor returned nil"))
 	}
+	activationStore, err := dependencies.newActivationStore(
+		canonical.ActivationStore,
+		canonical.LocalExecutorNodeID,
+		canonical.LocalCxldLogicalID,
+		processIncarnation,
+		store)
+	if err != nil {
+		return nil, releaseProcessLock(fmt.Errorf(
+			"open VNext Reader activation store: %w", err))
+	}
+	if activationStore == nil {
+		return nil, releaseProcessLock(errors.New(
+			"VNext Reader activation store constructor returned nil"))
+	}
 	reader, closeReader, err := dependencies.openLeaderReader(
 		canonical.SchedulerAuthority)
 	if err != nil {
@@ -761,6 +870,22 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 		return nil, cleanupReader(errors.New(
 			"VNext Reader IDENTIFY authority verifier constructor returned nil"))
 	}
+	activationVerifierConfig := vnextReaderActivationCurrentAuthorityConfig{
+		LeaderKey:            canonical.SchedulerAuthority.LeaderKey,
+		ExpectedCluster:      canonical.SchedulerAuthority.ExpectedCluster,
+		ReadTimeout:          canonical.SchedulerAuthority.ReadTimeout,
+		SchedulerByPrincipal: canonical.SchedulerByPrincipal,
+	}
+	activationVerifier, err := dependencies.newActivationVerifier(
+		activationVerifierConfig, reader)
+	if err != nil {
+		return nil, cleanupReader(fmt.Errorf(
+			"construct VNext Reader activation authority verifier: %w", err))
+	}
+	if vnextReaderPreparedStatusNilInterface(activationVerifier) {
+		return nil, cleanupReader(errors.New(
+			"VNext Reader activation authority verifier constructor returned nil"))
+	}
 	service, err := dependencies.newService(
 		canonical.LocalExecutorNodeID,
 		canonical.LocalCxldLogicalID,
@@ -804,6 +929,16 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 		return nil, cleanupReader(errors.New(
 			"VNext Reader IDENTIFY service constructor returned nil"))
 	}
+	activationService, err := dependencies.newActivationService(
+		activationStore, dependencies.clock, activationVerifier)
+	if err != nil {
+		return nil, cleanupReader(fmt.Errorf(
+			"construct VNext Reader activation service: %w", err))
+	}
+	if activationService == nil {
+		return nil, cleanupReader(errors.New(
+			"VNext Reader activation service constructor returned nil"))
+	}
 	rpc := dependencies.newRPC(service)
 	if rpc == nil {
 		return nil, cleanupReader(errors.New(
@@ -818,6 +953,24 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 	if vnextReaderPreparedStatusNilInterface(identifyRPC) {
 		return nil, cleanupReader(errors.New(
 			"VNext Reader IDENTIFY RPC constructor returned nil"))
+	}
+	activationProposalRPC := dependencies.newActivationProposalRPC(
+		activationService)
+	if vnextReaderPreparedStatusNilInterface(activationProposalRPC) {
+		return nil, cleanupReader(errors.New(
+			"VNext Reader activation proposal RPC constructor returned nil"))
+	}
+	activationCommitRPC := dependencies.newActivationCommitRPC(
+		activationService)
+	if vnextReaderPreparedStatusNilInterface(activationCommitRPC) {
+		return nil, cleanupReader(errors.New(
+			"VNext Reader activation commit RPC constructor returned nil"))
+	}
+	activationStatusRPC := dependencies.newActivationStatusRPC(
+		activationService)
+	if vnextReaderPreparedStatusNilInterface(activationStatusRPC) {
+		return nil, cleanupReader(errors.New(
+			"VNext Reader activation status RPC constructor returned nil"))
 	}
 	tlsConfig := vnextReaderPrepareTLSServerConfig{
 		ListenAddress:         canonical.TLS.ListenAddress,
@@ -846,6 +999,7 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 	}
 	server, err := dependencies.startServer(
 		tlsConfig, rpc, statusRPC, identifyRPC,
+		activationProposalRPC, activationCommitRPC, activationStatusRPC,
 		requestAdmission, largeAdmission)
 	if err != nil || server == nil {
 		primary := err
@@ -882,6 +1036,12 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 		identifyVerifier:       identifyVerifier,
 		identifyService:        identifyService,
 		identifyRPC:            identifyRPC,
+		activationStore:        activationStore,
+		activationVerifier:     activationVerifier,
+		activationService:      activationService,
+		activationProposalRPC:  activationProposalRPC,
+		activationCommitRPC:    activationCommitRPC,
+		activationStatusRPC:    activationStatusRPC,
 		server:                 server,
 		closeLeaderReader:      closeReader,
 		requestAdmission:       requestAdmission,
@@ -985,6 +1145,12 @@ func (runtime *vnextReaderPrepareRuntime) Close() error {
 	runtime.identifyRPC = nil
 	runtime.identifyService = nil
 	runtime.identifyVerifier = nil
+	runtime.activationProposalRPC = nil
+	runtime.activationCommitRPC = nil
+	runtime.activationStatusRPC = nil
+	runtime.activationService = nil
+	runtime.activationVerifier = nil
+	runtime.activationStore = nil
 	runtime.processIncarnation = vnextReaderProcessIncarnation{}
 	runtime.processIncarnationLock = nil
 	runtime.store = nil

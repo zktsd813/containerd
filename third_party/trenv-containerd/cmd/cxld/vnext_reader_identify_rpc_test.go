@@ -139,7 +139,7 @@ func TestVNextReaderIdentifyRPCReturnsCanonicalBoundIdentity(t *testing.T) {
 	}
 }
 
-func TestVNextReaderIdentifyV1AdvertisesOnlyCanonicalPrepareAndStatusV2(t *testing.T) {
+func TestVNextReaderIdentifyV1AdvertisesCanonicalSixRouteCapabilitySet(t *testing.T) {
 	if vnextReaderIdentifyProtocol != "cxld.vnext-reader-identify.v1" ||
 		vnextReaderIdentifyALPN != "cxld-vnext-reader-identify/1" {
 		t.Fatalf("IDENTIFY hard-cut identity = %q/%q",
@@ -169,12 +169,26 @@ func TestVNextReaderIdentifyV1AdvertisesOnlyCanonicalPrepareAndStatusV2(t *testi
 			"cxld-vnext-reader-prepared-status-and-fence-response-receipt-v2" {
 		t.Fatal("STATUS_AND_FENCE v2 protocol, ALPN, or canonical domain drifted")
 	}
+	if vnextReaderActivationProposalProtocol !=
+		"cxld.vnext-reader-activation-proposal.v1" ||
+		vnextReaderActivationProposalALPN !=
+			"cxld-vnext-reader-activation-proposal/1" ||
+		vnextReaderActivationCommitProtocol !=
+			"cxld.vnext-reader-activation-commit.v1" ||
+		vnextReaderActivationCommitALPN !=
+			"cxld-vnext-reader-activation-commit/1" ||
+		vnextReaderActivationStatusProtocol !=
+			"cxld.vnext-reader-activation-status-and-fence.v1" ||
+		vnextReaderActivationStatusALPN !=
+			"cxld-vnext-reader-activation-status/1" {
+		t.Fatal("activation protocol or ALPN identity drifted")
+	}
 	capabilities := vnextReaderIdentifyCurrentCapabilities()
 	if err := validateVNextReaderIdentifyCapabilities(capabilities); err != nil {
 		t.Fatalf("validate canonical IDENTIFY capabilities: %v", err)
 	}
 	digest := vnextReaderIdentifyCanonicalCapabilitiesDigest(capabilities)
-	const wantDigest = "2ed26b1132cb10ea75c11fd3663a9b837e277451889926231336c2fd2f5193d1"
+	const wantDigest = "0dd20665ed7cb91c81247304d729cc7363bb08e945b41a7f4378f10a8b4862b1"
 	if got := fmt.Sprintf("%x", digest); got != wantDigest {
 		t.Fatalf("IDENTIFY v1 capabilities digest = %s, want %s", got, wantDigest)
 	}
@@ -297,6 +311,16 @@ func TestVNextReaderIdentifyResponseRejectsEveryIdentityAndCapabilityMutation(
 		},
 		"capability": func(value *vnextReaderIdentifyResponse) {
 			value.SupportedProtocols[0].ALPN = vnextReaderPrepareALPN
+		},
+		"missing activation capability": func(value *vnextReaderIdentifyResponse) {
+			value.SupportedProtocols = value.SupportedProtocols[1:]
+		},
+		"reordered activation capabilities": func(value *vnextReaderIdentifyResponse) {
+			value.SupportedProtocols[0], value.SupportedProtocols[1] =
+				value.SupportedProtocols[1], value.SupportedProtocols[0]
+		},
+		"duplicate activation capability": func(value *vnextReaderIdentifyResponse) {
+			value.SupportedProtocols[1] = value.SupportedProtocols[0]
 		},
 		"capability digest": func(value *vnextReaderIdentifyResponse) {
 			value.CapabilitiesDigest[0] ^= 1

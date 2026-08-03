@@ -67,19 +67,22 @@ type vnextReaderPrepareTLSFailureWire struct {
 }
 
 type vnextReaderPrepareTLSServer struct {
-	listener             net.Listener
-	tlsConfig            *tls.Config
-	rpc                  vnextReaderPrepareTransportRPC
-	statusRPC            vnextReaderPreparedStatusTransportRPC
-	identifyRPC          vnextReaderIdentifyTransportRPC
-	handshakeAdmission   chan struct{}
-	requestAdmission     chan struct{}
-	largeFrameAdmission  chan struct{}
-	handshakeTimeout     time.Duration
-	requestReadTimeout   time.Duration
-	handlerTimeout       time.Duration
-	responseWriteTimeout time.Duration
-	schedulerByPrincipal map[string]string
+	listener              net.Listener
+	tlsConfig             *tls.Config
+	rpc                   vnextReaderPrepareTransportRPC
+	statusRPC             vnextReaderPreparedStatusTransportRPC
+	identifyRPC           vnextReaderIdentifyTransportRPC
+	activationProposalRPC vnextReaderActivationTransportRPC
+	activationCommitRPC   vnextReaderActivationTransportRPC
+	activationStatusRPC   vnextReaderActivationTransportRPC
+	handshakeAdmission    chan struct{}
+	requestAdmission      chan struct{}
+	largeFrameAdmission   chan struct{}
+	handshakeTimeout      time.Duration
+	requestReadTimeout    time.Duration
+	handlerTimeout        time.Duration
+	responseWriteTimeout  time.Duration
+	schedulerByPrincipal  map[string]string
 
 	stopOnce sync.Once
 	wg       sync.WaitGroup
@@ -276,9 +279,7 @@ func loadVNextReaderPrepareTLSServerConfig(
 	}
 	allowedALPNs := make(map[string]struct{}, len(nextProtos))
 	for _, protocol := range nextProtos {
-		if protocol != vnextReaderPrepareALPN &&
-			protocol != vnextReaderPreparedStatusALPN &&
-			protocol != vnextReaderIdentifyALPN {
+		if !validVNextReaderTLSALPN(protocol) {
 			return nil, fmt.Errorf(
 				"VNext Reader TLS ALPN %q is not an exact Reader operation", protocol)
 		}
@@ -296,6 +297,20 @@ func loadVNextReaderPrepareTLSServerConfig(
 		return err
 	}
 	return tlsConfig, nil
+}
+
+func validVNextReaderTLSALPN(protocol string) bool {
+	switch protocol {
+	case vnextReaderPrepareALPN,
+		vnextReaderPreparedStatusALPN,
+		vnextReaderIdentifyALPN,
+		vnextReaderActivationProposalALPN,
+		vnextReaderActivationCommitALPN,
+		vnextReaderActivationStatusALPN:
+		return true
+	default:
+		return false
+	}
 }
 
 func vnextReaderPrepareTLSAuthenticatedPrincipal(
@@ -354,7 +369,8 @@ func startVNextReaderPrepareTLSServer(
 	largeFrameAdmission chan struct{},
 ) (*vnextReaderPrepareTLSServer, error) {
 	return startVNextReaderPrepareTLSServerCommon(
-		config, rpc, nil, nil, requestAdmission, largeFrameAdmission)
+		config, rpc, nil, nil, nil, nil, nil,
+		requestAdmission, largeFrameAdmission)
 }
 
 func startVNextReaderPrepareAndStatusTLSServer(
@@ -369,7 +385,8 @@ func startVNextReaderPrepareAndStatusTLSServer(
 			"VNext Reader STATUS_AND_FENCE TLS RPC is unavailable")
 	}
 	return startVNextReaderPrepareTLSServerCommon(
-		config, prepareRPC, statusRPC, nil, requestAdmission, largeFrameAdmission)
+		config, prepareRPC, statusRPC, nil, nil, nil, nil,
+		requestAdmission, largeFrameAdmission)
 }
 
 func startVNextReaderPrepareStatusAndIdentifyTLSServer(
@@ -388,7 +405,7 @@ func startVNextReaderPrepareStatusAndIdentifyTLSServer(
 		return nil, errors.New("VNext Reader IDENTIFY TLS RPC is unavailable")
 	}
 	return startVNextReaderPrepareTLSServerCommon(
-		config, prepareRPC, statusRPC, identifyRPC,
+		config, prepareRPC, statusRPC, identifyRPC, nil, nil, nil,
 		requestAdmission, largeFrameAdmission)
 }
 
@@ -397,6 +414,9 @@ func startVNextReaderPrepareTLSServerCommon(
 	rpc vnextReaderPrepareTransportRPC,
 	statusRPC vnextReaderPreparedStatusTransportRPC,
 	identifyRPC vnextReaderIdentifyTransportRPC,
+	activationProposalRPC vnextReaderActivationTransportRPC,
+	activationCommitRPC vnextReaderActivationTransportRPC,
+	activationStatusRPC vnextReaderActivationTransportRPC,
 	requestAdmission chan struct{},
 	largeFrameAdmission chan struct{},
 ) (*vnextReaderPrepareTLSServer, error) {
@@ -412,12 +432,30 @@ func startVNextReaderPrepareTLSServerCommon(
 		return nil, errors.New(
 			"VNext Reader PREPARE TLS large-frame admission is unavailable or unbuffered")
 	}
+	activationRouteCount := 0
+	for _, activationRPC := range []vnextReaderActivationTransportRPC{
+		activationProposalRPC, activationCommitRPC, activationStatusRPC,
+	} {
+		if !vnextReaderPreparedStatusNilInterface(activationRPC) {
+			activationRouteCount++
+		}
+	}
+	if activationRouteCount != 0 && activationRouteCount != 3 {
+		return nil, errors.New(
+			"VNext Reader activation TLS routes must be all present or all absent")
+	}
 	nextProtos := []string{vnextReaderPrepareALPN}
 	if !vnextReaderPreparedStatusNilInterface(statusRPC) {
 		nextProtos = append(nextProtos, vnextReaderPreparedStatusALPN)
 	}
 	if !vnextReaderPreparedStatusNilInterface(identifyRPC) {
 		nextProtos = append(nextProtos, vnextReaderIdentifyALPN)
+	}
+	if activationRouteCount == 3 {
+		nextProtos = append(nextProtos,
+			vnextReaderActivationProposalALPN,
+			vnextReaderActivationCommitALPN,
+			vnextReaderActivationStatusALPN)
 	}
 	tlsConfig, err := loadVNextReaderPrepareTLSServerConfig(
 		config, bindings, nextProtos)
@@ -431,19 +469,22 @@ func startVNextReaderPrepareTLSServerCommon(
 			config.ListenAddress, err)
 	}
 	server := &vnextReaderPrepareTLSServer{
-		listener:             listener,
-		tlsConfig:            tlsConfig,
-		rpc:                  rpc,
-		statusRPC:            statusRPC,
-		identifyRPC:          identifyRPC,
-		handshakeAdmission:   make(chan struct{}, vnextReaderPrepareTLSMaxHandshakes),
-		requestAdmission:     requestAdmission,
-		largeFrameAdmission:  largeFrameAdmission,
-		handshakeTimeout:     config.HandshakeTimeout,
-		requestReadTimeout:   config.RequestReadTimeout,
-		handlerTimeout:       config.HandlerTimeout,
-		responseWriteTimeout: config.ResponseWriteTimeout,
-		schedulerByPrincipal: bindings,
+		listener:              listener,
+		tlsConfig:             tlsConfig,
+		rpc:                   rpc,
+		statusRPC:             statusRPC,
+		identifyRPC:           identifyRPC,
+		activationProposalRPC: activationProposalRPC,
+		activationCommitRPC:   activationCommitRPC,
+		activationStatusRPC:   activationStatusRPC,
+		handshakeAdmission:    make(chan struct{}, vnextReaderPrepareTLSMaxHandshakes),
+		requestAdmission:      requestAdmission,
+		largeFrameAdmission:   largeFrameAdmission,
+		handshakeTimeout:      config.HandshakeTimeout,
+		requestReadTimeout:    config.RequestReadTimeout,
+		handlerTimeout:        config.HandlerTimeout,
+		responseWriteTimeout:  config.ResponseWriteTimeout,
+		schedulerByPrincipal:  bindings,
 	}
 	server.wg.Add(1)
 	go server.acceptLoop()
@@ -546,6 +587,11 @@ func (server *vnextReaderPrepareTLSServer) serveAccepted(rawConn net.Conn) {
 	if !vnextReaderPreparedStatusNilInterface(server.identifyRPC) {
 		allowedALPNs[vnextReaderIdentifyALPN] = struct{}{}
 	}
+	if server.hasAllVNextReaderActivationTLSRoutes() {
+		allowedALPNs[vnextReaderActivationProposalALPN] = struct{}{}
+		allowedALPNs[vnextReaderActivationCommitALPN] = struct{}{}
+		allowedALPNs[vnextReaderActivationStatusALPN] = struct{}{}
+	}
 	state := tlsConn.ConnectionState()
 	principal, err := vnextReaderTLSAuthenticatedPrincipal(
 		state, server.schedulerByPrincipal, allowedALPNs)
@@ -556,7 +602,15 @@ func (server *vnextReaderPrepareTLSServer) serveAccepted(rawConn net.Conn) {
 		return
 	}
 	if !tryAcquireDaemonRequestAdmission(server.requestAdmission) {
-		if state.NegotiatedProtocol == vnextReaderIdentifyALPN {
+		if spec, _, activation := server.vnextReaderActivationTLSRoute(
+			state.NegotiatedProtocol); activation {
+			server.writeActivationFailure(tlsConn, spec,
+				vnextReaderActivationFailure(
+					spec, vnextReaderActivationCapacityError,
+					vnextReaderActivationDefinitelyNotAccepted,
+					errors.New(
+						"VNext Reader activation TLS request admission is full")))
+		} else if state.NegotiatedProtocol == vnextReaderIdentifyALPN {
 			server.writeIdentifyFailure(tlsConn, vnextReaderIdentifyFailure(
 				vnextReaderIdentifyCapacityError,
 				errors.New("VNext Reader IDENTIFY TLS request admission is full")))
@@ -594,6 +648,12 @@ func (server *vnextReaderPrepareTLSServer) serveAuthenticated(
 	negotiatedProtocol string,
 	releaseRequest func(),
 ) {
+	if spec, rpc, activation := server.vnextReaderActivationTLSRoute(
+		negotiatedProtocol); activation {
+		server.serveAuthenticatedActivation(
+			conn, principal, spec, rpc, releaseRequest)
+		return
+	}
 	if negotiatedProtocol == vnextReaderIdentifyALPN {
 		server.serveAuthenticatedIdentify(conn, principal, releaseRequest)
 		return
