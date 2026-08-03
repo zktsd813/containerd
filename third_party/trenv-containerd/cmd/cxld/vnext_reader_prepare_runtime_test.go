@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -21,6 +24,55 @@ func (*vnextReaderPrepareRuntimeTestLeaderReader) LinearizableGetExact(
 ) (vnextOwnerSchedulerLeaderSnapshot, error) {
 	return vnextOwnerSchedulerLeaderSnapshot{}, errors.New(
 		"runtime test leader reads are not expected during construction")
+}
+
+type vnextReaderPrepareRuntimeTestIncarnationPublisher struct {
+	publish func(string, vnextReaderProcessIncarnation) error
+}
+
+type vnextReaderPrepareRuntimeTestIncarnationLock struct {
+	remove  func(vnextReaderProcessIncarnation, bool) error
+	release func() error
+}
+
+func (lock *vnextReaderPrepareRuntimeTestIncarnationLock) RemovePublishedIdentity(
+	incarnation vnextReaderProcessIncarnation,
+	requireExact bool,
+) error {
+	if lock.remove != nil {
+		return lock.remove(incarnation, requireExact)
+	}
+	return nil
+}
+
+func (lock *vnextReaderPrepareRuntimeTestIncarnationLock) Release() error {
+	if lock.release != nil {
+		return lock.release()
+	}
+	return nil
+}
+
+type vnextReaderPrepareRuntimeTestIncarnationLocker struct {
+	acquire func(string) (vnextReaderProcessIncarnationLock, error)
+}
+
+func (locker *vnextReaderPrepareRuntimeTestIncarnationLocker) Acquire(
+	path string,
+) (vnextReaderProcessIncarnationLock, error) {
+	if locker.acquire != nil {
+		return locker.acquire(path)
+	}
+	return &vnextReaderPrepareRuntimeTestIncarnationLock{}, nil
+}
+
+func (publisher *vnextReaderPrepareRuntimeTestIncarnationPublisher) Publish(
+	path string,
+	incarnation vnextReaderProcessIncarnation,
+) error {
+	if publisher.publish != nil {
+		return publisher.publish(path, incarnation)
+	}
+	return nil
 }
 
 type vnextReaderPrepareRuntimeTestEvents struct {
@@ -120,6 +172,11 @@ func vnextReaderPrepareRuntimeTestDependencies(
 	closeErr error,
 ) (vnextReaderPrepareRuntimeDependencies, *int64) {
 	dependencies := defaultVNextReaderPrepareRuntimeDependencies()
+	dependencies.processIncarnationPath = "/test/process-incarnation"
+	dependencies.processIncarnationWriter =
+		&vnextReaderPrepareRuntimeTestIncarnationPublisher{}
+	dependencies.processIncarnationLocker =
+		&vnextReaderPrepareRuntimeTestIncarnationLocker{}
 	closeCalls := new(int64)
 	dependencies.openLeaderReader = func(
 		vnextOwnerSchedulerAuthorityConfig,
@@ -181,6 +238,18 @@ func TestVNextReaderPrepareAndStatusRuntimeDependenciesAreAllOrNothing(
 ) {
 	config := validVNextReaderPrepareRuntimeConfig(t)
 	tests := map[string]func(*vnextReaderPrepareRuntimeDependencies){
+		"entropy": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.entropy = nil
+		},
+		"process-incarnation path": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.processIncarnationPath = ""
+		},
+		"process-incarnation publisher": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.processIncarnationWriter = nil
+		},
+		"process-incarnation locker": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.processIncarnationLocker = nil
+		},
 		"store": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.newStore = nil
 		},
@@ -193,17 +262,26 @@ func TestVNextReaderPrepareAndStatusRuntimeDependenciesAreAllOrNothing(
 		"STATUS verifier": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.newStatusVerifier = nil
 		},
+		"IDENTIFY verifier": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newIdentifyVerifier = nil
+		},
 		"PREPARE service": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.newService = nil
 		},
 		"STATUS service": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.newStatusService = nil
 		},
+		"IDENTIFY service": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newIdentifyService = nil
+		},
 		"PREPARE RPC": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.newRPC = nil
 		},
 		"STATUS RPC": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.newStatusRPC = nil
+		},
+		"IDENTIFY RPC": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newIdentifyRPC = nil
 		},
 		"dual listener": func(value *vnextReaderPrepareRuntimeDependencies) {
 			value.startServer = nil
@@ -350,6 +428,9 @@ func TestVNextReaderPrepareRuntimeLeaderReaderPartialOpenAlwaysCloses(
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			dependencies := defaultVNextReaderPrepareRuntimeDependencies()
+			dependencies.processIncarnationPath = "/test/process-incarnation"
+			dependencies.processIncarnationLocker =
+				&vnextReaderPrepareRuntimeTestIncarnationLocker{}
 			var closeCalls int64
 			dependencies.openLeaderReader = func(
 				vnextOwnerSchedulerAuthorityConfig,
@@ -363,6 +444,7 @@ func TestVNextReaderPrepareRuntimeLeaderReaderPartialOpenAlwaysCloses(
 				vnextReaderPrepareTLSServerConfig,
 				vnextReaderPrepareTransportRPC,
 				vnextReaderPreparedStatusTransportRPC,
+				vnextReaderIdentifyTransportRPC,
 				chan struct{},
 				chan struct{},
 			) (vnextReaderPrepareRuntimeServer, error) {
@@ -460,6 +542,269 @@ func TestVNextReaderPrepareRuntimeRequiresDaemonWideAdmissionsBeforeResources(
 	}
 }
 
+func TestVNextReaderPrepareRuntimeEntropyFailureAndZeroOpenNothing(
+	t *testing.T,
+) {
+	config := validVNextReaderPrepareRuntimeConfig(t)
+	for name, entropy := range map[string]io.Reader{
+		"failure": vnextReaderProcessIncarnationErrorReader{
+			err: errors.New("test runtime entropy failure")},
+		"zero": bytes.NewReader(make([]byte,
+			vnextReaderProcessIncarnationBytes)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			dependencies, _ := vnextReaderPrepareRuntimeTestDependencies(nil, nil)
+			dependencies.entropy = entropy
+			var lockAcquireCalls int64
+			var lockReleaseCalls int64
+			dependencies.processIncarnationLocker =
+				&vnextReaderPrepareRuntimeTestIncarnationLocker{
+					acquire: func(string) (vnextReaderProcessIncarnationLock, error) {
+						atomic.AddInt64(&lockAcquireCalls, 1)
+						return &vnextReaderPrepareRuntimeTestIncarnationLock{
+							release: func() error {
+								atomic.AddInt64(&lockReleaseCalls, 1)
+								return nil
+							},
+						}, nil
+					},
+				}
+			var resourceCalls int64
+			dependencies.newStore = func(
+				vnextReaderAuthorizationStoreConfig,
+			) (*vnextReaderAuthorizationStore, error) {
+				atomic.AddInt64(&resourceCalls, 1)
+				return nil, errors.New("must not open")
+			}
+			dependencies.processIncarnationWriter =
+				&vnextReaderPrepareRuntimeTestIncarnationPublisher{
+					publish: func(string, vnextReaderProcessIncarnation) error {
+						atomic.AddInt64(&resourceCalls, 1)
+						return nil
+					},
+				}
+			runtime, err := openVNextReaderPrepareRuntimeTest(config, dependencies)
+			if runtime != nil || err == nil {
+				t.Fatalf("entropy %s returned runtime=%#v err=%v", name, runtime, err)
+			}
+			if atomic.LoadInt64(&resourceCalls) != 0 {
+				t.Fatalf("entropy %s opened %d resources", name, resourceCalls)
+			}
+			if atomic.LoadInt64(&lockAcquireCalls) != 1 ||
+				atomic.LoadInt64(&lockReleaseCalls) != 1 {
+				t.Fatalf("entropy %s lock acquire/release=%d/%d, want 1/1",
+					name, lockAcquireCalls, lockReleaseCalls)
+			}
+		})
+	}
+}
+
+func TestVNextReaderPrepareRuntimePublishesIdentityBeforeListener(
+	t *testing.T,
+) {
+	config := validVNextReaderPrepareRuntimeConfig(t)
+	events := &vnextReaderPrepareRuntimeTestEvents{}
+	dependencies, _ := vnextReaderPrepareRuntimeTestDependencies(events, nil)
+	want := vnextReaderProcessIncarnationForTest(0x61)
+	dependencies.entropy = bytes.NewReader(want[:])
+	var published vnextReaderProcessIncarnation
+	dependencies.processIncarnationWriter =
+		&vnextReaderPrepareRuntimeTestIncarnationPublisher{
+			publish: func(path string, incarnation vnextReaderProcessIncarnation) error {
+				if path != dependencies.processIncarnationPath {
+					t.Fatalf("publish path = %q", path)
+				}
+				published = incarnation
+				events.add("incarnation-publish")
+				return nil
+			},
+		}
+	server := &vnextReaderPrepareRuntimeTestServer{events: events}
+	dependencies.startServer = func(
+		_ vnextReaderPrepareTLSServerConfig,
+		_ vnextReaderPrepareTransportRPC,
+		_ vnextReaderPreparedStatusTransportRPC,
+		identifyRPC vnextReaderIdentifyTransportRPC,
+		_ chan struct{},
+		_ chan struct{},
+	) (vnextReaderPrepareRuntimeServer, error) {
+		if got := events.snapshot(); !reflect.DeepEqual(
+			got, []string{"incarnation-publish"}) {
+			t.Fatalf("listener started before identity publication: %v", got)
+		}
+		concrete, ok := identifyRPC.(*vnextReaderIdentifyRPC)
+		if !ok || concrete.service.processIncarnation != want {
+			t.Fatalf("listener IDENTIFY RPC has process incarnation %#v", identifyRPC)
+		}
+		events.add("listener-open")
+		return server, nil
+	}
+	runtime, err := openVNextReaderPrepareRuntimeTest(config, dependencies)
+	if err != nil {
+		t.Fatalf("open runtime with ordered identity publication: %v", err)
+	}
+	if published != want || runtime.processIncarnation != want ||
+		runtime.identifyService.processIncarnation != want {
+		_ = runtime.Close()
+		t.Fatal("runtime components did not share the one generated incarnation")
+	}
+	if got := events.snapshot(); !reflect.DeepEqual(
+		got, []string{"incarnation-publish", "listener-open"}) {
+		_ = runtime.Close()
+		t.Fatalf("startup order = %v", got)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("close runtime: %v", err)
+	}
+}
+
+func TestVNextReaderPrepareRuntimePublicationFailureNeverOpensListener(
+	t *testing.T,
+) {
+	config := validVNextReaderPrepareRuntimeConfig(t)
+	events := &vnextReaderPrepareRuntimeTestEvents{}
+	dependencies, closeCalls := vnextReaderPrepareRuntimeTestDependencies(
+		events, nil)
+	publishErr := errors.New("test process-incarnation publication failure")
+	dependencies.processIncarnationWriter =
+		&vnextReaderPrepareRuntimeTestIncarnationPublisher{
+			publish: func(string, vnextReaderProcessIncarnation) error {
+				events.add("incarnation-publish-fail")
+				return publishErr
+			},
+		}
+	dependencies.startServer = func(
+		vnextReaderPrepareTLSServerConfig,
+		vnextReaderPrepareTransportRPC,
+		vnextReaderPreparedStatusTransportRPC,
+		vnextReaderIdentifyTransportRPC,
+		chan struct{},
+		chan struct{},
+	) (vnextReaderPrepareRuntimeServer, error) {
+		t.Fatal("listener opened after process-incarnation publication failed")
+		return nil, nil
+	}
+	runtime, err := openVNextReaderPrepareRuntimeTest(config, dependencies)
+	if runtime != nil || !errors.Is(err, publishErr) {
+		t.Fatalf("publication failure returned runtime=%#v err=%v", runtime, err)
+	}
+	if got := events.snapshot(); !reflect.DeepEqual(got,
+		[]string{"incarnation-publish-fail", "etcd-close"}) {
+		t.Fatalf("publication failure cleanup order = %v", got)
+	}
+	if atomic.LoadInt64(closeCalls) != 1 {
+		t.Fatalf("publication failure etcd close calls = %d", *closeCalls)
+	}
+}
+
+func TestVNextReaderPrepareRuntimeListenerFailureRemovesPublishedIdentityAndUnlocks(
+	t *testing.T,
+) {
+	config := validVNextReaderPrepareRuntimeConfig(t)
+	directory := vnextReaderProcessIncarnationSecureTestDir(t)
+	path := filepath.Join(directory, "process-incarnation")
+	want := vnextReaderProcessIncarnationForTest(0x81)
+	dependencies, closeCalls := vnextReaderPrepareRuntimeTestDependencies(nil, nil)
+	dependencies.entropy = bytes.NewReader(want[:])
+	dependencies.processIncarnationPath = path
+	dependencies.processIncarnationWriter =
+		&vnextReaderProcessIncarnationFilePublisher{}
+	dependencies.processIncarnationLocker =
+		&vnextReaderProcessIncarnationFileLockAcquirer{}
+	startErr := errors.New("test post-publication listener failure")
+	dependencies.startServer = func(
+		vnextReaderPrepareTLSServerConfig,
+		vnextReaderPrepareTransportRPC,
+		vnextReaderPreparedStatusTransportRPC,
+		vnextReaderIdentifyTransportRPC,
+		chan struct{},
+		chan struct{},
+	) (vnextReaderPrepareRuntimeServer, error) {
+		assertVNextReaderProcessIncarnationFile(t, path, want)
+		return nil, startErr
+	}
+	runtime, err := openVNextReaderPrepareRuntimeTest(config, dependencies)
+	if runtime != nil || !errors.Is(err, startErr) {
+		t.Fatalf("listener failure returned runtime=%#v err=%v", runtime, err)
+	}
+	if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("listener failure left published process incarnation: %v", statErr)
+	}
+	if atomic.LoadInt64(closeCalls) != 1 {
+		t.Fatalf("listener failure etcd close calls = %d", *closeCalls)
+	}
+	lock, lockErr := (&vnextReaderProcessIncarnationFileLockAcquirer{}).Acquire(path)
+	if lockErr != nil {
+		t.Fatalf("listener failure left process lock held: %v", lockErr)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatalf("release post-failure lock: %v", err)
+	}
+}
+
+func TestVNextReaderPrepareRuntimeLockSerializesStartsThroughGracefulClose(
+	t *testing.T,
+) {
+	config := validVNextReaderPrepareRuntimeConfig(t)
+	directory := vnextReaderProcessIncarnationSecureTestDir(t)
+	path := filepath.Join(directory, "process-incarnation")
+	firstID := vnextReaderProcessIncarnationForTest(0x91)
+	secondID := vnextReaderProcessIncarnationForTest(0x92)
+	newDependencies := func(
+		entropy io.Reader,
+	) vnextReaderPrepareRuntimeDependencies {
+		dependencies, _ := vnextReaderPrepareRuntimeTestDependencies(nil, nil)
+		dependencies.entropy = entropy
+		dependencies.processIncarnationPath = path
+		dependencies.processIncarnationWriter =
+			&vnextReaderProcessIncarnationFilePublisher{}
+		dependencies.processIncarnationLocker =
+			&vnextReaderProcessIncarnationFileLockAcquirer{}
+		dependencies.startServer = func(
+			vnextReaderPrepareTLSServerConfig,
+			vnextReaderPrepareTransportRPC,
+			vnextReaderPreparedStatusTransportRPC,
+			vnextReaderIdentifyTransportRPC,
+			chan struct{},
+			chan struct{},
+		) (vnextReaderPrepareRuntimeServer, error) {
+			return &vnextReaderPrepareRuntimeTestServer{}, nil
+		}
+		return dependencies
+	}
+	first, err := openVNextReaderPrepareRuntimeTest(
+		config, newDependencies(bytes.NewReader(firstID[:])))
+	if err != nil {
+		t.Fatalf("open first locked Reader runtime: %v", err)
+	}
+	assertVNextReaderProcessIncarnationFile(t, path, firstID)
+	blocked, err := openVNextReaderPrepareRuntimeTest(
+		config,
+		newDependencies(vnextReaderProcessIncarnationErrorReader{
+			err: errors.New("entropy must not be read while lock is held")}))
+	if blocked != nil ||
+		!errors.Is(err, errVNextReaderProcessIncarnationLockHeld) {
+		_ = first.Close()
+		t.Fatalf("concurrent start returned runtime=%#v err=%v", blocked, err)
+	}
+	assertVNextReaderProcessIncarnationFile(t, path, firstID)
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first locked Reader runtime: %v", err)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("graceful Close left stale process incarnation: %v", err)
+	}
+	second, err := openVNextReaderPrepareRuntimeTest(
+		config, newDependencies(bytes.NewReader(secondID[:])))
+	if err != nil {
+		t.Fatalf("open Reader runtime after first Close: %v", err)
+	}
+	assertVNextReaderProcessIncarnationFile(t, path, secondID)
+	if err := second.Close(); err != nil {
+		t.Fatalf("close second locked Reader runtime: %v", err)
+	}
+}
+
 func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 	t *testing.T,
 ) {
@@ -470,8 +815,10 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 	dependencies, _ := vnextReaderPrepareRuntimeTestDependencies(nil, nil)
 	defaultNewVerifier := dependencies.newVerifier
 	defaultNewStatusVerifier := dependencies.newStatusVerifier
+	defaultNewIdentifyVerifier := dependencies.newIdentifyVerifier
 	var verifierConfig vnextReaderPrepareCurrentAuthorityConfig
 	var statusVerifierConfig vnextReaderPreparedStatusCurrentAuthorityConfig
+	var identifyVerifierConfig vnextReaderIdentifyCurrentAuthorityConfig
 	dependencies.newVerifier = func(
 		config vnextReaderPrepareCurrentAuthorityConfig,
 		reader vnextOwnerSchedulerLeaderReader,
@@ -486,20 +833,30 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 		statusVerifierConfig = config
 		return defaultNewStatusVerifier(config, reader)
 	}
+	dependencies.newIdentifyVerifier = func(
+		config vnextReaderIdentifyCurrentAuthorityConfig,
+		reader vnextOwnerSchedulerLeaderReader,
+	) (vnextReaderIdentifyAuthorityVerifier, error) {
+		identifyVerifierConfig = config
+		return defaultNewIdentifyVerifier(config, reader)
+	}
 	server := &vnextReaderPrepareRuntimeTestServer{}
 	var tlsConfig vnextReaderPrepareTLSServerConfig
 	var passedPrepareRPC vnextReaderPrepareTransportRPC
 	var passedStatusRPC vnextReaderPreparedStatusTransportRPC
+	var passedIdentifyRPC vnextReaderIdentifyTransportRPC
 	dependencies.startServer = func(
 		config vnextReaderPrepareTLSServerConfig,
 		prepareRPC vnextReaderPrepareTransportRPC,
 		statusRPC vnextReaderPreparedStatusTransportRPC,
+		identifyRPC vnextReaderIdentifyTransportRPC,
 		_ chan struct{},
 		_ chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
 		tlsConfig = config
 		passedPrepareRPC = prepareRPC
 		passedStatusRPC = statusRPC
+		passedIdentifyRPC = identifyRPC
 		return server, nil
 	}
 	requestAdmission, largeAdmission := vnextReaderPrepareRuntimeTestAdmissions()
@@ -518,12 +875,18 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 	if !ok {
 		t.Fatalf("runtime status verifier type = %T", runtime.statusVerifier)
 	}
+	currentIdentifyVerifier, ok := runtime.identifyVerifier.(*vnextReaderIdentifyCurrentAuthorityVerifier)
+	if !ok {
+		t.Fatalf("runtime IDENTIFY verifier type = %T", runtime.identifyVerifier)
+	}
 	for name, bindings := range map[string]map[string]string{
 		"runtime":           runtime.schedulerByPrincipal,
 		"verifier-config":   verifierConfig.SchedulerByPrincipal,
 		"verifier-retained": currentVerifier.schedulerByPrincipal,
 		"status-config":     statusVerifierConfig.SchedulerByPrincipal,
 		"status-retained":   currentStatusVerifier.schedulerByPrincipal,
+		"identify-config":   identifyVerifierConfig.SchedulerByPrincipal,
+		"identify-retained": currentIdentifyVerifier.schedulerByPrincipal,
 		"TLS-config":        tlsConfig.SchedulerByPrincipal,
 	} {
 		if !reflect.DeepEqual(bindings, wantBindings) {
@@ -532,19 +895,24 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 	}
 	if verifierConfig.LeaderKey != statusVerifierConfig.LeaderKey ||
 		verifierConfig.ExpectedCluster != statusVerifierConfig.ExpectedCluster ||
-		verifierConfig.ReadTimeout != statusVerifierConfig.ReadTimeout {
-		t.Fatalf("PREPARE/STATUS authority source differs: prepare=%#v status=%#v",
-			verifierConfig, statusVerifierConfig)
+		verifierConfig.ReadTimeout != statusVerifierConfig.ReadTimeout ||
+		verifierConfig.LeaderKey != identifyVerifierConfig.LeaderKey ||
+		verifierConfig.ExpectedCluster != identifyVerifierConfig.ExpectedCluster ||
+		verifierConfig.ReadTimeout != identifyVerifierConfig.ReadTimeout {
+		t.Fatalf("Reader authority sources differ: prepare=%#v status=%#v identify=%#v",
+			verifierConfig, statusVerifierConfig, identifyVerifierConfig)
 	}
-	if currentVerifier.reader != currentStatusVerifier.reader {
-		t.Fatal("PREPARE and STATUS verifiers did not retain the same independent reader")
+	if currentVerifier.reader != currentStatusVerifier.reader ||
+		currentVerifier.reader != currentIdentifyVerifier.reader {
+		t.Fatal("Reader verifiers did not retain the same independent reader")
 	}
 	if runtime.service.store != runtime.store ||
 		runtime.statusService.store != runtime.store {
 		t.Fatal("PREPARE and STATUS services do not share the exact authorization store")
 	}
-	if passedPrepareRPC != runtime.rpc || passedStatusRPC != runtime.statusRPC {
-		t.Fatal("dual listener did not receive the exact PREPARE and STATUS RPCs")
+	if passedPrepareRPC != runtime.rpc || passedStatusRPC != runtime.statusRPC ||
+		passedIdentifyRPC != runtime.identifyRPC {
+		t.Fatal("listener did not receive the exact three Reader RPCs")
 	}
 	if runtime.requestAdmission != requestAdmission ||
 		runtime.largeFrameAdmission != largeAdmission ||
@@ -564,7 +932,9 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 	if !reflect.DeepEqual(runtime.schedulerByPrincipal, wantBindings) ||
 		!reflect.DeepEqual(currentVerifier.schedulerByPrincipal, wantBindings) ||
 		!reflect.DeepEqual(
-			currentStatusVerifier.schedulerByPrincipal, wantBindings) {
+			currentStatusVerifier.schedulerByPrincipal, wantBindings) ||
+		!reflect.DeepEqual(
+			currentIdentifyVerifier.schedulerByPrincipal, wantBindings) {
 		t.Fatal("runtime retained aliases into caller-owned principal configuration")
 	}
 }
@@ -586,6 +956,7 @@ func TestVNextReaderPrepareRuntimePartialConstructionCleansUpInReverseOrder(
 		vnextReaderPrepareTLSServerConfig,
 		vnextReaderPrepareTransportRPC,
 		vnextReaderPreparedStatusTransportRPC,
+		vnextReaderIdentifyTransportRPC,
 		chan struct{},
 		chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
@@ -630,6 +1001,7 @@ func TestVNextReaderPrepareRuntimeVerifierFailureClosesOnlyOpenedEtcd(
 		vnextReaderPrepareTLSServerConfig,
 		vnextReaderPrepareTransportRPC,
 		vnextReaderPreparedStatusTransportRPC,
+		vnextReaderIdentifyTransportRPC,
 		chan struct{},
 		chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
@@ -651,6 +1023,21 @@ func TestVNextReaderPrepareRuntimeShutdownDrainsBeforeEtcdClose(t *testing.T) {
 	config := validVNextReaderPrepareRuntimeConfig(t)
 	events := &vnextReaderPrepareRuntimeTestEvents{}
 	dependencies, closeCalls := vnextReaderPrepareRuntimeTestDependencies(events, nil)
+	dependencies.processIncarnationLocker =
+		&vnextReaderPrepareRuntimeTestIncarnationLocker{
+			acquire: func(string) (vnextReaderProcessIncarnationLock, error) {
+				return &vnextReaderPrepareRuntimeTestIncarnationLock{
+					remove: func(vnextReaderProcessIncarnation, bool) error {
+						events.add("incarnation-remove")
+						return nil
+					},
+					release: func() error {
+						events.add("incarnation-unlock")
+						return nil
+					},
+				}, nil
+			},
+		}
 	waitStarted := make(chan struct{})
 	waitRelease := make(chan struct{})
 	server := &vnextReaderPrepareRuntimeTestServer{
@@ -660,6 +1047,7 @@ func TestVNextReaderPrepareRuntimeShutdownDrainsBeforeEtcdClose(t *testing.T) {
 		vnextReaderPrepareTLSServerConfig,
 		vnextReaderPrepareTransportRPC,
 		vnextReaderPreparedStatusTransportRPC,
+		vnextReaderIdentifyTransportRPC,
 		chan struct{},
 		chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
@@ -695,7 +1083,10 @@ func TestVNextReaderPrepareRuntimeShutdownDrainsBeforeEtcdClose(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("runtime Close did not finish after handler drain")
 	}
-	wantEvents := []string{"listener-stop", "handler-wait", "etcd-close"}
+	wantEvents := []string{
+		"listener-stop", "handler-wait", "etcd-close",
+		"incarnation-remove", "incarnation-unlock",
+	}
 	if got := events.snapshot(); !reflect.DeepEqual(got, wantEvents) {
 		t.Fatalf("shutdown order = %v, want %v", got, wantEvents)
 	}
@@ -730,9 +1121,10 @@ func TestVNextReaderPrepareRuntimeStartsRealMTLSListener(t *testing.T) {
 		_ = runtime.Close()
 		t.Fatal("successful startup omitted a required Reader component")
 	}
-	if len(server.tlsConfig.NextProtos) != 2 ||
+	if len(server.tlsConfig.NextProtos) != 3 ||
 		server.tlsConfig.NextProtos[0] != vnextReaderPrepareALPN ||
-		server.tlsConfig.NextProtos[1] != vnextReaderPreparedStatusALPN {
+		server.tlsConfig.NextProtos[1] != vnextReaderPreparedStatusALPN ||
+		server.tlsConfig.NextProtos[2] != vnextReaderIdentifyALPN {
 		_ = runtime.Close()
 		t.Fatalf("production Reader listener ALPNs = %#v",
 			server.tlsConfig.NextProtos)

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,7 +83,11 @@ type vnextReaderPrepareRuntimeServer interface {
 }
 
 type vnextReaderPrepareRuntimeDependencies struct {
-	newStore func(vnextReaderAuthorizationStoreConfig) (
+	entropy                  io.Reader
+	processIncarnationPath   string
+	processIncarnationWriter vnextReaderProcessIncarnationPublisher
+	processIncarnationLocker vnextReaderProcessIncarnationLockAcquirer
+	newStore                 func(vnextReaderAuthorizationStoreConfig) (
 		*vnextReaderAuthorizationStore, error)
 	openLeaderReader func(vnextOwnerSchedulerAuthorityConfig) (
 		vnextOwnerSchedulerLeaderReader, func() error, error)
@@ -93,6 +99,10 @@ type vnextReaderPrepareRuntimeDependencies struct {
 		vnextReaderPreparedStatusCurrentAuthorityConfig,
 		vnextOwnerSchedulerLeaderReader,
 	) (vnextReaderPreparedStatusAuthorityVerifier, error)
+	newIdentifyVerifier func(
+		vnextReaderIdentifyCurrentAuthorityConfig,
+		vnextOwnerSchedulerLeaderReader,
+	) (vnextReaderIdentifyAuthorityVerifier, error)
 	newService func(
 		string,
 		string,
@@ -106,14 +116,25 @@ type vnextReaderPrepareRuntimeDependencies struct {
 		vnextReaderPreparedStatusStore,
 		vnextReaderPreparedStatusAuthorityVerifier,
 	) (*vnextReaderPreparedStatusService, error)
+	newIdentifyService func(
+		string,
+		string,
+		vnextReaderProcessIncarnation,
+		string,
+		vnextReaderIdentifyAuthorityVerifier,
+	) (*vnextReaderIdentifyService, error)
 	newRPC       func(*vnextReaderPrepareService) vnextReaderPrepareTransportRPC
 	newStatusRPC func(
 		*vnextReaderPreparedStatusService,
 	) vnextReaderPreparedStatusTransportRPC
+	newIdentifyRPC func(
+		*vnextReaderIdentifyService,
+	) vnextReaderIdentifyTransportRPC
 	startServer func(
 		vnextReaderPrepareTLSServerConfig,
 		vnextReaderPrepareTransportRPC,
 		vnextReaderPreparedStatusTransportRPC,
+		vnextReaderIdentifyTransportRPC,
 		chan struct{},
 		chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error)
@@ -129,21 +150,26 @@ func (vnextReaderPrepareSystemClock) NowEpochMillis() int64 {
 type vnextReaderPrepareRuntime struct {
 	mu sync.Mutex
 
-	store                *vnextReaderAuthorizationStore
-	verifier             vnextReaderPrepareAuthorityVerifier
-	service              *vnextReaderPrepareService
-	rpc                  vnextReaderPrepareTransportRPC
-	statusVerifier       vnextReaderPreparedStatusAuthorityVerifier
-	statusService        *vnextReaderPreparedStatusService
-	statusRPC            vnextReaderPreparedStatusTransportRPC
-	server               vnextReaderPrepareRuntimeServer
-	closeLeaderReader    func() error
-	requestAdmission     chan struct{}
-	largeFrameAdmission  chan struct{}
-	schedulerByPrincipal map[string]string
-	stopCalled           bool
-	stopErr              error
-	closed               bool
+	store                  *vnextReaderAuthorizationStore
+	verifier               vnextReaderPrepareAuthorityVerifier
+	service                *vnextReaderPrepareService
+	rpc                    vnextReaderPrepareTransportRPC
+	statusVerifier         vnextReaderPreparedStatusAuthorityVerifier
+	statusService          *vnextReaderPreparedStatusService
+	statusRPC              vnextReaderPreparedStatusTransportRPC
+	processIncarnation     vnextReaderProcessIncarnation
+	processIncarnationLock vnextReaderProcessIncarnationLock
+	identifyVerifier       vnextReaderIdentifyAuthorityVerifier
+	identifyService        *vnextReaderIdentifyService
+	identifyRPC            vnextReaderIdentifyTransportRPC
+	server                 vnextReaderPrepareRuntimeServer
+	closeLeaderReader      func() error
+	requestAdmission       chan struct{}
+	largeFrameAdmission    chan struct{}
+	schedulerByPrincipal   map[string]string
+	stopCalled             bool
+	stopErr                error
+	closed                 bool
 }
 
 type vnextReaderPrepareRuntimeErrors struct {
@@ -502,8 +528,12 @@ func canonicalVNextReaderPrepareRuntimeConfig(
 
 func defaultVNextReaderPrepareRuntimeDependencies() vnextReaderPrepareRuntimeDependencies {
 	return vnextReaderPrepareRuntimeDependencies{
-		newStore:         newVNextReaderAuthorizationStore,
-		openLeaderReader: openVNextReaderPrepareIndependentLeaderReader,
+		entropy:                  rand.Reader,
+		processIncarnationPath:   vnextReaderProcessIncarnationPath,
+		processIncarnationWriter: &vnextReaderProcessIncarnationFilePublisher{},
+		processIncarnationLocker: &vnextReaderProcessIncarnationFileLockAcquirer{},
+		newStore:                 newVNextReaderAuthorizationStore,
+		openLeaderReader:         openVNextReaderPrepareIndependentLeaderReader,
 		newVerifier: func(
 			config vnextReaderPrepareCurrentAuthorityConfig,
 			reader vnextOwnerSchedulerLeaderReader,
@@ -516,8 +546,15 @@ func defaultVNextReaderPrepareRuntimeDependencies() vnextReaderPrepareRuntimeDep
 		) (vnextReaderPreparedStatusAuthorityVerifier, error) {
 			return newVNextReaderPreparedStatusCurrentAuthorityVerifier(config, reader)
 		},
-		newService:       newVNextReaderPrepareService,
-		newStatusService: newVNextReaderPreparedStatusService,
+		newIdentifyVerifier: func(
+			config vnextReaderIdentifyCurrentAuthorityConfig,
+			reader vnextOwnerSchedulerLeaderReader,
+		) (vnextReaderIdentifyAuthorityVerifier, error) {
+			return newVNextReaderIdentifyCurrentAuthorityVerifier(config, reader)
+		},
+		newService:         newVNextReaderPrepareService,
+		newStatusService:   newVNextReaderPreparedStatusService,
+		newIdentifyService: newVNextReaderIdentifyService,
 		newRPC: func(service *vnextReaderPrepareService) vnextReaderPrepareTransportRPC {
 			return newVNextReaderPrepareRPC(service)
 		},
@@ -526,15 +563,22 @@ func defaultVNextReaderPrepareRuntimeDependencies() vnextReaderPrepareRuntimeDep
 		) vnextReaderPreparedStatusTransportRPC {
 			return newVNextReaderPreparedStatusRPC(service)
 		},
+		newIdentifyRPC: func(
+			service *vnextReaderIdentifyService,
+		) vnextReaderIdentifyTransportRPC {
+			return newVNextReaderIdentifyRPC(service)
+		},
 		startServer: func(
 			config vnextReaderPrepareTLSServerConfig,
 			rpc vnextReaderPrepareTransportRPC,
 			statusRPC vnextReaderPreparedStatusTransportRPC,
+			identifyRPC vnextReaderIdentifyTransportRPC,
 			requestAdmission chan struct{},
 			largeAdmission chan struct{},
 		) (vnextReaderPrepareRuntimeServer, error) {
-			return startVNextReaderPrepareAndStatusTLSServer(
-				config, rpc, statusRPC, requestAdmission, largeAdmission)
+			return startVNextReaderPrepareStatusAndIdentifyTLSServer(
+				config, rpc, statusRPC, identifyRPC,
+				requestAdmission, largeAdmission)
 		},
 		clock: vnextReaderPrepareSystemClock{},
 	}
@@ -543,10 +587,17 @@ func defaultVNextReaderPrepareRuntimeDependencies() vnextReaderPrepareRuntimeDep
 func validateVNextReaderPrepareRuntimeDependencies(
 	dependencies vnextReaderPrepareRuntimeDependencies,
 ) error {
-	if dependencies.newStore == nil || dependencies.openLeaderReader == nil ||
+	if vnextReaderPreparedStatusNilInterface(dependencies.entropy) ||
+		dependencies.processIncarnationPath == "" ||
+		vnextReaderPreparedStatusNilInterface(dependencies.processIncarnationWriter) ||
+		vnextReaderPreparedStatusNilInterface(dependencies.processIncarnationLocker) ||
+		dependencies.newStore == nil || dependencies.openLeaderReader == nil ||
 		dependencies.newVerifier == nil || dependencies.newStatusVerifier == nil ||
+		dependencies.newIdentifyVerifier == nil ||
 		dependencies.newService == nil || dependencies.newStatusService == nil ||
+		dependencies.newIdentifyService == nil ||
 		dependencies.newRPC == nil || dependencies.newStatusRPC == nil ||
+		dependencies.newIdentifyRPC == nil ||
 		dependencies.startServer == nil ||
 		dependencies.clock == nil {
 		return errors.New(
@@ -593,12 +644,40 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 	if err := validateVNextReaderPrepareRuntimeDependencies(dependencies); err != nil {
 		return nil, err
 	}
+	processLock, err := dependencies.processIncarnationLocker.Acquire(
+		dependencies.processIncarnationPath)
+	if err != nil {
+		return nil, fmt.Errorf("acquire VNext Reader process-incarnation lock: %w", err)
+	}
+	if vnextReaderPreparedStatusNilInterface(processLock) {
+		return nil, errors.New(
+			"VNext Reader process-incarnation lock acquirer returned nil")
+	}
+	releaseProcessLock := func(primary error) error {
+		if processLock != nil {
+			if releaseErr := processLock.Release(); releaseErr != nil {
+				primary = appendVNextReaderPrepareRuntimeError(
+					primary,
+					fmt.Errorf("release VNext Reader process-incarnation lock: %w",
+						releaseErr))
+			}
+			processLock = nil
+		}
+		return primary
+	}
+	processIncarnation, err := newVNextReaderProcessIncarnation(
+		dependencies.entropy)
+	if err != nil {
+		return nil, releaseProcessLock(err)
+	}
 	store, err := dependencies.newStore(canonical.Store)
 	if err != nil {
-		return nil, fmt.Errorf("open VNext Reader PREPARE store: %w", err)
+		return nil, releaseProcessLock(fmt.Errorf(
+			"open VNext Reader PREPARE store: %w", err))
 	}
 	if store == nil {
-		return nil, errors.New("VNext Reader PREPARE store constructor returned nil")
+		return nil, releaseProcessLock(errors.New(
+			"VNext Reader PREPARE store constructor returned nil"))
 	}
 	reader, closeReader, err := dependencies.openLeaderReader(
 		canonical.SchedulerAuthority)
@@ -612,7 +691,7 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 					fmt.Errorf("close partial VNext Reader PREPARE etcd reader: %w", closeErr))
 			}
 		}
-		return nil, primary
+		return nil, releaseProcessLock(primary)
 	}
 	if vnextReaderPreparedStatusNilInterface(reader) || closeReader == nil {
 		primary := errors.New(
@@ -624,14 +703,14 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 					fmt.Errorf("close partial VNext Reader PREPARE etcd reader: %w", closeErr))
 			}
 		}
-		return nil, primary
+		return nil, releaseProcessLock(primary)
 	}
 	cleanupReader := func(primary error) error {
 		if closeErr := closeReader(); closeErr != nil {
 			primary = appendVNextReaderPrepareRuntimeError(
 				primary, fmt.Errorf("close VNext Reader PREPARE etcd reader: %w", closeErr))
 		}
-		return primary
+		return releaseProcessLock(primary)
 	}
 	verifierConfig := vnextReaderPrepareCurrentAuthorityConfig{
 		LeaderKey:            canonical.SchedulerAuthority.LeaderKey,
@@ -664,6 +743,22 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 		return nil, cleanupReader(errors.New(
 			"VNext Reader STATUS_AND_FENCE authority verifier constructor returned nil"))
 	}
+	identifyVerifierConfig := vnextReaderIdentifyCurrentAuthorityConfig{
+		LeaderKey:            canonical.SchedulerAuthority.LeaderKey,
+		ExpectedCluster:      canonical.SchedulerAuthority.ExpectedCluster,
+		ReadTimeout:          canonical.SchedulerAuthority.ReadTimeout,
+		SchedulerByPrincipal: canonical.SchedulerByPrincipal,
+	}
+	identifyVerifier, err := dependencies.newIdentifyVerifier(
+		identifyVerifierConfig, reader)
+	if err != nil {
+		return nil, cleanupReader(fmt.Errorf(
+			"construct VNext Reader IDENTIFY authority verifier: %w", err))
+	}
+	if vnextReaderPreparedStatusNilInterface(identifyVerifier) {
+		return nil, cleanupReader(errors.New(
+			"VNext Reader IDENTIFY authority verifier constructor returned nil"))
+	}
 	service, err := dependencies.newService(
 		canonical.LocalExecutorNodeID,
 		canonical.LocalCxldInstanceID,
@@ -691,6 +786,20 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 		return nil, cleanupReader(errors.New(
 			"VNext Reader STATUS_AND_FENCE service constructor returned nil"))
 	}
+	identifyService, err := dependencies.newIdentifyService(
+		canonical.LocalExecutorNodeID,
+		canonical.LocalCxldInstanceID,
+		processIncarnation,
+		canonical.TLS.ExpectedServerURISAN,
+		identifyVerifier)
+	if err != nil {
+		return nil, cleanupReader(fmt.Errorf(
+			"construct VNext Reader IDENTIFY service: %w", err))
+	}
+	if identifyService == nil {
+		return nil, cleanupReader(errors.New(
+			"VNext Reader IDENTIFY service constructor returned nil"))
+	}
 	rpc := dependencies.newRPC(service)
 	if rpc == nil {
 		return nil, cleanupReader(errors.New(
@@ -700,6 +809,11 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 	if vnextReaderPreparedStatusNilInterface(statusRPC) {
 		return nil, cleanupReader(errors.New(
 			"VNext Reader STATUS_AND_FENCE RPC constructor returned nil"))
+	}
+	identifyRPC := dependencies.newIdentifyRPC(identifyService)
+	if vnextReaderPreparedStatusNilInterface(identifyRPC) {
+		return nil, cleanupReader(errors.New(
+			"VNext Reader IDENTIFY RPC constructor returned nil"))
 	}
 	tlsConfig := vnextReaderPrepareTLSServerConfig{
 		ListenAddress:         canonical.TLS.ListenAddress,
@@ -713,8 +827,22 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 		HandlerTimeout:        canonical.TLS.HandlerTimeout,
 		ResponseWriteTimeout:  canonical.TLS.ResponseWriteTimeout,
 	}
+	if err := dependencies.processIncarnationWriter.Publish(
+		dependencies.processIncarnationPath, processIncarnation); err != nil {
+		primary := fmt.Errorf(
+			"publish VNext Reader process incarnation: %w", err)
+		if cleanupErr := processLock.RemovePublishedIdentity(
+			processIncarnation, false); cleanupErr != nil {
+			primary = appendVNextReaderPrepareRuntimeError(
+				primary,
+				fmt.Errorf("clean partial VNext Reader process incarnation: %w",
+					cleanupErr))
+		}
+		return nil, cleanupReader(primary)
+	}
 	server, err := dependencies.startServer(
-		tlsConfig, rpc, statusRPC, requestAdmission, largeAdmission)
+		tlsConfig, rpc, statusRPC, identifyRPC,
+		requestAdmission, largeAdmission)
 	if err != nil || server == nil {
 		primary := err
 		if primary == nil {
@@ -728,21 +856,33 @@ func openVNextReaderPrepareRuntimeWithDependencies(
 			}
 			server.Wait()
 		}
+		if cleanupErr := processLock.RemovePublishedIdentity(
+			processIncarnation, true); cleanupErr != nil {
+			primary = appendVNextReaderPrepareRuntimeError(
+				primary,
+				fmt.Errorf("clean failed VNext Reader process incarnation: %w",
+					cleanupErr))
+		}
 		return nil, cleanupReader(primary)
 	}
 	return &vnextReaderPrepareRuntime{
-		store:                store,
-		verifier:             verifier,
-		service:              service,
-		rpc:                  rpc,
-		statusVerifier:       statusVerifier,
-		statusService:        statusService,
-		statusRPC:            statusRPC,
-		server:               server,
-		closeLeaderReader:    closeReader,
-		requestAdmission:     requestAdmission,
-		largeFrameAdmission:  largeAdmission,
-		schedulerByPrincipal: canonical.SchedulerByPrincipal,
+		store:                  store,
+		verifier:               verifier,
+		service:                service,
+		rpc:                    rpc,
+		statusVerifier:         statusVerifier,
+		statusService:          statusService,
+		statusRPC:              statusRPC,
+		processIncarnation:     processIncarnation,
+		processIncarnationLock: processLock,
+		identifyVerifier:       identifyVerifier,
+		identifyService:        identifyService,
+		identifyRPC:            identifyRPC,
+		server:                 server,
+		closeLeaderReader:      closeReader,
+		requestAdmission:       requestAdmission,
+		largeFrameAdmission:    largeAdmission,
+		schedulerByPrincipal:   canonical.SchedulerByPrincipal,
 	}, nil
 }
 
@@ -817,6 +957,19 @@ func (runtime *vnextReaderPrepareRuntime) Close() error {
 				closeErr, fmt.Errorf("close VNext Reader PREPARE etcd reader: %w", err))
 		}
 	}
+	if runtime.processIncarnationLock != nil {
+		if err := runtime.processIncarnationLock.RemovePublishedIdentity(
+			runtime.processIncarnation, true); err != nil {
+			closeErr = appendVNextReaderPrepareRuntimeError(
+				closeErr,
+				fmt.Errorf("remove closed VNext Reader process incarnation: %w", err))
+		}
+		if err := runtime.processIncarnationLock.Release(); err != nil {
+			closeErr = appendVNextReaderPrepareRuntimeError(
+				closeErr,
+				fmt.Errorf("release VNext Reader process-incarnation lock: %w", err))
+		}
+	}
 	runtime.server = nil
 	runtime.closeLeaderReader = nil
 	runtime.service = nil
@@ -825,6 +978,11 @@ func (runtime *vnextReaderPrepareRuntime) Close() error {
 	runtime.statusRPC = nil
 	runtime.statusService = nil
 	runtime.statusVerifier = nil
+	runtime.identifyRPC = nil
+	runtime.identifyService = nil
+	runtime.identifyVerifier = nil
+	runtime.processIncarnation = vnextReaderProcessIncarnation{}
+	runtime.processIncarnationLock = nil
 	runtime.store = nil
 	runtime.closed = true
 	return closeErr
