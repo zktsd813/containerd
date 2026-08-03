@@ -584,38 +584,49 @@ func vnextReaderPrepareCanonicalRequestDigest(
 	vnextReaderPrepareWriteString(&buffer, vnextReaderPrepareRequestDigestDomain)
 	vnextReaderPrepareWriteString(&buffer, vnextReaderPrepareProtocol)
 	vnextReaderPrepareWriteString(&buffer, vnextReaderPrepareOperation)
-	authorization := acquired.Authorization
-	vnextReaderPrepareWriteString(&buffer, authorization.RestoreAuthorizationID)
-	vnextReaderPrepareWriteString(&buffer, authorization.CheckpointID)
-	vnextReaderPrepareWriteString(&buffer, authorization.ExecutorID)
-	vnextReaderPrepareWriteString(&buffer, authorization.CxldInstanceID)
-	vnextReaderPrepareWriteString(&buffer, authorization.TargetContainerID)
-	root := authorization.Root
-	vnextReaderPrepareWriteString(&buffer, root.RootID)
-	vnextReaderPrepareWriteU64(&buffer, root.RootVersion)
-	vnextReaderPrepareWriteString(&buffer, root.MMTemplateID)
-	vnextReaderPrepareWriteString(&buffer, root.PageMapID)
-	vnextReaderPrepareWriteU64(&buffer, root.PageMapVersion)
-	buffer.Write(root.DeviceTableDigest[:])
-	vnextReaderPrepareWriteString(&buffer, root.ContractID)
-	locator := root.PublicationLocator
-	vnextReaderPrepareWriteU64(&buffer, locator.PublicationByteLength)
-	buffer.Write(locator.PublicationSHA256[:])
-	vnextReaderPrepareWriteU64(&buffer, uint64(len(locator.PageRuns)))
-	for _, run := range locator.PageRuns {
-		vnextReaderPrepareWriteString(&buffer, run.FirstPage.OwnerID)
-		vnextReaderPrepareWriteString(&buffer, run.FirstPage.DeviceUUID)
-		vnextReaderPrepareWriteU64(&buffer, run.FirstPage.AllocationRecordID)
-		vnextReaderPrepareWriteU64(&buffer, run.FirstPage.DataPageIndex)
-		vnextReaderPrepareWriteU64(&buffer, run.PageCount)
-	}
-	vnextReaderPrepareWriteString(&buffer, acquired.SchedulerID)
-	vnextReaderPrepareWriteU64(&buffer, acquired.SchedulerFenceRevision)
-	vnextReaderPrepareWriteU64(&buffer, uint64(acquired.IssuedAtEpochMillis))
-	vnextReaderPrepareWriteU64(&buffer, uint64(acquired.ExpiresAtEpochMillis))
-	vnextReaderPrepareWriteString(&buffer, string(acquired.CatalogState))
-	vnextReaderPrepareWriteString(&buffer, acquired.LastMutationID)
+	vnextReaderWriteCanonicalAcquired(&buffer, acquired)
 	return sha256.Sum256(buffer.Bytes())
+}
+
+// vnextReaderWriteCanonicalAcquired is the one operation-neutral canonical
+// writer for the durable Scheduler ACQUIRED identity. Callers must prepend
+// their own distinct domain, protocol, and operation. Keeping those fields out
+// of this helper prevents PREPARE and STATUS_AND_FENCE digest substitution.
+func vnextReaderWriteCanonicalAcquired(
+	buffer *bytes.Buffer,
+	acquired vnextReaderAcquiredAuthorization,
+) {
+	authorization := acquired.Authorization
+	vnextReaderPrepareWriteString(buffer, authorization.RestoreAuthorizationID)
+	vnextReaderPrepareWriteString(buffer, authorization.CheckpointID)
+	vnextReaderPrepareWriteString(buffer, authorization.ExecutorID)
+	vnextReaderPrepareWriteString(buffer, authorization.CxldInstanceID)
+	vnextReaderPrepareWriteString(buffer, authorization.TargetContainerID)
+	root := authorization.Root
+	vnextReaderPrepareWriteString(buffer, root.RootID)
+	vnextReaderPrepareWriteU64(buffer, root.RootVersion)
+	vnextReaderPrepareWriteString(buffer, root.MMTemplateID)
+	vnextReaderPrepareWriteString(buffer, root.PageMapID)
+	vnextReaderPrepareWriteU64(buffer, root.PageMapVersion)
+	buffer.Write(root.DeviceTableDigest[:])
+	vnextReaderPrepareWriteString(buffer, root.ContractID)
+	locator := root.PublicationLocator
+	vnextReaderPrepareWriteU64(buffer, locator.PublicationByteLength)
+	buffer.Write(locator.PublicationSHA256[:])
+	vnextReaderPrepareWriteU64(buffer, uint64(len(locator.PageRuns)))
+	for _, run := range locator.PageRuns {
+		vnextReaderPrepareWriteString(buffer, run.FirstPage.OwnerID)
+		vnextReaderPrepareWriteString(buffer, run.FirstPage.DeviceUUID)
+		vnextReaderPrepareWriteU64(buffer, run.FirstPage.AllocationRecordID)
+		vnextReaderPrepareWriteU64(buffer, run.FirstPage.DataPageIndex)
+		vnextReaderPrepareWriteU64(buffer, run.PageCount)
+	}
+	vnextReaderPrepareWriteString(buffer, acquired.SchedulerID)
+	vnextReaderPrepareWriteU64(buffer, acquired.SchedulerFenceRevision)
+	vnextReaderPrepareWriteU64(buffer, uint64(acquired.IssuedAtEpochMillis))
+	vnextReaderPrepareWriteU64(buffer, uint64(acquired.ExpiresAtEpochMillis))
+	vnextReaderPrepareWriteString(buffer, string(acquired.CatalogState))
+	vnextReaderPrepareWriteString(buffer, acquired.LastMutationID)
 }
 
 // vnextReaderPrepareAuthoritySignaturePreimage is the only Reader PREPARE
