@@ -176,6 +176,59 @@ func TestVNextReaderPrepareRuntimeDisabledHasZeroSideEffects(t *testing.T) {
 	}
 }
 
+func TestVNextReaderPrepareAndStatusRuntimeDependenciesAreAllOrNothing(
+	t *testing.T,
+) {
+	config := validVNextReaderPrepareRuntimeConfig(t)
+	tests := map[string]func(*vnextReaderPrepareRuntimeDependencies){
+		"store": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newStore = nil
+		},
+		"leader reader": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.openLeaderReader = nil
+		},
+		"PREPARE verifier": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newVerifier = nil
+		},
+		"STATUS verifier": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newStatusVerifier = nil
+		},
+		"PREPARE service": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newService = nil
+		},
+		"STATUS service": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newStatusService = nil
+		},
+		"PREPARE RPC": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newRPC = nil
+		},
+		"STATUS RPC": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.newStatusRPC = nil
+		},
+		"dual listener": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.startServer = nil
+		},
+		"clock": func(value *vnextReaderPrepareRuntimeDependencies) {
+			value.clock = nil
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			dependencies := defaultVNextReaderPrepareRuntimeDependencies()
+			mutate(&dependencies)
+			requestAdmission, largeAdmission :=
+				vnextReaderPrepareRuntimeTestAdmissions()
+			runtime, err := openVNextReaderPrepareRuntimeWithDependencies(
+				config, requestAdmission, largeAdmission, dependencies)
+			if runtime != nil || err == nil ||
+				!strings.Contains(err.Error(), "dependencies are incomplete") {
+				t.Fatalf("missing %s returned runtime=%#v err=%v",
+					name, runtime, err)
+			}
+		})
+	}
+}
+
 func TestVNextReaderPrepareRuntimeEnabledMissingFieldMatrix(t *testing.T) {
 	input := validVNextReaderPrepareRuntimeInput(t)
 	typeOfInput := reflect.TypeOf(input)
@@ -309,6 +362,7 @@ func TestVNextReaderPrepareRuntimeLeaderReaderPartialOpenAlwaysCloses(
 			dependencies.startServer = func(
 				vnextReaderPrepareTLSServerConfig,
 				vnextReaderPrepareTransportRPC,
+				vnextReaderPreparedStatusTransportRPC,
 				chan struct{},
 				chan struct{},
 			) (vnextReaderPrepareRuntimeServer, error) {
@@ -415,7 +469,9 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 	}
 	dependencies, _ := vnextReaderPrepareRuntimeTestDependencies(nil, nil)
 	defaultNewVerifier := dependencies.newVerifier
+	defaultNewStatusVerifier := dependencies.newStatusVerifier
 	var verifierConfig vnextReaderPrepareCurrentAuthorityConfig
+	var statusVerifierConfig vnextReaderPreparedStatusCurrentAuthorityConfig
 	dependencies.newVerifier = func(
 		config vnextReaderPrepareCurrentAuthorityConfig,
 		reader vnextOwnerSchedulerLeaderReader,
@@ -423,15 +479,27 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 		verifierConfig = config
 		return defaultNewVerifier(config, reader)
 	}
+	dependencies.newStatusVerifier = func(
+		config vnextReaderPreparedStatusCurrentAuthorityConfig,
+		reader vnextOwnerSchedulerLeaderReader,
+	) (vnextReaderPreparedStatusAuthorityVerifier, error) {
+		statusVerifierConfig = config
+		return defaultNewStatusVerifier(config, reader)
+	}
 	server := &vnextReaderPrepareRuntimeTestServer{}
 	var tlsConfig vnextReaderPrepareTLSServerConfig
+	var passedPrepareRPC vnextReaderPrepareTransportRPC
+	var passedStatusRPC vnextReaderPreparedStatusTransportRPC
 	dependencies.startServer = func(
 		config vnextReaderPrepareTLSServerConfig,
-		_ vnextReaderPrepareTransportRPC,
+		prepareRPC vnextReaderPrepareTransportRPC,
+		statusRPC vnextReaderPreparedStatusTransportRPC,
 		_ chan struct{},
 		_ chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
 		tlsConfig = config
+		passedPrepareRPC = prepareRPC
+		passedStatusRPC = statusRPC
 		return server, nil
 	}
 	requestAdmission, largeAdmission := vnextReaderPrepareRuntimeTestAdmissions()
@@ -446,15 +514,37 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 	if !ok {
 		t.Fatalf("runtime verifier type = %T", runtime.verifier)
 	}
+	currentStatusVerifier, ok := runtime.statusVerifier.(*vnextReaderPreparedStatusCurrentAuthorityVerifier)
+	if !ok {
+		t.Fatalf("runtime status verifier type = %T", runtime.statusVerifier)
+	}
 	for name, bindings := range map[string]map[string]string{
 		"runtime":           runtime.schedulerByPrincipal,
 		"verifier-config":   verifierConfig.SchedulerByPrincipal,
 		"verifier-retained": currentVerifier.schedulerByPrincipal,
+		"status-config":     statusVerifierConfig.SchedulerByPrincipal,
+		"status-retained":   currentStatusVerifier.schedulerByPrincipal,
 		"TLS-config":        tlsConfig.SchedulerByPrincipal,
 	} {
 		if !reflect.DeepEqual(bindings, wantBindings) {
 			t.Fatalf("%s principal bindings = %#v, want %#v", name, bindings, wantBindings)
 		}
+	}
+	if verifierConfig.LeaderKey != statusVerifierConfig.LeaderKey ||
+		verifierConfig.ExpectedCluster != statusVerifierConfig.ExpectedCluster ||
+		verifierConfig.ReadTimeout != statusVerifierConfig.ReadTimeout {
+		t.Fatalf("PREPARE/STATUS authority source differs: prepare=%#v status=%#v",
+			verifierConfig, statusVerifierConfig)
+	}
+	if currentVerifier.reader != currentStatusVerifier.reader {
+		t.Fatal("PREPARE and STATUS verifiers did not retain the same independent reader")
+	}
+	if runtime.service.store != runtime.store ||
+		runtime.statusService.store != runtime.store {
+		t.Fatal("PREPARE and STATUS services do not share the exact authorization store")
+	}
+	if passedPrepareRPC != runtime.rpc || passedStatusRPC != runtime.statusRPC {
+		t.Fatal("dual listener did not receive the exact PREPARE and STATUS RPCs")
 	}
 	if runtime.requestAdmission != requestAdmission ||
 		runtime.largeFrameAdmission != largeAdmission ||
@@ -472,7 +562,9 @@ func TestVNextReaderPrepareRuntimeSharesOneCanonicalPrincipalBinding(
 	config.SchedulerByPrincipal[vnextReaderPrepareTestPrincipal] = "scheduler-mutated"
 	config.SchedulerAuthority.Endpoints[0] = "https://mutated.test:2379"
 	if !reflect.DeepEqual(runtime.schedulerByPrincipal, wantBindings) ||
-		!reflect.DeepEqual(currentVerifier.schedulerByPrincipal, wantBindings) {
+		!reflect.DeepEqual(currentVerifier.schedulerByPrincipal, wantBindings) ||
+		!reflect.DeepEqual(
+			currentStatusVerifier.schedulerByPrincipal, wantBindings) {
 		t.Fatal("runtime retained aliases into caller-owned principal configuration")
 	}
 }
@@ -493,6 +585,7 @@ func TestVNextReaderPrepareRuntimePartialConstructionCleansUpInReverseOrder(
 	dependencies.startServer = func(
 		vnextReaderPrepareTLSServerConfig,
 		vnextReaderPrepareTransportRPC,
+		vnextReaderPreparedStatusTransportRPC,
 		chan struct{},
 		chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
@@ -536,6 +629,7 @@ func TestVNextReaderPrepareRuntimeVerifierFailureClosesOnlyOpenedEtcd(
 	dependencies.startServer = func(
 		vnextReaderPrepareTLSServerConfig,
 		vnextReaderPrepareTransportRPC,
+		vnextReaderPreparedStatusTransportRPC,
 		chan struct{},
 		chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
@@ -565,6 +659,7 @@ func TestVNextReaderPrepareRuntimeShutdownDrainsBeforeEtcdClose(t *testing.T) {
 	dependencies.startServer = func(
 		vnextReaderPrepareTLSServerConfig,
 		vnextReaderPrepareTransportRPC,
+		vnextReaderPreparedStatusTransportRPC,
 		chan struct{},
 		chan struct{},
 	) (vnextReaderPrepareRuntimeServer, error) {
@@ -630,9 +725,17 @@ func TestVNextReaderPrepareRuntimeStartsRealMTLSListener(t *testing.T) {
 			runtime.server, server)
 	}
 	if runtime.store == nil || runtime.service == nil || runtime.rpc == nil ||
-		runtime.verifier == nil {
+		runtime.verifier == nil || runtime.statusVerifier == nil ||
+		runtime.statusService == nil || runtime.statusRPC == nil {
 		_ = runtime.Close()
 		t.Fatal("successful startup omitted a required Reader component")
+	}
+	if len(server.tlsConfig.NextProtos) != 2 ||
+		server.tlsConfig.NextProtos[0] != vnextReaderPrepareALPN ||
+		server.tlsConfig.NextProtos[1] != vnextReaderPreparedStatusALPN {
+		_ = runtime.Close()
+		t.Fatalf("production Reader listener ALPNs = %#v",
+			server.tlsConfig.NextProtos)
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatalf("close production Reader PREPARE listener: %v", err)
