@@ -17,6 +17,8 @@ var (
 		"TRCXL007 offline Owner device-group format is incomplete")
 	ErrOwnerDeviceGroupReopenRequired = errors.New(
 		"TRCXL007 Owner device group must be reopened before further use")
+	ErrOwnerDeviceGroupOfflineRequired = errors.New(
+		"TRCXL007 Owner device group has an irreconcilable durable contradiction and must be taken offline")
 )
 
 // OwnerDeviceGroupDeviceInput identifies exactly one caller-owned storage
@@ -60,8 +62,9 @@ type OwnerDeviceGroup struct {
 // poison bit for the one identity-checked handle. This is not a distributed or
 // cross-process Owner fence.
 type ownerDeviceGroupExecutionState struct {
-	mu             sync.Mutex
-	reopenRequired bool
+	mu              sync.Mutex
+	reopenRequired  bool
+	offlineRequired bool
 }
 
 type ownerDeviceGroupOpenedDevice struct {
@@ -300,6 +303,9 @@ func (group *OwnerDeviceGroup) plannerInputsLocked() (
 	if group == nil || group.anchor == nil {
 		return OwnerStateSnapshot{}, nil, ErrOwnerDeviceGroupInput
 	}
+	if group.ownerDeviceGroupOfflineRequiredLocked() {
+		return OwnerStateSnapshot{}, nil, ErrOwnerDeviceGroupOfflineRequired
+	}
 	if group.ownerDeviceGroupReopenRequiredLocked() {
 		return OwnerStateSnapshot{}, nil, ErrOwnerDeviceGroupReopenRequired
 	}
@@ -319,6 +325,11 @@ func (group *OwnerDeviceGroup) plannerInputsLocked() (
 		}
 	}
 	return ownerState, inputs, nil
+}
+
+func (group *OwnerDeviceGroup) ownerDeviceGroupOfflineRequiredLocked() bool {
+	return group != nil && group.executionState != nil &&
+		group.executionState.offlineRequired
 }
 
 func (group *OwnerDeviceGroup) ownerDeviceGroupReopenRequiredLocked() bool {

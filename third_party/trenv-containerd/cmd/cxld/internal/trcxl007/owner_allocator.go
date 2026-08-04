@@ -44,6 +44,9 @@ const (
 // replayed under a different authority epoch or membership. ContentDemands
 // uses one 4 KiB capacity unit for memory, artifact, restore, and control
 // objects; there is no separate artifact allocator or byte-sized allocation.
+// V7 requires nonzero Scheduler-reserve, Producer-capability, and reclaim-
+// authority SHA-256 commitments so every PREPARING record is reclaimable by
+// an exact capability commitment rather than becoming permanently abortless.
 type OwnerReserveRequest struct {
 	ClusterID              string
 	OwnerGroupID           string
@@ -321,6 +324,9 @@ func validateOwnerReserveRequest(request OwnerReserveRequest) (uint64, error) {
 	}
 	if request.AuthorityEvidence.ProducerCapabilitySHA256 == ([sha256.Size]byte{}) {
 		return 0, ownerReserveInvalidf("Producer capability SHA-256 is zero")
+	}
+	if request.AuthorityEvidence.ReclaimAuthoritySHA256 == ([sha256.Size]byte{}) {
+		return 0, ownerReserveInvalidf("reclaim authority SHA-256 is zero")
 	}
 
 	totalDemandPages, err := ownerReserveTotalDemandPages(request.ContentDemands)

@@ -572,6 +572,11 @@ func TestOwnerAllocatorSignedBoundsAndRequestValidation(t *testing.T) {
 			value.AuthorityEvidence.ProducerCapabilitySHA256 = [sha256.Size]byte{}
 			return value
 		}(),
+		func() OwnerReserveRequest {
+			value := baseRequest
+			value.AuthorityEvidence.ReclaimAuthoritySHA256 = [sha256.Size]byte{}
+			return value
+		}(),
 	}
 	for index, request := range invalidRequests {
 		if _, err := PlanOwnerCheckpointReserve(

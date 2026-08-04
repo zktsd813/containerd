@@ -96,6 +96,9 @@ func (group *OwnerDeviceGroup) ExecuteCheckpointReserve(
 	}
 	group.executionState.mu.Lock()
 	defer group.executionState.mu.Unlock()
+	if group.ownerDeviceGroupOfflineRequiredLocked() {
+		return OwnerReserveExecutionResult{}, ErrOwnerDeviceGroupOfflineRequired
+	}
 	if group.ownerDeviceGroupReopenRequiredLocked() {
 		return OwnerReserveExecutionResult{}, ErrOwnerDeviceGroupReopenRequired
 	}
@@ -178,6 +181,9 @@ func (group *OwnerDeviceGroup) RecoverPreparingCheckpointReserve() (
 	}
 	group.executionState.mu.Lock()
 	defer group.executionState.mu.Unlock()
+	if group.ownerDeviceGroupOfflineRequiredLocked() {
+		return OwnerReserveExecutionResult{}, ErrOwnerDeviceGroupOfflineRequired
+	}
 	if group.ownerDeviceGroupReopenRequiredLocked() {
 		return OwnerReserveExecutionResult{}, ErrOwnerDeviceGroupReopenRequired
 	}

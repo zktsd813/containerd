@@ -222,6 +222,7 @@ func (fixture *ownerReserveExecutorTestFixture) request(
 		AuthorityEvidence: OwnerStateAuthorityEvidence{
 			SchedulerReserveSHA256:   sha256.Sum256([]byte("scheduler-" + id)),
 			ProducerCapabilitySHA256: sha256.Sum256([]byte("producer-" + id)),
+			ReclaimAuthoritySHA256:   sha256.Sum256([]byte("reclaim-" + id)),
 		},
 	}
 }
@@ -383,6 +384,31 @@ func TestOwnerReserveExecutorSingleDeviceSuccessAndReplay(t *testing.T) {
 		t.Fatalf("replay result = %#v", replay)
 	}
 	fixture.assertZeroIO(t)
+}
+
+func TestOwnerReserveExecutorRejectsZeroReclaimAuthorityWithoutIO(t *testing.T) {
+	fixture := newOwnerReserveExecutorTestFixture(
+		t,
+		[]string{"device-a"},
+		"device-a",
+		2<<20)
+	request := fixture.request("zero-reclaim-authority", 1)
+	request.AuthorityEvidence.ReclaimAuthoritySHA256 = [sha256.Size]byte{}
+	fixture.resetTracking()
+	if _, err := fixture.group.ExecuteCheckpointReserve(request); !errors.Is(
+		err,
+		ErrInvalidOwnerReserveRequest) {
+		t.Fatalf("zero reclaim authority reserve = %v", err)
+	}
+	fixture.assertZeroIO(t)
+	ownerState, _, err := fixture.group.PlannerInputs()
+	if err != nil || len(ownerState.Records()) != 0 ||
+		ownerState.NextAllocationRecordID != 1 ||
+		ownerState.NextOwnerTransactionSequence != 1 {
+		t.Fatalf("invalid reserve changed cached Owner state = %#v, %v",
+			ownerState,
+			err)
+	}
 }
 
 func TestOwnerReserveExecutorNoSpaceAndReplay(t *testing.T) {
