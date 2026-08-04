@@ -737,6 +737,26 @@ func (sink *ownerSealDescriptorSink) syncEveryAffectedDevice(
 func (group *OwnerDeviceGroup) prepareOwnerSealDescriptorPersistenceLocked(
 	plan OwnerSealPlan,
 ) (OwnerSealPlan, []ownerSealDescriptorDevice, error) {
+	return group.prepareOwnerSealDescriptorPersistenceWithReopenLocked(plan, false)
+}
+
+// prepareOwnerSealDescriptorPostRefreshLocked is the single privileged entry
+// used after a descriptor persistence boundary. The enclosing seal executor
+// must already have latched the group reopen requirement and must keep the
+// same execution lock and external writer fence. This entry ignores only that
+// one group-level latch; every freshly opened per-device metadata handle must
+// be clean. All remaining plan, identity, storage, allocator-envelope, and
+// allocated-page checks are identical to the normal preparation path.
+func (group *OwnerDeviceGroup) prepareOwnerSealDescriptorPostRefreshLocked(
+	plan OwnerSealPlan,
+) (OwnerSealPlan, []ownerSealDescriptorDevice, error) {
+	return group.prepareOwnerSealDescriptorPersistenceWithReopenLocked(plan, true)
+}
+
+func (group *OwnerDeviceGroup) prepareOwnerSealDescriptorPersistenceWithReopenLocked(
+	plan OwnerSealPlan,
+	allowGroupReopenLatch bool,
+) (OwnerSealPlan, []ownerSealDescriptorDevice, error) {
 	if !group.ownerDeviceGroupHandleValid() || group.anchor == nil || len(group.devices) == 0 {
 		return OwnerSealPlan{}, nil, ownerSealDescriptorError(
 			ErrInvalidOwnerSealDescriptorPersistence,
@@ -751,7 +771,33 @@ func (group *OwnerDeviceGroup) prepareOwnerSealDescriptorPersistenceLocked(
 			ErrOwnerDeviceGroupOfflineRequired,
 			"Owner device group is offline")
 	}
-	if group.ownerDeviceGroupReopenRequiredLocked() {
+	if allowGroupReopenLatch {
+		if !group.executionState.reopenRequired {
+			return OwnerSealPlan{}, nil, ownerSealDescriptorError(
+				ErrInvalidOwnerSealDescriptorPersistence,
+				"prepare-post-refresh",
+				ErrOwnerDeviceGroupReopenRequired,
+				"post-refresh preparation requires the group reopen latch")
+		}
+		if group.anchor.reopenRequired {
+			return OwnerSealPlan{}, nil, ownerSealDescriptorError(
+				ErrInvalidOwnerSealDescriptorPersistence,
+				"prepare-post-refresh",
+				ErrDeviceMetadataReopenRequired,
+				"refreshed ANCHOR metadata still requires reopen")
+		}
+		for index := range group.devices {
+			device := group.devices[index]
+			if device.metadata == nil || device.metadata.reopenRequired {
+				return OwnerSealPlan{}, nil, ownerSealDescriptorError(
+					ErrInvalidOwnerSealDescriptorPersistence,
+					"prepare-post-refresh",
+					ErrDeviceMetadataReopenRequired,
+					"refreshed device %q metadata is absent or still requires reopen",
+					device.deviceUUID)
+			}
+		}
+	} else if group.ownerDeviceGroupReopenRequiredLocked() {
 		return OwnerSealPlan{}, nil, ownerSealDescriptorError(
 			ErrInvalidOwnerSealDescriptorPersistence,
 			"prepare",
