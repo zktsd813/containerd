@@ -248,7 +248,10 @@ func TestOwnerDeviceGroupFormatOpenPlannerAndPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenOwnerDeviceGroup: %v", err)
 	}
-	ownerState, plannerInputs := group.PlannerInputs()
+	ownerState, plannerInputs, err := group.PlannerInputs()
+	if err != nil {
+		t.Fatalf("PlannerInputs: %v", err)
+	}
 	if ownerState.SnapshotSequence != 1 || len(plannerInputs) != 3 {
 		t.Fatalf("planner inputs = Owner sequence %d, devices %d",
 			ownerState.SnapshotSequence, len(plannerInputs))
@@ -280,7 +283,10 @@ func TestOwnerDeviceGroupFormatOpenPlannerAndPayload(t *testing.T) {
 	plannerInputs[0].Snapshot.allocationBitmap[0] ^= 1
 	fixture.input.Devices[0].ExpectedDeviceUUID = "mutated-input"
 	fixture.input.OwnerStateBootstrap.Devices[0].DeviceUUID = "mutated-bootstrap"
-	detachedOwner, detachedInputs := group.PlannerInputs()
+	detachedOwner, detachedInputs, err := group.PlannerInputs()
+	if err != nil {
+		t.Fatalf("detached PlannerInputs: %v", err)
+	}
 	if detachedOwner.SnapshotSequence != 1 ||
 		detachedInputs[0].DeviceUUID != "device-a" ||
 		detachedInputs[0].Snapshot.SnapshotSequence != 1 ||
@@ -533,7 +539,10 @@ func TestOwnerDeviceGroupOpenAllowsUnequalAppliedTransactionsBelowAnchor(t *test
 	if err != nil {
 		t.Fatalf("open baseline: %v", err)
 	}
-	ownerState, allocatorInputs := group.PlannerInputs()
+	ownerState, allocatorInputs, err := group.PlannerInputs()
+	if err != nil {
+		t.Fatalf("PlannerInputs: %v", err)
+	}
 	plan, err := PlanOwnerCheckpointReserve(
 		ownerState,
 		allocatorInputs,
@@ -571,7 +580,10 @@ func TestOwnerDeviceGroupOpenAllowsUnequalAppliedTransactionsBelowAnchor(t *test
 	if err != nil {
 		t.Fatalf("open group with lagging MEMBER allocators: %v", err)
 	}
-	reopenedOwner, reopenedInputs := reopened.PlannerInputs()
+	reopenedOwner, reopenedInputs, err := reopened.PlannerInputs()
+	if err != nil {
+		t.Fatalf("reopened PlannerInputs: %v", err)
+	}
 	if reopenedOwner.NextOwnerTransactionSequence != 3 {
 		t.Fatalf("next Owner transaction = %d, want 3",
 			reopenedOwner.NextOwnerTransactionSequence)

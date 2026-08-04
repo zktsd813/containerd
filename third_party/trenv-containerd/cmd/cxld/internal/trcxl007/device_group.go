@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"sync"
 )
 
 var (
@@ -14,6 +15,8 @@ var (
 		"TRCXL007 Owner device group does not match canonical membership")
 	ErrOwnerDeviceGroupFormatIncomplete = errors.New(
 		"TRCXL007 offline Owner device-group format is incomplete")
+	ErrOwnerDeviceGroupReopenRequired = errors.New(
+		"TRCXL007 Owner device group must be reopened before further use")
 )
 
 // OwnerDeviceGroupDeviceInput identifies exactly one caller-owned storage
@@ -38,14 +41,27 @@ type OwnerDeviceGroupInput struct {
 	OwnerStateBootstrap OwnerStateBootstrap
 }
 
-// OwnerDeviceGroup is a validated read-only group foundation. It retains the
-// caller-owned storage views through DeviceMetadata but never closes them.
-// Raw persistence commits remain package-private until the Owner executor
-// supplies legal transition and authority checks.
+// OwnerDeviceGroup is a validated group handle. It retains the caller-owned
+// storage views through DeviceMetadata but never closes them. The value must
+// not be copied: public entry points reject a shallow copy before taking its
+// shared lock or performing storage I/O. Raw persistence commits remain
+// package-private until the Owner executor supplies legal transition and
+// authority checks.
 type OwnerDeviceGroup struct {
-	bootstrap OwnerStateBootstrap
-	devices   []ownerDeviceGroupOpenedDevice
-	anchor    *DeviceMetadata
+	bootstrap      OwnerStateBootstrap
+	devices        []ownerDeviceGroupOpenedDevice
+	anchor         *DeviceMetadata
+	executionState *ownerDeviceGroupExecutionState
+	self           *OwnerDeviceGroup
+}
+
+// ownerDeviceGroupExecutionState is allocated exactly once by
+// OpenOwnerDeviceGroup. It supplies single-process writer serialization and a
+// poison bit for the one identity-checked handle. This is not a distributed or
+// cross-process Owner fence.
+type ownerDeviceGroupExecutionState struct {
+	mu             sync.Mutex
+	reopenRequired bool
 }
 
 type ownerDeviceGroupOpenedDevice struct {
@@ -250,11 +266,14 @@ func OpenOwnerDeviceGroup(input OwnerDeviceGroupInput) (*OwnerDeviceGroup, error
 				ownerState.NextOwnerTransactionSequence)
 		}
 	}
-	return &OwnerDeviceGroup{
-		bootstrap: cloneOwnerStateBootstrap(prepared.bootstrap),
-		devices:   opened,
-		anchor:    anchor,
-	}, nil
+	group := &OwnerDeviceGroup{
+		bootstrap:      cloneOwnerStateBootstrap(prepared.bootstrap),
+		devices:        opened,
+		anchor:         anchor,
+		executionState: &ownerDeviceGroupExecutionState{},
+	}
+	group.self = group
+	return group, nil
 }
 
 // PlannerInputs returns detached values in canonical persistent DeviceUUID
@@ -263,13 +282,31 @@ func OpenOwnerDeviceGroup(input OwnerDeviceGroupInput) (*OwnerDeviceGroup, error
 func (group *OwnerDeviceGroup) PlannerInputs() (
 	OwnerStateSnapshot,
 	[]OwnerAllocatorDeviceSnapshot,
+	error,
+) {
+	if !group.ownerDeviceGroupHandleValid() {
+		return OwnerStateSnapshot{}, nil, ErrOwnerDeviceGroupInput
+	}
+	group.executionState.mu.Lock()
+	defer group.executionState.mu.Unlock()
+	return group.plannerInputsLocked()
+}
+
+func (group *OwnerDeviceGroup) plannerInputsLocked() (
+	OwnerStateSnapshot,
+	[]OwnerAllocatorDeviceSnapshot,
+	error,
 ) {
 	if group == nil || group.anchor == nil {
-		return OwnerStateSnapshot{}, nil
+		return OwnerStateSnapshot{}, nil, ErrOwnerDeviceGroupInput
+	}
+	if group.ownerDeviceGroupReopenRequiredLocked() {
+		return OwnerStateSnapshot{}, nil, ErrOwnerDeviceGroupReopenRequired
 	}
 	_, ownerState, present := group.anchor.ActiveOwnerState()
 	if !present {
-		return OwnerStateSnapshot{}, nil
+		return OwnerStateSnapshot{}, nil, ownerDeviceGroupMismatchf(
+			"ANCHOR has no selected Owner state")
 	}
 	inputs := make([]OwnerAllocatorDeviceSnapshot, len(group.devices))
 	for index := range group.devices {
@@ -281,15 +318,42 @@ func (group *OwnerDeviceGroup) PlannerInputs() (
 			Snapshot:   allocator,
 		}
 	}
-	return ownerState, inputs
+	return ownerState, inputs, nil
+}
+
+func (group *OwnerDeviceGroup) ownerDeviceGroupReopenRequiredLocked() bool {
+	if !group.ownerDeviceGroupHandleValid() {
+		return true
+	}
+	if group.executionState.reopenRequired {
+		return true
+	}
+	if group.anchor != nil && group.anchor.reopenRequired {
+		group.executionState.reopenRequired = true
+		return true
+	}
+	for index := range group.devices {
+		if group.devices[index].metadata == nil ||
+			group.devices[index].metadata.reopenRequired {
+			group.executionState.reopenRequired = true
+			return true
+		}
+	}
+	return false
 }
 
 // Bootstrap returns a detached copy of the validated static group contract.
 func (group *OwnerDeviceGroup) Bootstrap() OwnerStateBootstrap {
-	if group == nil {
+	if !group.ownerDeviceGroupHandleValid() {
 		return OwnerStateBootstrap{}
 	}
+	group.executionState.mu.Lock()
+	defer group.executionState.mu.Unlock()
 	return cloneOwnerStateBootstrap(group.bootstrap)
+}
+
+func (group *OwnerDeviceGroup) ownerDeviceGroupHandleValid() bool {
+	return group != nil && group.self == group && group.executionState != nil
 }
 
 func prepareOwnerDeviceGroup(input OwnerDeviceGroupInput) (preparedOwnerDeviceGroup, error) {
