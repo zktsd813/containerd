@@ -479,6 +479,12 @@ func ownerAbortTestAssertExactTerminal(
 		t.Fatalf("exact terminal result = %#v", result)
 	}
 	abortingTransaction := expected.abortingRecord.OwnerTransactionSequence
+	if result.Record.ReservationTransactionSequence !=
+		expected.abortingRecord.ReservationTransactionSequence {
+		t.Fatalf("terminal reservation transaction = %d, want immutable N = %d",
+			result.Record.ReservationTransactionSequence,
+			expected.abortingRecord.ReservationTransactionSequence)
+	}
 	if result.Record.OwnerTransactionSequence != abortingTransaction+1 {
 		t.Fatalf("terminal transaction = %d, want M+1 = %d",
 			result.Record.OwnerTransactionSequence,
@@ -1969,7 +1975,7 @@ func TestOwnerAbortExecutorPreparingBesideTransitionLatchesOffline(t *testing.T)
 	secondAbort.AllocationRecordID = 2
 	plan := fixture.plan(t, secondReserve)
 	records := plan.PreparingOwnerState.Records()
-	records[0].State = OwnerAllocationCommitting
+	records[0].State = OwnerAllocationCanceling
 	malformed := ownerReserveExecutorSnapshotWithRecords(
 		t,
 		plan.PreparingOwnerState,
@@ -2502,6 +2508,7 @@ func TestOwnerAbortExecutorDurableAbortingTransactionExhaustionGoesOffline(t *te
 	ownerAbortTestPreparing(t, fixture, reserve)
 	plan := ownerAbortTestExpectedFreshPlan(t, fixture)
 	record := cloneOwnerStateRecord(plan.abortingRecord)
+	record.ReservationTransactionSequence = cxlcheckpoint.MaxSignedLong - 2
 	record.OwnerTransactionSequence = cxlcheckpoint.MaxSignedLong - 1
 	exhausted, err := NewOwnerStateSnapshot(OwnerStateConfig{
 		ClusterID:                    plan.abortingState.ClusterID,

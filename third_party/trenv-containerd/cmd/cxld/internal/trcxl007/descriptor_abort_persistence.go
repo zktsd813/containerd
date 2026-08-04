@@ -267,12 +267,12 @@ func (device *DeviceMetadata) prepareAbortDescriptorPersistence(
 	switch authorityRecord.State {
 	case OwnerAllocationPreparing:
 		want, ok := checkedAdd(
-			authorityRecord.OwnerTransactionSequence,
+			authorityRecord.ReservationTransactionSequence,
 			1)
 		if !ok || want != abortingTransaction {
 			return nil, 0, ownerAllocatorInputMismatchf(
 				"PREPARING transaction %d does not precede abort transaction %d",
-				authorityRecord.OwnerTransactionSequence,
+				authorityRecord.ReservationTransactionSequence,
 				abortingTransaction)
 		}
 	case OwnerAllocationAborting:
@@ -284,7 +284,8 @@ func (device *DeviceMetadata) prepareAbortDescriptorPersistence(
 				abortingTransaction)
 		}
 		preparingRecord.State = OwnerAllocationPreparing
-		preparingRecord.OwnerTransactionSequence = abortingTransaction - 1
+		preparingRecord.OwnerTransactionSequence =
+			preparingRecord.ReservationTransactionSequence
 	default:
 		return nil, 0, ownerAllocatorInputMismatchf(
 			"allocation record %d state %d is neither PREPARING nor ABORTING",

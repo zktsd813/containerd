@@ -483,7 +483,8 @@ func TestPersistPreparingReservedDescriptorsSupportsPostAllocatorRecovery(t *tes
 	assertReservedDescriptorPages(t, fixture.storage, fixture.device.geometry, fixture.runs)
 	_, allocator := fixture.device.ActiveAllocatorSnapshot()
 	if allocator.SnapshotSequence != fixture.record.Fragments[0].TargetAllocatorSnapshotSequence ||
-		allocator.AppliedOwnerTransactionSequence != fixture.record.OwnerTransactionSequence {
+		allocator.AppliedOwnerTransactionSequence !=
+			fixture.record.ReservationTransactionSequence {
 		t.Fatalf("allocator changed during descriptor recovery: %#v", allocator)
 	}
 }
@@ -527,18 +528,19 @@ func TestPersistPreparingReservedDescriptorsMemberUsesSuppliedGroupAuthority(t *
 		LogicalPageStart: 0,
 	}
 	record := OwnerStateAllocationRecord{
-		AllocationRecordID:       7,
-		OwnerTransactionSequence: 5,
-		State:                    OwnerAllocationPreparing,
-		RequestID:                "member-reserve-request",
-		CheckpointID:             "member-checkpoint",
-		ProducerID:               "member-producer",
-		DedupDomainID:            "member-dedup-domain",
-		SharingPolicyID:          "member-sharing-policy",
-		RequestSHA256:            sha256.Sum256([]byte("member-request")),
-		TotalDemandPages:         3,
-		MaxExtents:               1,
-		ContentDemands:           []OwnerStateContentDemand{demand},
+		AllocationRecordID:             7,
+		ReservationTransactionSequence: 5,
+		OwnerTransactionSequence:       5,
+		State:                          OwnerAllocationPreparing,
+		RequestID:                      "member-reserve-request",
+		CheckpointID:                   "member-checkpoint",
+		ProducerID:                     "member-producer",
+		DedupDomainID:                  "member-dedup-domain",
+		SharingPolicyID:                "member-sharing-policy",
+		RequestSHA256:                  sha256.Sum256([]byte("member-request")),
+		TotalDemandPages:               3,
+		MaxExtents:                     1,
+		ContentDemands:                 []OwnerStateContentDemand{demand},
 		Fragments: []OwnerStateDeviceFragment{{
 			DeviceUUID:                      formatFixture.input.Superblock.DeviceUUID,
 			DeviceOwnerEpoch:                formatFixture.input.Superblock.OwnerEpoch,
@@ -559,7 +561,7 @@ func TestPersistPreparingReservedDescriptorsMemberUsesSuppliedGroupAuthority(t *
 			PageCount:          3,
 		}},
 		record.AllocationRecordID,
-		record.OwnerTransactionSequence)
+		record.ReservationTransactionSequence)
 	if err != nil {
 		t.Fatalf("derive member runs: %v", err)
 	}

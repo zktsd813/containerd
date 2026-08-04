@@ -28,9 +28,13 @@ const (
 
 	// V7StorageCompatibilityID is the complete persisted target identity.
 	// Keep this literal stable. It is a compatibility requirement, not a claim
-	// that a live TRCXL007 formatter or device path already exists.
+	// that a live TRCXL007 formatter or device path already exists. The
+	// owner-state suffix hard-cuts the earlier draft V7 Owner-state ABI: media
+	// without the suffix requires destructive reformatting, and this package
+	// supplies no dual decoder or live migration.
 	V7StorageCompatibilityID = "publication=TRPUB007/v7/little-endian/immutable-publication-v1;" +
 		"envelope-header=64;max-envelope=8388608;" +
 		"page=4096;fingerprint=crc32c-castagnoli/0x11edc6f41;" +
-		"descriptor=TRCXL007/64/trcxl007-page-descriptor-little-endian-v1"
+		"descriptor=TRCXL007/64/trcxl007-page-descriptor-little-endian-v1;" +
+		"owner-state=TROWN007/v2"
 )

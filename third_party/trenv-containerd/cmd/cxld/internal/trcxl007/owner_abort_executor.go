@@ -440,10 +440,14 @@ func ownerAbortActiveAborting(
 			ownerState.NextAllocationRecordID,
 			ownerState.NextOwnerTransactionSequence)
 	}
-	if record.OwnerTransactionSequence <= 1 {
+	wantAbortingTransaction, reservationOK := checkedAdd(
+		record.ReservationTransactionSequence,
+		1)
+	if !reservationOK || wantAbortingTransaction != record.OwnerTransactionSequence {
 		return OwnerStateAllocationRecord{}, false, ownerAbortOfflinef(
-			"ABORTING transaction %d has no PREPARING predecessor",
-			record.OwnerTransactionSequence)
+			"ABORTING transaction %d does not immediately follow reservation transaction %d",
+			record.OwnerTransactionSequence,
+			record.ReservationTransactionSequence)
 	}
 	return record, true, nil
 }
@@ -460,7 +464,8 @@ func ownerAbortOtherTransitionalRecord(
 		case OwnerAllocationPreparing,
 			OwnerAllocationCommitting,
 			OwnerAllocationAborting,
-			OwnerAllocationReclaiming:
+			OwnerAllocationReclaiming,
+			OwnerAllocationCanceling:
 			return record, true
 		}
 	}
@@ -489,7 +494,7 @@ func (group *OwnerDeviceGroup) preflightFreshPreparingAbortLocked(
 			err)
 	}
 	abortingTransaction, err := ownerReserveAddSequence(
-		preparingRecord.OwnerTransactionSequence,
+		preparingRecord.ReservationTransactionSequence,
 		1,
 		"ABORTING transaction")
 	if err != nil {
@@ -626,13 +631,17 @@ func (group *OwnerDeviceGroup) buildAbortingRecoveryPlanLocked(
 	if err := abortingState.CrossCheckBootstrap(group.bootstrap); err != nil {
 		return ownerAbortRecoveryPlan{}, err
 	}
+	wantAbortingTransaction, reservationOK := checkedAdd(
+		abortingRecord.ReservationTransactionSequence,
+		1)
 	if abortingRecord.State != OwnerAllocationAborting ||
-		abortingRecord.OwnerTransactionSequence <= 1 {
+		!reservationOK ||
+		wantAbortingTransaction != abortingRecord.OwnerTransactionSequence {
 		return ownerAbortRecoveryPlan{}, ownerAbortOfflinef(
 			"record %d is not a valid ABORTING record",
 			abortingRecord.AllocationRecordID)
 	}
-	preparingTransaction := abortingRecord.OwnerTransactionSequence - 1
+	preparingTransaction := abortingRecord.ReservationTransactionSequence
 	terminalTransaction, err := ownerReserveAddSequence(
 		abortingRecord.OwnerTransactionSequence,
 		1,

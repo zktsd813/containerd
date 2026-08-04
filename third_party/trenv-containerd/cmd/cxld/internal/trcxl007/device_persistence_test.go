@@ -702,6 +702,50 @@ func TestOwnerStateReadLimitIsExplicitPolicy(t *testing.T) {
 	}
 }
 
+func TestOwnerStateDraftV1DomainRejectsWithoutBodyIO(t *testing.T) {
+	geometry := metadataTestGeometry(t, 8<<20, 4096)
+	fixture := metadataTestFixtureForRole(t, geometry, OwnerGroupRoleAnchor)
+	storage := metadataTestFormat(t, fixture)
+	headerOffset := geometry.OwnerStateSnapshotAOffset
+	header := storage.rawBytes(headerOffset, int(OwnerStateEnvelopeHeaderBytes))
+	var oldDomain [ownerStateDomainFieldBytes]byte
+	copy(oldDomain[:], "owner-group-full-snapshot-v1")
+	copy(header[ownerStateDomainOffset:ownerStatePayloadLengthOffset], oldDomain[:])
+	binary.LittleEndian.PutUint32(header[ownerStateHeaderCRCOffset:], 0)
+	binary.LittleEndian.PutUint32(
+		header[ownerStateHeaderCRCOffset:],
+		ownerStateHeaderCRC32C(header))
+	storage.rawWrite(headerOffset, header)
+
+	storage.resetTracking()
+	bodyOffset := headerOffset + OwnerStateEnvelopeHeaderBytes
+	storage.failReadOffset = &bodyOffset
+	selected, err := readOwnerStateSlot(
+		storage,
+		geometry,
+		headerOffset,
+		geometry.OwnerStateSnapshotSlotBytes)
+	if err != nil {
+		t.Fatalf("read draft-v1 header: %v", err)
+	}
+	if storage.readCalls != 1 || storage.maxRead != int(OwnerStateEnvelopeHeaderBytes) ||
+		len(selected) != int(OwnerStateEnvelopeHeaderBytes) {
+		t.Fatalf(
+			"draft-v1 read calls/max/bytes = %d/%d/%d, want header-only 1/%d/%d",
+			storage.readCalls,
+			storage.maxRead,
+			len(selected),
+			OwnerStateEnvelopeHeaderBytes,
+			OwnerStateEnvelopeHeaderBytes)
+	}
+	if storage.writeCalls != 0 || storage.mutationCount != 0 {
+		t.Fatalf("draft-v1 rejection performed mutation I/O: %#v", storage.events)
+	}
+	if _, err := ParseOwnerState(selected, geometry); !errors.Is(err, ErrWrongOwnerStateFormat) {
+		t.Fatalf("draft-v1 parse error = %v, want wrong format", err)
+	}
+}
+
 func TestAnchorOpenRejectsAllocatorBeyondIssuedOwnerTransaction(t *testing.T) {
 	geometry := metadataTestGeometry(t, 8<<20, 4096)
 	fixture := metadataTestFixtureForRole(t, geometry, OwnerGroupRoleAnchor)
@@ -748,17 +792,18 @@ func TestCommitOwnerStateRejectsEnvelopeBeyondOpenedReadPolicy(t *testing.T) {
 		t.Fatal("genesis Owner state is absent")
 	}
 	record := OwnerStateAllocationRecord{
-		AllocationRecordID:       1,
-		OwnerTransactionSequence: 1,
-		State:                    OwnerAllocationRejectedNoSpace,
-		RequestID:                "request-read-limit",
-		CheckpointID:             "checkpoint-read-limit",
-		ProducerID:               "producer-read-limit",
-		DedupDomainID:            "dedup-read-limit",
-		SharingPolicyID:          "sharing-read-limit",
-		RequestSHA256:            sha256.Sum256([]byte("read-limit request")),
-		TotalDemandPages:         1,
-		MaxExtents:               1,
+		AllocationRecordID:             1,
+		ReservationTransactionSequence: 0,
+		OwnerTransactionSequence:       1,
+		State:                          OwnerAllocationRejectedNoSpace,
+		RequestID:                      "request-read-limit",
+		CheckpointID:                   "checkpoint-read-limit",
+		ProducerID:                     "producer-read-limit",
+		DedupDomainID:                  "dedup-read-limit",
+		SharingPolicyID:                "sharing-read-limit",
+		RequestSHA256:                  sha256.Sum256([]byte("read-limit request")),
+		TotalDemandPages:               1,
+		MaxExtents:                     1,
 		ContentDemands: []OwnerStateContentDemand{{
 			Kind:             cxlcheckpoint.ContentMemoryPayloadV7,
 			ObjectID:         1,

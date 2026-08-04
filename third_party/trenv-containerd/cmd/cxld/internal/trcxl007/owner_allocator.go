@@ -334,19 +334,20 @@ func validateOwnerReserveRequest(request OwnerReserveRequest) (uint64, error) {
 		return 0, err
 	}
 	probe := OwnerStateAllocationRecord{
-		AllocationRecordID:       1,
-		OwnerTransactionSequence: 1,
-		State:                    OwnerAllocationRejectedNoSpace,
-		RequestID:                request.RequestID,
-		CheckpointID:             request.CheckpointID,
-		ProducerID:               request.ProducerID,
-		DedupDomainID:            request.DedupDomainID,
-		SharingPolicyID:          request.SharingPolicyID,
-		RequestSHA256:            [sha256.Size]byte{1},
-		TotalDemandPages:         totalDemandPages,
-		MaxExtents:               request.MaxExtents,
-		ContentDemands:           request.ContentDemands,
-		AuthorityEvidence:        request.AuthorityEvidence,
+		AllocationRecordID:             1,
+		ReservationTransactionSequence: 0,
+		OwnerTransactionSequence:       1,
+		State:                          OwnerAllocationRejectedNoSpace,
+		RequestID:                      request.RequestID,
+		CheckpointID:                   request.CheckpointID,
+		ProducerID:                     request.ProducerID,
+		DedupDomainID:                  request.DedupDomainID,
+		SharingPolicyID:                request.SharingPolicyID,
+		RequestSHA256:                  [sha256.Size]byte{1},
+		TotalDemandPages:               totalDemandPages,
+		MaxExtents:                     request.MaxExtents,
+		ContentDemands:                 request.ContentDemands,
+		AuthorityEvidence:              request.AuthorityEvidence,
 	}
 	if err := validateOwnerStateRecord(probe, nil); err != nil {
 		return 0, ownerReserveInvalidf("request record shape: %v", err)
@@ -799,7 +800,7 @@ func buildOwnerReserveSuccessPlan(
 		request.ContentDemands,
 		placedRuns,
 		preparingRecord.AllocationRecordID,
-		preparingRecord.OwnerTransactionSequence)
+		preparingRecord.ReservationTransactionSequence)
 	if err != nil {
 		return OwnerCheckpointReservePlan{}, err
 	}
@@ -972,7 +973,7 @@ func ownerReserveDescriptorRuns(
 	demands []OwnerStateContentDemand,
 	placedRuns []ownerAllocatorPlacedRun,
 	allocationRecordID uint64,
-	ownerTransactionSequence uint64,
+	reservationTransactionSequence uint64,
 ) ([]OwnerReservedDescriptorRun, error) {
 	result := make([]OwnerReservedDescriptorRun, 0, len(placedRuns)+len(demands)-1)
 	demandIndex := 0
@@ -1000,7 +1001,7 @@ func ownerReserveDescriptorRuns(
 			descriptor := Descriptor{
 				AllocationRecordID:  allocationRecordID,
 				OriginObjectID:      demand.ObjectID,
-				OwnerTransactionSeq: ownerTransactionSequence,
+				OwnerTransactionSeq: reservationTransactionSequence,
 				State:               DescriptorReserved,
 				ContentKind:         demand.Kind,
 			}
@@ -1052,21 +1053,26 @@ func ownerReserveRecord(
 	state OwnerAllocationState,
 	fragments []OwnerStateDeviceFragment,
 ) OwnerStateAllocationRecord {
+	reservationTransaction := transactionSequence
+	if state == OwnerAllocationRejectedNoSpace {
+		reservationTransaction = 0
+	}
 	return OwnerStateAllocationRecord{
-		AllocationRecordID:       allocationRecordID,
-		OwnerTransactionSequence: transactionSequence,
-		State:                    state,
-		RequestID:                request.RequestID,
-		CheckpointID:             request.CheckpointID,
-		ProducerID:               request.ProducerID,
-		DedupDomainID:            request.DedupDomainID,
-		SharingPolicyID:          request.SharingPolicyID,
-		RequestSHA256:            requestSHA256,
-		TotalDemandPages:         totalDemandPages,
-		MaxExtents:               request.MaxExtents,
-		ContentDemands:           append([]OwnerStateContentDemand(nil), request.ContentDemands...),
-		Fragments:                fragments,
-		AuthorityEvidence:        request.AuthorityEvidence,
+		AllocationRecordID:             allocationRecordID,
+		ReservationTransactionSequence: reservationTransaction,
+		OwnerTransactionSequence:       transactionSequence,
+		State:                          state,
+		RequestID:                      request.RequestID,
+		CheckpointID:                   request.CheckpointID,
+		ProducerID:                     request.ProducerID,
+		DedupDomainID:                  request.DedupDomainID,
+		SharingPolicyID:                request.SharingPolicyID,
+		RequestSHA256:                  requestSHA256,
+		TotalDemandPages:               totalDemandPages,
+		MaxExtents:                     request.MaxExtents,
+		ContentDemands:                 append([]OwnerStateContentDemand(nil), request.ContentDemands...),
+		Fragments:                      fragments,
+		AuthorityEvidence:              request.AuthorityEvidence,
 	}
 }
 
@@ -1101,6 +1107,14 @@ func ownerReserveReplaceLastRecordSnapshot(
 	if len(records) == 0 || records[len(records)-1].AllocationRecordID != record.AllocationRecordID {
 		return OwnerStateSnapshot{}, ownerAllocatorInputMismatchf(
 			"cannot replace missing allocation record %d", record.AllocationRecordID)
+	}
+	existing := records[len(records)-1]
+	if existing.ReservationTransactionSequence != record.ReservationTransactionSequence {
+		return OwnerStateSnapshot{}, ownerAllocatorInputMismatchf(
+			"allocation record %d reservation transaction sequence changed from %d to %d",
+			record.AllocationRecordID,
+			existing.ReservationTransactionSequence,
+			record.ReservationTransactionSequence)
 	}
 	records[len(records)-1] = cloneOwnerStateRecord(record)
 	return ownerReserveNewSnapshot(

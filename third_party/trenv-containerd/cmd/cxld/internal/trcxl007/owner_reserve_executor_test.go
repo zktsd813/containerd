@@ -347,6 +347,7 @@ func TestOwnerReserveExecutorSingleDeviceSuccessAndReplay(t *testing.T) {
 	}
 	if result.Outcome != OwnerReservePlanned || result.ForwardRecovered ||
 		result.Record.State != OwnerAllocationGranted ||
+		result.Record.ReservationTransactionSequence != 1 ||
 		result.Record.OwnerTransactionSequence != 2 {
 		t.Fatalf("fresh result = %#v", result)
 	}
@@ -1025,6 +1026,7 @@ func TestOwnerReserveExecutorOlderTransitionBlocksPreparingRecovery(t *testing.T
 		{name: "COMMITTING", state: OwnerAllocationCommitting},
 		{name: "ABORTING", state: OwnerAllocationAborting},
 		{name: "RECLAIMING", state: OwnerAllocationReclaiming},
+		{name: "CANCELING", state: OwnerAllocationCanceling},
 	}
 	for _, test := range states {
 		t.Run(test.name, func(t *testing.T) {

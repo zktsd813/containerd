@@ -24,7 +24,7 @@ const (
 	ownerStateStateFieldBytes = 8
 
 	ownerStateMinimumDeviceWireBytes   uint64 = 53  // one-byte UUID plus fixed fields
-	ownerStateMinimumRecordWireBytes   uint64 = 233 // five one-byte IDs plus fixed fields
+	ownerStateMinimumRecordWireBytes   uint64 = 241 // five one-byte IDs plus fixed fields
 	ownerStateContentDemandWireBytes   uint64 = 40
 	ownerStateMinimumFragmentWireBytes uint64 = 29 // one-byte UUID plus fixed fields
 	ownerStateExtentWireBytes          uint64 = 24
@@ -348,7 +348,7 @@ func ownerStatePayloadLength(snapshot OwnerStateSnapshot) (uint64, error) {
 		}
 	}
 	for _, record := range snapshot.records {
-		if err := add(208); err != nil { // fixed scalars, digests, counts, and evidence
+		if err := add(216); err != nil { // fixed scalars, digests, counts, and evidence
 			return 0, err
 		}
 		for _, value := range []string{
@@ -382,6 +382,7 @@ func ownerStatePayloadLength(snapshot OwnerStateSnapshot) (uint64, error) {
 
 func ownerStateAppendRecord(destination []byte, record OwnerStateAllocationRecord) []byte {
 	destination = ownerStateAppendU64(destination, record.AllocationRecordID)
+	destination = ownerStateAppendU64(destination, record.ReservationTransactionSequence)
 	destination = ownerStateAppendU64(destination, record.OwnerTransactionSequence)
 	destination = append(destination, byte(record.State))
 	destination = append(destination, make([]byte, ownerStateStateFieldBytes-1)...)
@@ -519,6 +520,9 @@ func (decoder *ownerStateDecoder) record() (OwnerStateAllocationRecord, error) {
 	var record OwnerStateAllocationRecord
 	var err error
 	if record.AllocationRecordID, err = decoder.u64("allocation-record ID"); err != nil {
+		return record, err
+	}
+	if record.ReservationTransactionSequence, err = decoder.u64("reservation transaction sequence"); err != nil {
 		return record, err
 	}
 	if record.OwnerTransactionSequence, err = decoder.u64("Owner-transaction sequence"); err != nil {

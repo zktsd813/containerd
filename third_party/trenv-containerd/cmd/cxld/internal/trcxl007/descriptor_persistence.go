@@ -307,7 +307,7 @@ func (device *DeviceMetadata) prepareReservedDescriptorPersistence(
 		record.ContentDemands,
 		placed,
 		record.AllocationRecordID,
-		record.OwnerTransactionSequence)
+		record.ReservationTransactionSequence)
 	if err != nil {
 		return nil, 0, ownerAllocatorInputMismatchf(
 			"derive RESERVED descriptors for device %q: %v", localUUID, err)
@@ -368,9 +368,9 @@ func (device *DeviceMetadata) prepareReservedDescriptorPersistence(
 	beforeTargetSequence, sequenceOK := checkedAdd(device.allocator.SnapshotSequence, 1)
 	beforeApply := sequenceOK &&
 		beforeTargetSequence == fragment.TargetAllocatorSnapshotSequence &&
-		device.allocator.AppliedOwnerTransactionSequence < record.OwnerTransactionSequence
+		device.allocator.AppliedOwnerTransactionSequence < record.ReservationTransactionSequence
 	afterApply := device.allocator.SnapshotSequence == fragment.TargetAllocatorSnapshotSequence &&
-		device.allocator.AppliedOwnerTransactionSequence == record.OwnerTransactionSequence
+		device.allocator.AppliedOwnerTransactionSequence == record.ReservationTransactionSequence
 	if !beforeApply && !afterApply {
 		return nil, 0, fmt.Errorf(
 			"%w: device %q allocator sequence/applied transaction %d/%d is neither before nor after target %d/%d",
@@ -379,7 +379,7 @@ func (device *DeviceMetadata) prepareReservedDescriptorPersistence(
 			device.allocator.SnapshotSequence,
 			device.allocator.AppliedOwnerTransactionSequence,
 			fragment.TargetAllocatorSnapshotSequence,
-			record.OwnerTransactionSequence)
+			record.ReservationTransactionSequence)
 	}
 	for _, extent := range fragment.Extents {
 		end, ok := checkedAdd(extent.StartDataPageIndex, extent.PageCount)
@@ -499,6 +499,7 @@ func reservedDescriptorRecordScalarsEqual(
 	left, right OwnerStateAllocationRecord,
 ) bool {
 	return left.AllocationRecordID == right.AllocationRecordID &&
+		left.ReservationTransactionSequence == right.ReservationTransactionSequence &&
 		left.OwnerTransactionSequence == right.OwnerTransactionSequence &&
 		left.State == right.State &&
 		left.RequestID == right.RequestID &&

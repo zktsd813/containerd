@@ -18,10 +18,12 @@ const (
 	// OwnerStateMagicString, OwnerStateVersion, and OwnerStateDomain identify
 	// one clean-slate, group-global TROWN007 full snapshot. The snapshot is
 	// checkpoint-level Owner metadata, not a per-page journal and not a
-	// PublicationV7 pinned-control object.
+	// PublicationV7 pinned-control object. The v2 domain is a destructive ABI
+	// cut: old draft-v1 media must be reformatted, because no dual decoder or
+	// live migration is supplied.
 	OwnerStateMagicString = "TROWN007"
 	OwnerStateVersion     = uint32(7)
-	OwnerStateDomain      = "owner-group-full-snapshot-v1"
+	OwnerStateDomain      = "owner-group-full-snapshot-v2"
 
 	OwnerStateEnvelopeHeaderBytes uint64 = 64
 	MaxOwnerStateIdentityBytes           = 256
@@ -82,10 +84,12 @@ const (
 	OwnerAllocationReclaimed
 	OwnerAllocationQuarantined
 	OwnerAllocationRejectedNoSpace
+	OwnerAllocationCanceling
+	OwnerAllocationCanceled
 )
 
 func (state OwnerAllocationState) valid() bool {
-	return state >= OwnerAllocationPreparing && state <= OwnerAllocationRejectedNoSpace
+	return state >= OwnerAllocationPreparing && state <= OwnerAllocationCanceled
 }
 
 // OwnerStateDevice is one canonical member of an Owner group. DeviceUUID is
@@ -142,11 +146,15 @@ type OwnerStateAuthorityEvidence struct {
 
 // OwnerStateAllocationRecord is the checkpoint-level recovery and idempotency
 // unit. AllocationRecordID remains positive even for REJECTED_NO_SPACE, whose
-// exact demand is retained without physical fragments.
+// exact demand is retained without physical fragments. The reservation
+// transaction adds eight bytes per checkpoint record, never per page, and is
+// immutable for the lifetime of a physical allocation. OwnerTransactionSequence
+// instead names the latest transaction that produced the current record state.
 type OwnerStateAllocationRecord struct {
-	AllocationRecordID       uint64
-	OwnerTransactionSequence uint64
-	State                    OwnerAllocationState
+	AllocationRecordID             uint64
+	ReservationTransactionSequence uint64
+	OwnerTransactionSequence       uint64
+	State                          OwnerAllocationState
 
 	RequestID       string
 	CheckpointID    string
@@ -316,6 +324,7 @@ func (snapshot OwnerStateSnapshot) Validate() error {
 	requestIndex := make(map[string]uint64, len(snapshot.records))
 	checkpointIndex := make(map[string]uint64, len(snapshot.records))
 	transactionIndex := make(map[uint64]uint64, len(snapshot.records))
+	reservationIndex := make(map[uint64]uint64, len(snapshot.records))
 	var previousAllocationID uint64
 	var maximumTransactionSequence uint64
 	for index := range snapshot.records {
@@ -342,12 +351,35 @@ func (snapshot OwnerStateSnapshot) Validate() error {
 				"Owner-transaction sequence %d is shared by allocation records %d and %d",
 				record.OwnerTransactionSequence, previous, record.AllocationRecordID)
 		}
+		if record.ReservationTransactionSequence != 0 {
+			if previous, exists := reservationIndex[record.ReservationTransactionSequence]; exists {
+				return ownerStateInvalidf(
+					"reservation transaction sequence %d is shared by allocation records %d and %d",
+					record.ReservationTransactionSequence, previous, record.AllocationRecordID)
+			}
+			reservationIndex[record.ReservationTransactionSequence] = record.AllocationRecordID
+		}
 		requestIndex[record.RequestID] = record.AllocationRecordID
 		checkpointIndex[record.CheckpointID] = record.AllocationRecordID
 		transactionIndex[record.OwnerTransactionSequence] = record.AllocationRecordID
 		previousAllocationID = record.AllocationRecordID
 		if record.OwnerTransactionSequence > maximumTransactionSequence {
 			maximumTransactionSequence = record.OwnerTransactionSequence
+		}
+		if record.ReservationTransactionSequence > maximumTransactionSequence {
+			maximumTransactionSequence = record.ReservationTransactionSequence
+		}
+	}
+	for _, record := range snapshot.records {
+		if record.ReservationTransactionSequence == 0 {
+			continue
+		}
+		if retainedBy, exists := transactionIndex[record.ReservationTransactionSequence]; exists && retainedBy != record.AllocationRecordID {
+			return ownerStateInvalidf(
+				"reservation transaction sequence %d for allocation record %d collides with retained transaction of allocation record %d",
+				record.ReservationTransactionSequence,
+				record.AllocationRecordID,
+				retainedBy)
 		}
 	}
 	if len(snapshot.records) > 0 && snapshot.NextAllocationRecordID <= previousAllocationID {
@@ -520,7 +552,44 @@ func validateOwnerStateRecord(
 		return err
 	}
 	if !record.State.valid() {
-		return ownerStateInvalidf("allocation state %d is outside PREPARING..REJECTED_NO_SPACE", record.State)
+		return ownerStateInvalidf("allocation state %d is outside the TROWN007 v2 state machine", record.State)
+	}
+	if record.State == OwnerAllocationRejectedNoSpace {
+		if record.ReservationTransactionSequence != 0 {
+			return ownerStateInvalidf(
+				"REJECTED_NO_SPACE reservation transaction sequence is %d, want zero",
+				record.ReservationTransactionSequence)
+		}
+	} else {
+		if err := ownerStatePositiveLong(
+			"reservation transaction sequence",
+			record.ReservationTransactionSequence); err != nil {
+			return err
+		}
+		if record.ReservationTransactionSequence > record.OwnerTransactionSequence {
+			return ownerStateInvalidf(
+				"reservation transaction sequence %d exceeds current Owner transaction %d",
+				record.ReservationTransactionSequence,
+				record.OwnerTransactionSequence)
+		}
+		switch record.State {
+		case OwnerAllocationPreparing:
+			if record.ReservationTransactionSequence != record.OwnerTransactionSequence {
+				return ownerStateInvalidf(
+					"PREPARING current transaction %d does not equal reservation transaction %d",
+					record.OwnerTransactionSequence,
+					record.ReservationTransactionSequence)
+			}
+		case OwnerAllocationGranted:
+			wantCurrent, ok := checkedAdd(record.ReservationTransactionSequence, 1)
+			if !ok || wantCurrent > cxlcheckpoint.MaxSignedLong ||
+				record.OwnerTransactionSequence != wantCurrent {
+				return ownerStateInvalidf(
+					"GRANTED current transaction %d does not immediately follow reservation transaction %d",
+					record.OwnerTransactionSequence,
+					record.ReservationTransactionSequence)
+			}
+		}
 	}
 	for _, identity := range []struct {
 		name  string
@@ -863,8 +932,9 @@ func ownerStateDigestString(writer io.Writer, value string) {
 func ownerStateCompiledContractValid() bool {
 	return OwnerStateMagicString == "TROWN007" &&
 		OwnerStateVersion == 7 &&
-		OwnerStateDomain == "owner-group-full-snapshot-v1" &&
+		OwnerStateDomain == "owner-group-full-snapshot-v2" &&
 		len(OwnerStateDomain) <= ownerStateDomainFieldBytes &&
+		len(cxlcheckpoint.V7StorageCompatibilityID) <= MaxOwnerStateIdentityBytes &&
 		OwnerStateEnvelopeHeaderBytes == 64 &&
 		MaxOwnerStateDevices == 256 &&
 		MaxOwnerStateContentDemands == 256 &&

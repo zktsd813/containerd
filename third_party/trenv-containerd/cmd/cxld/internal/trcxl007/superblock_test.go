@@ -14,10 +14,10 @@ import (
 )
 
 const (
-	superblockKnownHeaderHex     = "545243584c30303707000000400000006465766963652d7375706572626c6f636b2d7631000000001c02000000000000ec1d024200000000c65bc45200000000"
-	superblockKnownPayloadHex    = "0a000000636c75737465722dceb10b0000006465766963652d303030310d0000006f776e65722d67726f75702d330c0000006f776e65722d6e6f64652d370b0000006465766963652d30303031db0000007075626c69636174696f6e3d54525055423030372f76372f6c6974746c652d656e6469616e2f696d6d757461626c652d7075626c69636174696f6e2d76313b656e76656c6f70652d6865616465723d36343b6d61782d656e76656c6f70653d383338383630383b706167653d343039363b66696e6765727072696e743d6372633332632d6361737461676e6f6c692f30783131656463366634313b64657363726970746f723d545243584c3030372f36342f747263786c3030372d706167652d64657363726970746f722d6c6974746c652d656e6469616e2d76310b00000000000000110000000000000001000000000000000500000000000000c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf00001000000000000000000000000000001000000000000000200000000000000030000000000000001000000000000000400000000000000050000000000000001000000000000000600000000000000060000000000000803d00000000000000a000000000000000600f0000000000f60000000000000002000000000000000c00000000000000cf000000000000009eb1c913d13d034fadbeecdb5c99f23d1bb178933ab7c365bf812b03cd52c915"
-	superblockKnownSlotSHA256    = "585b50a57c65bdc5fed6bbd4f9c6336cf6ed51cefddf6ac1ad5a9aad13806e64"
-	superblockKnownDeviceSHA     = "9d07c5f96c8aea98f5c28d0729f9614a1e33d9b18d2a3c5965dd7b8c6956c0d5"
+	superblockKnownHeaderHex     = "545243584c30303707000000400000006465766963652d7375706572626c6f636b2d76310000000034020000000000000aa0a26e0000000025dc0f4f00000000"
+	superblockKnownPayloadHex    = "0a000000636c75737465722dceb10b0000006465766963652d303030310d0000006f776e65722d67726f75702d330c0000006f776e65722d6e6f64652d370b0000006465766963652d30303031f30000007075626c69636174696f6e3d54525055423030372f76372f6c6974746c652d656e6469616e2f696d6d757461626c652d7075626c69636174696f6e2d76313b656e76656c6f70652d6865616465723d36343b6d61782d656e76656c6f70653d383338383630383b706167653d343039363b66696e6765727072696e743d6372633332632d6361737461676e6f6c692f30783131656463366634313b64657363726970746f723d545243584c3030372f36342f747263786c3030372d706167652d64657363726970746f722d6c6974746c652d656e6469616e2d76313b6f776e65722d73746174653d54524f574e3030372f76320b00000000000000110000000000000001000000000000000500000000000000c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf00001000000000000000000000000000001000000000000000200000000000000030000000000000001000000000000000400000000000000050000000000000001000000000000000600000000000000060000000000000803d00000000000000a000000000000000600f0000000000f60000000000000002000000000000000c00000000000000cf000000000000004df6d0c790df97895f9922ccfeb20a6889f17e1c08787c35fdcbf03d87860aad"
+	superblockKnownSlotSHA256    = "a27321febb5f9a72e51639949fa7304b9cbfa7d7c0478cdb1ca64715294dc793"
+	superblockKnownDeviceSHA     = "9d99de3704ce3f79f1ed6347b0acd3834ed6f0042b705482ecca4919813a3dfc"
 	superblockKnownOwnerGroupSHA = "e3d078b2cfd73d02de8eb159ba5ffffc0463fd3c2ef3ebd53be2a160a549bf86"
 )
 
@@ -36,8 +36,8 @@ func TestSuperblockKnownAnswerSHA256AndOffsets(t *testing.T) {
 		t.Fatalf("slot length = %d, expected %d", len(wire), SuperblockSlotBytes)
 	}
 	payloadLength := binary.LittleEndian.Uint64(wire[superblockPayloadLengthOffset:])
-	if payloadLength != 540 {
-		t.Fatalf("known payload length = %d, expected 540", payloadLength)
+	if payloadLength != 564 {
+		t.Fatalf("known payload length = %d, expected 564", payloadLength)
 	}
 	payloadEnd := int(SuperblockEnvelopeHeaderBytes + payloadLength)
 	slotSHA256 := sha256.Sum256(wire)
@@ -101,21 +101,21 @@ func TestSuperblockKnownAnswerSHA256AndOffsets(t *testing.T) {
 		binary.LittleEndian.Uint32(wire[110:114]) != 12 || string(wire[114:126]) != "owner-node-7" ||
 		binary.LittleEndian.Uint32(wire[126:130]) != 11 || string(wire[130:141]) != "device-0001" ||
 		binary.LittleEndian.Uint32(wire[141:145]) != uint32(len(cxlcheckpoint.V7StorageCompatibilityID)) ||
-		string(wire[145:364]) != cxlcheckpoint.V7StorageCompatibilityID {
+		string(wire[145:388]) != cxlcheckpoint.V7StorageCompatibilityID {
 		t.Fatalf("known length-prefixed identity offsets changed")
 	}
-	if binary.LittleEndian.Uint64(wire[364:372]) != 11 ||
-		binary.LittleEndian.Uint64(wire[372:380]) != 17 ||
-		wire[380] != byte(OwnerGroupRoleAnchor) || !superblockAllZero(wire[381:388]) ||
-		binary.LittleEndian.Uint64(wire[388:396]) != 5 ||
-		!bytes.Equal(wire[396:428], superblock.OwnerGroupMembershipSHA256[:]) ||
-		binary.LittleEndian.Uint64(wire[428:436]) != superblock.Geometry.DeviceBytes ||
-		binary.LittleEndian.Uint64(wire[540:548]) != superblock.Geometry.DataPageCount ||
-		wire[548] != byte(SuperblockSlotB) || !superblockAllZero(wire[549:556]) ||
-		binary.LittleEndian.Uint64(wire[556:564]) != snapshot.SnapshotSequence ||
-		binary.LittleEndian.Uint64(wire[564:572]) != storage.ExactLength() ||
-		!bytes.Equal(wire[572:604], storageSHA256[:]) {
-		t.Fatalf("known scalar/geometry/snapshot offsets changed: %x", wire[364:604])
+	if binary.LittleEndian.Uint64(wire[388:396]) != 11 ||
+		binary.LittleEndian.Uint64(wire[396:404]) != 17 ||
+		wire[404] != byte(OwnerGroupRoleAnchor) || !superblockAllZero(wire[405:412]) ||
+		binary.LittleEndian.Uint64(wire[412:420]) != 5 ||
+		!bytes.Equal(wire[420:452], superblock.OwnerGroupMembershipSHA256[:]) ||
+		binary.LittleEndian.Uint64(wire[452:460]) != superblock.Geometry.DeviceBytes ||
+		binary.LittleEndian.Uint64(wire[564:572]) != superblock.Geometry.DataPageCount ||
+		wire[572] != byte(SuperblockSlotB) || !superblockAllZero(wire[573:580]) ||
+		binary.LittleEndian.Uint64(wire[580:588]) != snapshot.SnapshotSequence ||
+		binary.LittleEndian.Uint64(wire[588:596]) != storage.ExactLength() ||
+		!bytes.Equal(wire[596:628], storageSHA256[:]) {
+		t.Fatalf("known scalar/geometry/snapshot offsets changed: %x", wire[388:628])
 	}
 	if !superblockAllZero(wire[payloadEnd:]) {
 		t.Fatal("known slot tail is not canonical zero")
@@ -489,11 +489,11 @@ func TestSuperblockRejectsHeaderPayloadReservedAndTailCorruption(t *testing.T) {
 	superblockTestRequireCorrupt(t, tail, "tail")
 
 	roleReserved := append([]byte(nil), wire...)
-	roleReserved[381] = 1
+	roleReserved[405] = 1
 	superblockTestRechecksum(roleReserved)
 	superblockTestRequireCorrupt(t, roleReserved, "Owner-group role reserved")
 	activeReserved := append([]byte(nil), wire...)
-	activeReserved[549] = 1
+	activeReserved[573] = 1
 	superblockTestRechecksum(activeReserved)
 	superblockTestRequireCorrupt(t, activeReserved, "active allocator reserved")
 	oversizedIdentity := append([]byte(nil), wire...)

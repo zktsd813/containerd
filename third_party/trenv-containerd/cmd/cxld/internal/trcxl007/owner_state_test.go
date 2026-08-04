@@ -16,7 +16,7 @@ import (
 
 const (
 	ownerStateKnownMembershipSHA256 = "e4ed58ce1730f545f2439b7b7fb20316c139b483849ff438e880b1e8914aff6f"
-	ownerStateKnownEnvelopeSHA256   = "678ff15245fc449fc9c5a99fcc12e58415066a7c6ce25703db75fd3259de3502"
+	ownerStateKnownEnvelopeSHA256   = "846141f607a13416e9f01be4823737b7e50992d27b6b06c186394b6ebea73fe6"
 )
 
 func TestOwnerStateKnownAnswerRoundTripAndStorage(t *testing.T) {
@@ -42,6 +42,29 @@ func TestOwnerStateKnownAnswerRoundTripAndStorage(t *testing.T) {
 	}
 	if got := binary.LittleEndian.Uint64(wire[48:56]); got != uint64(len(wire))-64 {
 		t.Fatalf("payload length = %d, want %d", got, len(wire)-64)
+	}
+	recordOffset := int(OwnerStateEnvelopeHeaderBytes)
+	for index := 0; index < 5; index++ {
+		length := int(binary.LittleEndian.Uint32(wire[recordOffset : recordOffset+4]))
+		recordOffset += 4 + length
+	}
+	recordOffset += 80
+	deviceCount := int(binary.LittleEndian.Uint32(wire[recordOffset-8 : recordOffset-4]))
+	for index := 0; index < deviceCount; index++ {
+		length := int(binary.LittleEndian.Uint32(wire[recordOffset : recordOffset+4]))
+		recordOffset += 4 + length + 8 + 8 + sha256.Size
+	}
+	if got := binary.LittleEndian.Uint64(wire[recordOffset:]); got != 29 {
+		t.Fatalf("wire allocation-record ID = %d, want 29", got)
+	}
+	if got := binary.LittleEndian.Uint64(wire[recordOffset+8:]); got != 31 {
+		t.Fatalf("wire reservation transaction = %d, want 31", got)
+	}
+	if got := binary.LittleEndian.Uint64(wire[recordOffset+16:]); got != 31 {
+		t.Fatalf("wire current Owner transaction = %d, want 31", got)
+	}
+	if got := OwnerAllocationState(wire[recordOffset+24]); got != OwnerAllocationPreparing {
+		t.Fatalf("wire allocation state = %d, want PREPARING", got)
 	}
 
 	membershipHex := hex.EncodeToString(snapshot.MembershipSHA256[:])
@@ -92,6 +115,71 @@ func TestOwnerStateKnownAnswerRoundTripAndStorage(t *testing.T) {
 	first[0] ^= 0xff
 	if bytes.Equal(first, storage.ExactBytes()) {
 		t.Fatal("ExactBytes aliases internal storage")
+	}
+}
+
+func TestOwnerStateV2StateNumbersAndTransactionSemantics(t *testing.T) {
+	wantNumbers := []OwnerAllocationState{
+		OwnerAllocationPreparing,
+		OwnerAllocationGranted,
+		OwnerAllocationCommitting,
+		OwnerAllocationCommitted,
+		OwnerAllocationAborting,
+		OwnerAllocationAborted,
+		OwnerAllocationReclaiming,
+		OwnerAllocationReclaimed,
+		OwnerAllocationQuarantined,
+		OwnerAllocationRejectedNoSpace,
+		OwnerAllocationCanceling,
+		OwnerAllocationCanceled,
+	}
+	for index, state := range wantNumbers {
+		if got, want := uint8(state), uint8(index+1); got != want {
+			t.Fatalf("state %d numeric value = %d, want %d", index, got, want)
+		}
+	}
+
+	base := ownerStateTestSnapshot(t)
+	checks := []struct {
+		name   string
+		mutate func(*OwnerStateSnapshot)
+	}{
+		{"preparing-reservation-differs", func(value *OwnerStateSnapshot) {
+			value.records[0].ReservationTransactionSequence--
+		}},
+		{"reservation-after-current", func(value *OwnerStateSnapshot) {
+			value.records[0].ReservationTransactionSequence++
+		}},
+		{"granted-not-reservation-plus-one", func(value *OwnerStateSnapshot) {
+			value.records[0].State = OwnerAllocationGranted
+		}},
+		{"rejected-retains-reservation", func(value *OwnerStateSnapshot) {
+			value.records[0].State = OwnerAllocationRejectedNoSpace
+			value.records[0].Fragments = nil
+		}},
+	}
+	for _, check := range checks {
+		t.Run(check.name, func(t *testing.T) {
+			candidate := base.Clone()
+			check.mutate(&candidate)
+			if err := candidate.Validate(); !errors.Is(err, ErrInvalidOwnerState) {
+				t.Fatalf("Validate error = %v", err)
+			}
+		})
+	}
+
+	granted := base.Clone()
+	granted.records[0].State = OwnerAllocationGranted
+	granted.records[0].OwnerTransactionSequence++
+	granted.NextOwnerTransactionSequence++
+	if err := granted.Validate(); err != nil {
+		t.Fatalf("valid GRANTED reservation/current pair: %v", err)
+	}
+
+	canceled := granted.Clone()
+	canceled.records[0].State = OwnerAllocationCanceled
+	if err := canceled.Validate(); err != nil {
+		t.Fatalf("CANCELED terminal state: %v", err)
 	}
 }
 
@@ -260,21 +348,47 @@ func TestOwnerStateDeepCopyAndIndexRebuild(t *testing.T) {
 
 func TestOwnerStateAllStatesAndNoSpaceSemantics(t *testing.T) {
 	base := ownerStateTestSnapshot(t)
-	for state := OwnerAllocationPreparing; state <= OwnerAllocationRejectedNoSpace; state++ {
+	geometry := ownerStateTestGeometry(t, 64<<10)
+	states := []OwnerAllocationState{
+		OwnerAllocationPreparing,
+		OwnerAllocationGranted,
+		OwnerAllocationCommitting,
+		OwnerAllocationCommitted,
+		OwnerAllocationAborting,
+		OwnerAllocationAborted,
+		OwnerAllocationReclaiming,
+		OwnerAllocationReclaimed,
+		OwnerAllocationQuarantined,
+		OwnerAllocationRejectedNoSpace,
+		OwnerAllocationCanceling,
+		OwnerAllocationCanceled,
+	}
+	for _, state := range states {
 		t.Run(fmt.Sprintf("state-%d", state), func(t *testing.T) {
 			candidate := base.Clone()
 			candidate.records[0].State = state
-			if state == OwnerAllocationRejectedNoSpace {
+			switch state {
+			case OwnerAllocationGranted:
+				candidate.records[0].OwnerTransactionSequence++
+				candidate.NextOwnerTransactionSequence++
+			case OwnerAllocationRejectedNoSpace:
+				candidate.records[0].ReservationTransactionSequence = 0
 				candidate.records[0].Fragments = nil
 			}
 			if err := candidate.Validate(); err != nil {
 				t.Fatalf("valid state %d: %v", state, err)
+			}
+			wire := ownerStateTestEncode(t, candidate, geometry)
+			parsed, err := ParseOwnerState(wire, geometry)
+			if err != nil || parsed.records[0].State != state {
+				t.Fatalf("state %d codec = %d, %v", state, parsed.records[0].State, err)
 			}
 		})
 	}
 
 	noSpaceWithFragments := base.Clone()
 	noSpaceWithFragments.records[0].State = OwnerAllocationRejectedNoSpace
+	noSpaceWithFragments.records[0].ReservationTransactionSequence = 0
 	if err := noSpaceWithFragments.Validate(); !errors.Is(err, ErrInvalidOwnerState) {
 		t.Fatalf("no-space fragments error = %v", err)
 	}
@@ -285,6 +399,7 @@ func TestOwnerStateAllStatesAndNoSpaceSemantics(t *testing.T) {
 	}
 	noSpace := base.Clone()
 	noSpace.records[0].State = OwnerAllocationRejectedNoSpace
+	noSpace.records[0].ReservationTransactionSequence = 0
 	noSpace.records[0].Fragments = nil
 	if noSpace.records[0].AllocationRecordID == 0 || noSpace.records[0].TotalDemandPages == 0 {
 		t.Fatal("no-space fixture lost positive identity or exact demand")
@@ -317,6 +432,9 @@ func TestOwnerStateValidationRejectsCanonicalityAndCoverageErrors(t *testing.T) 
 		{"record-zero-id", func(value *OwnerStateSnapshot) { value.records[0].AllocationRecordID = 0 }},
 		{"record-zero-transaction", func(value *OwnerStateSnapshot) {
 			value.records[0].OwnerTransactionSequence = 0
+		}},
+		{"record-zero-reservation", func(value *OwnerStateSnapshot) {
+			value.records[0].ReservationTransactionSequence = 0
 		}},
 		{"record-bad-state", func(value *OwnerStateSnapshot) { value.records[0].State = 0 }},
 		{"request-digest-zero", func(value *OwnerStateSnapshot) {
@@ -382,6 +500,7 @@ func TestOwnerStateDuplicateRequestCheckpointAndRecordOrdering(t *testing.T) {
 	base := ownerStateTestSnapshot(t)
 	second := cloneOwnerStateRecord(base.records[0])
 	second.AllocationRecordID = 30
+	second.ReservationTransactionSequence = 32
 	second.OwnerTransactionSequence = 32
 	second.RequestID = "request-30"
 	second.CheckpointID = "checkpoint-30"
@@ -407,6 +526,21 @@ func TestOwnerStateDuplicateRequestCheckpointAndRecordOrdering(t *testing.T) {
 		}},
 		{"duplicate-owner-transaction", func(value *OwnerStateSnapshot) {
 			value.records[1].OwnerTransactionSequence = value.records[0].OwnerTransactionSequence
+			value.records[1].ReservationTransactionSequence = 30
+			value.records[1].State = OwnerAllocationCommitted
+		}},
+		{"duplicate-reservation-transaction", func(value *OwnerStateSnapshot) {
+			value.records[1].ReservationTransactionSequence =
+				value.records[0].ReservationTransactionSequence
+			value.records[1].State = OwnerAllocationCommitted
+		}},
+		{"reservation-collides-with-other-current", func(value *OwnerStateSnapshot) {
+			value.records[0].State = OwnerAllocationCommitted
+			value.records[0].OwnerTransactionSequence = 32
+			value.records[1].State = OwnerAllocationCommitted
+			value.records[1].ReservationTransactionSequence = 32
+			value.records[1].OwnerTransactionSequence = 33
+			value.NextOwnerTransactionSequence = 34
 		}},
 	}
 	for _, check := range checks {
@@ -478,6 +612,15 @@ func TestOwnerStateParserRejectsTruncationCorruptionAndCountAttacks(t *testing.T
 		})
 	}
 
+	oldDraftDomain := append([]byte(nil), wire...)
+	var oldDomain [ownerStateDomainFieldBytes]byte
+	copy(oldDomain[:], "owner-group-full-snapshot-v1")
+	copy(oldDraftDomain[ownerStateDomainOffset:ownerStatePayloadLengthOffset], oldDomain[:])
+	ownerStateTestRefreshCRCs(oldDraftDomain)
+	if _, err := ParseOwnerState(oldDraftDomain, geometry); !errors.Is(err, ErrWrongOwnerStateFormat) {
+		t.Fatalf("old draft-v1 domain error = %v, want wrong format", err)
+	}
+
 	oversized := append([]byte(nil), wire[:64]...)
 	binary.LittleEndian.PutUint64(
 		oversized[ownerStatePayloadLengthOffset:], geometry.OwnerStateSnapshotSlotBytes)
@@ -519,7 +662,7 @@ func TestOwnerStateParserRejectsTruncationCorruptionAndCountAttacks(t *testing.T
 		length := int(binary.LittleEndian.Uint32(wire[cursor : cursor+4]))
 		cursor += 4 + length + 8 + 8 + sha256.Size
 	}
-	cursor += 8 + 8 + ownerStateStateFieldBytes
+	cursor += 8 + 8 + 8 + ownerStateStateFieldBytes
 	for index := 0; index < 5; index++ {
 		length := int(binary.LittleEndian.Uint32(wire[cursor : cursor+4]))
 		cursor += 4 + length
@@ -760,17 +903,18 @@ func ownerStateTestConfig(t *testing.T) OwnerStateConfig {
 		t.Fatalf("membership fixture: %v", err)
 	}
 	record := OwnerStateAllocationRecord{
-		AllocationRecordID:       29,
-		OwnerTransactionSequence: 31,
-		State:                    OwnerAllocationPreparing,
-		RequestID:                "request-29",
-		CheckpointID:             "checkpoint-29",
-		ProducerID:               "producer-a",
-		DedupDomainID:            "dedup-a",
-		SharingPolicyID:          "sharing-a",
-		RequestSHA256:            sha256.Sum256([]byte("request-29-canonical")),
-		TotalDemandPages:         6,
-		MaxExtents:               3,
+		AllocationRecordID:             29,
+		ReservationTransactionSequence: 31,
+		OwnerTransactionSequence:       31,
+		State:                          OwnerAllocationPreparing,
+		RequestID:                      "request-29",
+		CheckpointID:                   "checkpoint-29",
+		ProducerID:                     "producer-a",
+		DedupDomainID:                  "dedup-a",
+		SharingPolicyID:                "sharing-a",
+		RequestSHA256:                  sha256.Sum256([]byte("request-29-canonical")),
+		TotalDemandPages:               6,
+		MaxExtents:                     3,
 		ContentDemands: []OwnerStateContentDemand{
 			{
 				Kind:             cxlcheckpoint.ContentMemoryPayloadV7,
@@ -839,17 +983,18 @@ func ownerStateTestConfig(t *testing.T) OwnerStateConfig {
 
 func ownerStateTestNoSpaceRecord(id uint64) OwnerStateAllocationRecord {
 	return OwnerStateAllocationRecord{
-		AllocationRecordID:       id,
-		OwnerTransactionSequence: id + 1,
-		State:                    OwnerAllocationRejectedNoSpace,
-		RequestID:                fmt.Sprintf("request-%08d", id),
-		CheckpointID:             fmt.Sprintf("checkpoint-%08d", id),
-		ProducerID:               "producer-a",
-		DedupDomainID:            "dedup-a",
-		SharingPolicyID:          "sharing-a",
-		RequestSHA256:            sha256.Sum256([]byte(fmt.Sprintf("request-%08d", id))),
-		TotalDemandPages:         1,
-		MaxExtents:               1,
+		AllocationRecordID:             id,
+		ReservationTransactionSequence: 0,
+		OwnerTransactionSequence:       id + 1,
+		State:                          OwnerAllocationRejectedNoSpace,
+		RequestID:                      fmt.Sprintf("request-%08d", id),
+		CheckpointID:                   fmt.Sprintf("checkpoint-%08d", id),
+		ProducerID:                     "producer-a",
+		DedupDomainID:                  "dedup-a",
+		SharingPolicyID:                "sharing-a",
+		RequestSHA256:                  sha256.Sum256([]byte(fmt.Sprintf("request-%08d", id))),
+		TotalDemandPages:               1,
+		MaxExtents:                     1,
 		ContentDemands: []OwnerStateContentDemand{
 			{
 				Kind:             cxlcheckpoint.ContentMemoryPayloadV7,

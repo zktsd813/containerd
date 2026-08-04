@@ -115,7 +115,7 @@ func (group *OwnerDeviceGroup) ExecuteCheckpointReserve(
 	if replayErr != nil {
 		return OwnerReserveExecutionResult{}, replayErr
 	}
-	// Any earlier COMMITTING/ABORTING/RECLAIMING record blocks allocation and
+	// Any earlier COMMITTING/ABORTING/RECLAIMING/CANCELING record blocks allocation and
 	// recovery even when the last record is PREPARING. Otherwise a newer
 	// reservation could bypass an unfinished older ownership transition. An
 	// unrelated transition does not hide an already-terminal exact replay.
@@ -288,7 +288,8 @@ func ownerReserveTransitionalRecord(
 		switch record.State {
 		case OwnerAllocationCommitting,
 			OwnerAllocationAborting,
-			OwnerAllocationReclaiming:
+			OwnerAllocationReclaiming,
+			OwnerAllocationCanceling:
 			return record, true
 		}
 	}
@@ -300,7 +301,8 @@ func ownerReserveRecordIsTerminal(record OwnerStateAllocationRecord) bool {
 	case OwnerAllocationPreparing,
 		OwnerAllocationCommitting,
 		OwnerAllocationAborting,
-		OwnerAllocationReclaiming:
+		OwnerAllocationReclaiming,
+		OwnerAllocationCanceling:
 		return false
 	default:
 		return record.State.valid()
@@ -440,7 +442,7 @@ func (group *OwnerDeviceGroup) executePreparingRecoveryPlanLocked(
 ) (OwnerReserveExecutionResult, error) {
 	// Descriptor and allocator metadata deliberately remain at PREPARING
 	// transaction N. Only the final Owner record advances to GRANTED N+1.
-	preparingTransaction := recoveryPlan.preparingRecord.OwnerTransactionSequence
+	preparingTransaction := recoveryPlan.preparingRecord.ReservationTransactionSequence
 	if recoveryPlan.grantedRecord.OwnerTransactionSequence != preparingTransaction+1 {
 		return OwnerReserveExecutionResult{}, group.ownerReserveFailureLocked(
 			ownerAllocatorInputMismatchf(
@@ -725,7 +727,7 @@ func (group *OwnerDeviceGroup) buildPreparingRecoveryPlanLocked(
 		entry, err := group.classifyPreparingAllocatorLocked(
 			deviceIndex,
 			fragment,
-			preparingRecord.OwnerTransactionSequence,
+			preparingRecord.ReservationTransactionSequence,
 			preparingState.NextOwnerTransactionSequence)
 		if err != nil {
 			return ownerReserveRecoveryPlan{}, err
@@ -744,12 +746,12 @@ func (group *OwnerDeviceGroup) buildPreparingRecoveryPlanLocked(
 			continue
 		}
 		applied := group.devices[index].metadata.allocator.AppliedOwnerTransactionSequence
-		if applied >= preparingRecord.OwnerTransactionSequence {
+		if applied >= preparingRecord.ReservationTransactionSequence {
 			return ownerReserveRecoveryPlan{}, ownerAllocatorInputMismatchf(
 				"unaffected device %q carries foreign applied transaction %d at/after PREPARING %d",
 				group.devices[index].deviceUUID,
 				applied,
-				preparingRecord.OwnerTransactionSequence)
+				preparingRecord.ReservationTransactionSequence)
 		}
 	}
 	sort.Slice(devices, func(left, right int) bool {
@@ -888,17 +890,17 @@ func ownerReserveDescriptorsFromRecord(
 		record.ContentDemands,
 		placed,
 		record.AllocationRecordID,
-		record.OwnerTransactionSequence)
+		record.ReservationTransactionSequence)
 	if err != nil {
 		return nil, ownerAllocatorInputMismatchf(
-			"derive RESERVED descriptors from PREPARING record: %v", err)
+			"derive RESERVED descriptors from allocation record: %v", err)
 	}
 	for _, run := range runs {
 		if run.Descriptor.State != DescriptorReserved ||
-			run.Descriptor.OwnerTransactionSeq != record.OwnerTransactionSequence {
+			run.Descriptor.OwnerTransactionSeq != record.ReservationTransactionSequence {
 			return nil, ownerAllocatorInputMismatchf(
 				"derived descriptor does not retain PREPARING transaction %d",
-				record.OwnerTransactionSequence)
+				record.ReservationTransactionSequence)
 		}
 	}
 	return runs, nil
@@ -919,7 +921,7 @@ func ownerReserveGrantFromPreparing(
 		return OwnerStateSnapshot{}, OwnerStateAllocationRecord{}, err
 	}
 	grantedTransaction, err := ownerReserveAddSequence(
-		preparingRecord.OwnerTransactionSequence,
+		preparingRecord.ReservationTransactionSequence,
 		1,
 		"recovered GRANTED record transaction")
 	if err != nil {

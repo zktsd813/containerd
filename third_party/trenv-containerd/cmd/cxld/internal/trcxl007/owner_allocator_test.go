@@ -65,6 +65,7 @@ func TestOwnerAllocatorSingleBestFitAndCheckpointTransitions(t *testing.T) {
 	preparingRecord := ownerAllocatorLastRecord(t, plan.PreparingOwnerState)
 	if preparingRecord.State != OwnerAllocationPreparing ||
 		preparingRecord.AllocationRecordID != fixture.state.NextAllocationRecordID ||
+		preparingRecord.ReservationTransactionSequence != fixture.state.NextOwnerTransactionSequence ||
 		preparingRecord.OwnerTransactionSequence != fixture.state.NextOwnerTransactionSequence {
 		t.Fatalf("PREPARING record identity/state = %#v", preparingRecord)
 	}
@@ -76,9 +77,21 @@ func TestOwnerAllocatorSingleBestFitAndCheckpointTransitions(t *testing.T) {
 	}
 	grantedRecord := ownerAllocatorLastRecord(t, plan.GrantedOwnerState)
 	if grantedRecord.State != OwnerAllocationGranted ||
+		grantedRecord.ReservationTransactionSequence != preparingRecord.ReservationTransactionSequence ||
 		grantedRecord.OwnerTransactionSequence != fixture.state.NextOwnerTransactionSequence+1 ||
 		!reflect.DeepEqual(grantedRecord, plan.Record) {
 		t.Fatalf("GRANTED record mismatch")
+	}
+	derivedAfterGrant, err := ownerReserveDescriptorsFromRecord(grantedRecord)
+	if err != nil {
+		t.Fatalf("derive RESERVED descriptors from GRANTED record: %v", err)
+	}
+	for _, run := range derivedAfterGrant {
+		if run.Descriptor.OwnerTransactionSeq !=
+			grantedRecord.ReservationTransactionSequence ||
+			run.Descriptor.OwnerTransactionSeq == grantedRecord.OwnerTransactionSequence {
+			t.Fatalf("GRANTED descriptor derivation used current transaction: %#v", run)
+		}
 	}
 
 	if len(grantedRecord.Fragments) != 1 ||
@@ -127,7 +140,8 @@ func TestOwnerAllocatorSingleBestFitAndCheckpointTransitions(t *testing.T) {
 	}
 	for _, descriptorRun := range plan.ReservedDescriptors {
 		if descriptorRun.Descriptor.AllocationRecordID != preparingRecord.AllocationRecordID ||
-			descriptorRun.Descriptor.OwnerTransactionSeq != preparingRecord.OwnerTransactionSequence {
+			descriptorRun.Descriptor.OwnerTransactionSeq !=
+				preparingRecord.ReservationTransactionSequence {
 			t.Fatalf("RESERVED descriptor transaction identity mismatch")
 		}
 		if err := descriptorRun.Descriptor.Validate(); err != nil {
@@ -137,6 +151,60 @@ func TestOwnerAllocatorSingleBestFitAndCheckpointTransitions(t *testing.T) {
 
 	ownerAllocatorRequireInputBitmaps(t, fixture.inputs, before)
 	ownerAllocatorRequirePlanCanonical(t, fixture, plan)
+}
+
+func TestOwnerAllocatorRejectsReservationMutationDuringRecordReplacement(t *testing.T) {
+	fixture := newOwnerAllocatorTestFixture(t, map[string][]ownerAllocatorTestRun{
+		"device-a": {{start: 4, count: 6}},
+	})
+	request := ownerAllocatorTestMemoryRequest(
+		fixture.state,
+		"reservation-mutation",
+		2,
+		1)
+	plan, err := PlanOwnerCheckpointReserve(fixture.state, fixture.inputs, request)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+
+	base := plan.GrantedOwnerState
+	replacement := ownerAllocatorLastRecord(t, base)
+	originalReservation := replacement.ReservationTransactionSequence
+	replacement.State = OwnerAllocationCommitted
+	replacement.ReservationTransactionSequence = replacement.OwnerTransactionSequence
+	replacement.OwnerTransactionSequence = base.NextOwnerTransactionSequence
+	nextTransaction := base.NextOwnerTransactionSequence + 1
+	anchorGeometry := fixture.geometries[base.AnchorDeviceUUID]
+
+	// The replacement is independently well-formed: only the transition from
+	// the retained record makes changing the immutable reservation invalid.
+	records := base.Records()
+	records[len(records)-1] = replacement
+	if _, err := ownerReserveNewSnapshot(
+		base,
+		records,
+		base.SnapshotSequence+1,
+		base.NextAllocationRecordID,
+		nextTransaction,
+		anchorGeometry); err != nil {
+		t.Fatalf("well-formed replacement control: %v", err)
+	}
+
+	_, err = ownerReserveReplaceLastRecordSnapshot(
+		base,
+		replacement,
+		base.SnapshotSequence+1,
+		base.NextAllocationRecordID,
+		nextTransaction,
+		anchorGeometry)
+	if !errors.Is(err, ErrOwnerAllocatorInputMismatch) ||
+		!strings.Contains(err.Error(), "reservation transaction sequence changed") {
+		t.Fatalf(
+			"reservation mutation %d -> %d error = %v",
+			originalReservation,
+			replacement.ReservationTransactionSequence,
+			err)
+	}
 }
 
 func TestOwnerAllocatorMinimumExtentsOnOneDevice(t *testing.T) {
@@ -290,6 +358,7 @@ func TestOwnerAllocatorNoSpaceConsumesRecordButNeverMutatesDevice(t *testing.T) 
 			record := ownerAllocatorLastRecord(t, plan.RejectedOwnerState)
 			if record.State != OwnerAllocationRejectedNoSpace ||
 				record.AllocationRecordID != fixture.state.NextAllocationRecordID ||
+				record.ReservationTransactionSequence != 0 ||
 				record.OwnerTransactionSequence != fixture.state.NextOwnerTransactionSequence ||
 				len(record.Fragments) != 0 ||
 				record.TotalDemandPages != ownerAllocatorDemandPages(test.request.ContentDemands) ||
@@ -517,7 +586,7 @@ func TestOwnerReserveRequestDigestIsDerivedAndDomainSeparated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("digest: %v", err)
 	}
-	const wantHex = "a1fca2a840e7af01a89476290db8ba22868a8ca189c156fa0aae2bb41b97b127"
+	const wantHex = "8f7afb7c7a8d547f19c8174ba8975f3aef7cd6d951b3e575cba7898791860c94"
 	if got := hex.EncodeToString(digest[:]); got != wantHex {
 		t.Fatalf("request digest = %s", got)
 	}
@@ -692,8 +761,10 @@ func TestOwnerAllocatorRetainedHoleMetadataIsStrictlyBounded(t *testing.T) {
 
 func TestOwnerAllocatorModelHasNoCallerDigestPageRPCOrRuntimeState(t *testing.T) {
 	requestType := reflect.TypeOf(OwnerReserveRequest{})
-	if _, exists := requestType.FieldByName("RequestSHA256"); exists {
-		t.Fatalf("request must not trust a caller-provided RequestSHA256")
+	for _, forbidden := range []string{"RequestSHA256", "ReservationTransactionSequence"} {
+		if _, exists := requestType.FieldByName(forbidden); exists {
+			t.Fatalf("request must not trust a caller-provided %s", forbidden)
+		}
 	}
 	for _, value := range []interface{}{
 		OwnerReserveRequest{},
