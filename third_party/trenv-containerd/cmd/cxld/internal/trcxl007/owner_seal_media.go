@@ -12,10 +12,10 @@ import (
 )
 
 var (
-	// ErrInvalidOwnerSealMedia identifies an invalid COMMITTING Owner shape or
-	// invalid bytes recovered from the two bootstrap control objects. It is not
-	// an operational content-source error and this read-only operation performs
-	// no descriptor, allocator, Owner-state, payload, or Sync mutation.
+	// ErrInvalidOwnerSealMedia identifies an invalid COMMITTING/COMMITTED Owner
+	// shape or invalid bytes recovered from the two bootstrap control objects.
+	// It is not an operational content-source error and this read-only operation
+	// performs no descriptor, allocator, Owner-state, payload, or Sync mutation.
 	ErrInvalidOwnerSealMedia = errors.New(
 		"invalid TRCXL007 Owner seal recovery media")
 
@@ -198,6 +198,11 @@ type ownerSealMediaBackingOrigin struct {
 	offset    uint64
 }
 
+type ownerSealMediaResultBuilder func(
+	publicationEnvelope []byte,
+	initialPlacementEnvelope []byte,
+) error
+
 // LoadCommittingOwnerSealRecoveryPlanFromMedia reads only the Publication and
 // initial slot-A capacities needed to bootstrap one exact COMMITTING recovery.
 // It first maps and validates every clipped direct-DAX extent, copies exactly a
@@ -217,29 +222,106 @@ func LoadCommittingOwnerSealRecoveryPlanFromMedia(
 	allocationRecordID uint64,
 	source OwnerSealContentSource,
 ) (
-	result CommittingOwnerSealRecoveryPlan,
-	resultErr error,
+	CommittingOwnerSealRecoveryPlan,
+	error,
 ) {
-	if interfaceIsNil(ctx) {
-		return CommittingOwnerSealRecoveryPlan{}, ownerSealMediaSourceError(
-			"validate context", "", errors.New("nil context"))
-	}
-	if err := ctx.Err(); err != nil {
-		return CommittingOwnerSealRecoveryPlan{}, ownerSealMediaSourceError(
-			"check context before media planning", "", err)
-	}
-
-	mediaPlan, err := buildOwnerSealRecordMediaPlan(
-		committingState, allocationRecordID)
+	var recovery CommittingOwnerSealRecoveryPlan
+	err := loadOwnerSealPlanFromMedia(
+		ctx,
+		committingState,
+		allocationRecordID,
+		source,
+		OwnerAllocationCommitting,
+		"decode and join recovery envelopes",
+		func(publicationBytes, initialPlacementBytes []byte) error {
+			var buildErr error
+			recovery, buildErr = BuildCommittingOwnerSealRecoveryPlan(
+				committingState,
+				allocationRecordID,
+				publicationBytes,
+				initialPlacementBytes)
+			return buildErr
+		})
 	if err != nil {
 		return CommittingOwnerSealRecoveryPlan{}, err
 	}
+	return recovery, nil
+}
+
+// LoadCommittedOwnerSealReplayPlanFromMedia reads only the Publication and
+// initial slot-A capacities needed to bootstrap one exact terminal COMMITTED
+// replay candidate. It shares the same bounded direct-DAX observation and
+// all-view validation barrier as COMMITTING recovery, then delegates the
+// lifecycle/media join to BuildCommittedOwnerSealReplayPlan.
+//
+// The returned value contains only a detached compact plan and durable H
+// comparison scalar. This function does not create or accept an opaque seal,
+// authorize restore or publication, mutate Owner state or media, or claim any
+// hardware DML verification. A caller must still complete the separately
+// required reread and opaque-seal verification before relying on terminal
+// content.
+func LoadCommittedOwnerSealReplayPlanFromMedia(
+	ctx context.Context,
+	committedState OwnerStateSnapshot,
+	allocationRecordID uint64,
+	source OwnerSealContentSource,
+) (CommittedOwnerSealReplayPlan, error) {
+	var replay CommittedOwnerSealReplayPlan
+	err := loadOwnerSealPlanFromMedia(
+		ctx,
+		committedState,
+		allocationRecordID,
+		source,
+		OwnerAllocationCommitted,
+		"decode and join committed replay envelopes",
+		func(publicationBytes, initialPlacementBytes []byte) error {
+			var buildErr error
+			replay, buildErr = BuildCommittedOwnerSealReplayPlan(
+				committedState,
+				allocationRecordID,
+				publicationBytes,
+				initialPlacementBytes)
+			return buildErr
+		})
+	if err != nil {
+		return CommittedOwnerSealReplayPlan{}, err
+	}
+	return replay, nil
+}
+
+func loadOwnerSealPlanFromMedia(
+	ctx context.Context,
+	ownerState OwnerStateSnapshot,
+	allocationRecordID uint64,
+	source OwnerSealContentSource,
+	expectedState OwnerAllocationState,
+	builderOperation string,
+	builder ownerSealMediaResultBuilder,
+) (resultErr error) {
+	if interfaceIsNil(ctx) {
+		return ownerSealMediaSourceError(
+			"validate context", "", errors.New("nil context"))
+	}
+	if err := ctx.Err(); err != nil {
+		return ownerSealMediaSourceError(
+			"check context before media planning", "", err)
+	}
+	if builder == nil {
+		return ownerSealMediaInvalidError(
+			"validate media result builder", errors.New("nil result builder"))
+	}
+
+	mediaPlan, err := buildOwnerSealRecordMediaPlan(
+		ownerState, allocationRecordID, expectedState)
+	if err != nil {
+		return err
+	}
 	if interfaceIsNil(source) {
-		return CommittingOwnerSealRecoveryPlan{}, ownerSealMediaSourceError(
+		return ownerSealMediaSourceError(
 			"validate direct content source", "", errors.New("nil content source"))
 	}
 	if err := ctx.Err(); err != nil {
-		return CommittingOwnerSealRecoveryPlan{}, ownerSealMediaSourceError(
+		return ownerSealMediaSourceError(
 			"check context before opening direct content pass", "", err)
 	}
 
@@ -249,13 +331,12 @@ func LoadCommittingOwnerSealRecoveryPlanFromMedia(
 		primary := ownerSealMediaSourceError(
 			"open direct content pass", "", openErr)
 		if interfaceIsNil(pass) {
-			return CommittingOwnerSealRecoveryPlan{}, primary
+			return primary
 		}
-		return CommittingOwnerSealRecoveryPlan{}, ownerSealMediaAddCloseFailure(
-			primary, pass.Close())
+		return ownerSealMediaAddCloseFailure(primary, pass.Close())
 	}
 	if interfaceIsNil(pass) {
-		return CommittingOwnerSealRecoveryPlan{}, ownerSealMediaSourceError(
+		return ownerSealMediaSourceError(
 			"open direct content pass", "", errors.New("source returned a nil pass"))
 	}
 
@@ -266,14 +347,13 @@ func LoadCommittingOwnerSealRecoveryPlanFromMedia(
 		}
 		closed = true
 		if closeErr := pass.Close(); closeErr != nil {
-			result = CommittingOwnerSealRecoveryPlan{}
 			resultErr = ownerSealMediaAddCloseFailure(resultErr, closeErr)
 		}
 	}()
 
 	prepared, err := prepareOwnerSealMediaRuns(ctx, pass, mediaPlan)
 	if err != nil {
-		return CommittingOwnerSealRecoveryPlan{}, err
+		return err
 	}
 	publicationBytes, err := readOwnerSealMediaEnvelope(
 		ctx,
@@ -283,10 +363,10 @@ func LoadCommittingOwnerSealRecoveryPlanFromMedia(
 		cxlcheckpoint.PublicationV7EnvelopeHeaderBytes,
 		cxlcheckpoint.PublicationV7EnvelopeExactLengthFromHeader)
 	if err != nil {
-		return CommittingOwnerSealRecoveryPlan{}, err
+		return err
 	}
 	if err := ctx.Err(); err != nil {
-		return CommittingOwnerSealRecoveryPlan{}, ownerSealMediaSourceError(
+		return ownerSealMediaSourceError(
 			"check context between recovery envelopes", "", err)
 	}
 	initialPlacementBytes, err := readOwnerSealMediaEnvelope(
@@ -297,65 +377,65 @@ func LoadCommittingOwnerSealRecoveryPlanFromMedia(
 		cxlcheckpoint.ContentMappingEnvelopeHeaderBytes,
 		cxlcheckpoint.ContentPlacementMapEnvelopeExactLengthFromHeader)
 	if err != nil {
-		return CommittingOwnerSealRecoveryPlan{}, err
+		return err
 	}
 	if err := ctx.Err(); err != nil {
-		return CommittingOwnerSealRecoveryPlan{}, ownerSealMediaSourceError(
+		return ownerSealMediaSourceError(
 			"check context before recovery-plan decode", "", err)
 	}
 
-	recovery, err := BuildCommittingOwnerSealRecoveryPlan(
-		committingState,
-		allocationRecordID,
-		publicationBytes,
-		initialPlacementBytes)
-	if err != nil {
-		return CommittingOwnerSealRecoveryPlan{}, ownerSealMediaInvalidError(
-			"decode and join recovery envelopes", err)
+	if err := builder(publicationBytes, initialPlacementBytes); err != nil {
+		return ownerSealMediaInvalidError(builderOperation, err)
 	}
 	if err := ctx.Err(); err != nil {
-		return CommittingOwnerSealRecoveryPlan{}, ownerSealMediaSourceError(
+		return ownerSealMediaSourceError(
 			"check context after recovery-plan decode", "", err)
 	}
 
 	closeErr := pass.Close()
 	closed = true
 	if closeErr != nil {
-		return CommittingOwnerSealRecoveryPlan{}, ownerSealMediaAddCloseFailure(
-			nil, closeErr)
+		return ownerSealMediaAddCloseFailure(nil, closeErr)
 	}
 	if err := ctx.Err(); err != nil {
-		return CommittingOwnerSealRecoveryPlan{}, ownerSealMediaSourceError(
+		return ownerSealMediaSourceError(
 			"check context after closing direct content pass", "", err)
 	}
-	return recovery, nil
+	return nil
 }
 
 func buildOwnerSealRecordMediaPlan(
-	committingState OwnerStateSnapshot,
+	ownerState OwnerStateSnapshot,
 	allocationRecordID uint64,
+	expectedState OwnerAllocationState,
 ) (ownerSealRecordMediaPlan, error) {
-	owner := committingState.Clone()
+	stateName, validState := ownerSealMediaStateName(expectedState)
+	if !validState {
+		return ownerSealRecordMediaPlan{}, ownerSealMediaInvalidError(
+			"validate media lifecycle",
+			fmt.Errorf("unsupported allocation state %d", expectedState))
+	}
+	owner := ownerState.Clone()
 	if err := owner.Validate(); err != nil {
 		return ownerSealRecordMediaPlan{}, ownerSealMediaInvalidError(
-			"validate COMMITTING Owner state", err)
+			"validate "+stateName+" Owner state", err)
 	}
 	if allocationRecordID == 0 || allocationRecordID > cxlcheckpoint.MaxSignedLong {
 		return ownerSealRecordMediaPlan{}, ownerSealMediaInvalidError(
-			"select COMMITTING allocation",
+			"select "+stateName+" allocation",
 			fmt.Errorf("allocation record ID %d is outside 1..%d",
 				allocationRecordID, cxlcheckpoint.MaxSignedLong))
 	}
 	record, found := producerScatterRecordByID(owner.Records(), allocationRecordID)
-	if !found || record.State != OwnerAllocationCommitting {
+	if !found || record.State != expectedState {
 		state := OwnerAllocationState(0)
 		if found {
 			state = record.State
 		}
 		return ownerSealRecordMediaPlan{}, ownerSealMediaInvalidError(
-			"select COMMITTING allocation",
-			fmt.Errorf("allocation %d is absent or in state %d",
-				allocationRecordID, state))
+			"select "+stateName+" allocation",
+			fmt.Errorf("allocation %d is absent or in state %d, want %s",
+				allocationRecordID, state, stateName))
 	}
 
 	var objects [ownerSealMediaObjectCount]ownerSealMediaObject
@@ -782,6 +862,17 @@ func copyOwnerSealMediaObjectBytes(
 				object.objectID, copied, len(destination)))
 	}
 	return nil
+}
+
+func ownerSealMediaStateName(state OwnerAllocationState) (string, bool) {
+	switch state {
+	case OwnerAllocationCommitting:
+		return "COMMITTING", true
+	case OwnerAllocationCommitted:
+		return "COMMITTED", true
+	default:
+		return "", false
+	}
 }
 
 func ownerSealMediaInvalidError(operation string, cause error) error {

@@ -189,7 +189,8 @@ func TestOwnerSealMediaLoadsExactFragmentedTwoDAXControlObjects(t *testing.T) {
 	if !reflect.DeepEqual(recovery.Plan(), fixture.freshPlan) {
 		t.Fatal("closing and overwriting direct views changed the detached result")
 	}
-	mediaPlan, err := buildOwnerSealRecordMediaPlan(fixture.committing, 29)
+	mediaPlan, err := buildOwnerSealRecordMediaPlan(
+		fixture.committing, 29, OwnerAllocationCommitting)
 	if err != nil {
 		t.Fatalf("build compact media plan: %v", err)
 	}
@@ -217,7 +218,7 @@ func TestOwnerSealMediaCrossesPageAndDeviceBoundaries(t *testing.T) {
 	}
 	seenSlotDevices := make(map[string]bool)
 	for _, request := range source.pass.requests {
-		if request.startDataPageIndex == 154 || request.startDataPageIndex == 155 {
+		if request.startDataPageIndex == 156 || request.startDataPageIndex == 157 {
 			seenSlotDevices[request.binding.DeviceUUID] = true
 		}
 	}
@@ -271,6 +272,147 @@ func TestOwnerSealMediaSelectsOnlyRequestedCommittingRecord(t *testing.T) {
 	if !reflect.DeepEqual(recovery.Plan(), fixture.freshPlan) ||
 		recovery.ExpectedOwnerVerifiedSealSHA256() != fixture.freshSeal.SHA256() {
 		t.Fatal("neighbor records changed the requested media recovery")
+	}
+	if source.openCalls != 1 || len(source.pass.requests) != 3 {
+		t.Fatalf("open/view calls = %d/%d, want 1/3",
+			source.openCalls, len(source.pass.requests))
+	}
+}
+
+func TestCommittedOwnerSealMediaReplayLoadsFragmentedTwoDAXControlObjects(t *testing.T) {
+	fixture := newOwnerSealRecoveryTestFixture(t)
+	source := ownerSealMediaTestSourceForFixture(t, fixture)
+	source.mutateOpenInput = true
+	source.pass.overwriteOnClose = true
+
+	replay, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+		context.Background(), fixture.committed, 29, source)
+	if err != nil {
+		t.Fatalf("LoadCommittedOwnerSealReplayPlanFromMedia: %v", err)
+	}
+	if !reflect.DeepEqual(replay.Plan(), fixture.freshPlan) ||
+		replay.ExpectedOwnerVerifiedSealSHA256() != fixture.freshSeal.SHA256() {
+		t.Fatal("committed media replay differs from fresh plan or durable H")
+	}
+	if source.openCalls != 1 || source.pass.closeCalls != 1 {
+		t.Fatalf("open/close calls = %d/%d, want 1/1",
+			source.openCalls, source.pass.closeCalls)
+	}
+	if got := ownerSealMediaTestDeviceUUIDs(source.openDevices[0]); !reflect.DeepEqual(got, []string{"device-a", "device-b"}) {
+		t.Fatalf("opened devices = %v, want device-a/device-b", got)
+	}
+	wantRequests := []ownerSealMediaTestRequest{
+		{binding: source.expectedBindings["device-b"], startDataPageIndex: 50, pageCount: 4},
+		{binding: source.expectedBindings["device-b"], startDataPageIndex: 40, pageCount: 1},
+		{binding: source.expectedBindings["device-a"], startDataPageIndex: 40, pageCount: 1},
+	}
+	if !reflect.DeepEqual(source.pass.requests, wantRequests) {
+		t.Fatalf("committed direct-view requests = %#v, want %#v",
+			source.pass.requests, wantRequests)
+	}
+	if !reflect.DeepEqual(replay.Plan(), fixture.freshPlan) {
+		t.Fatal("closing and overwriting direct views changed committed replay")
+	}
+
+	functionType := reflect.TypeOf(LoadCommittedOwnerSealReplayPlanFromMedia)
+	wantInputs := []reflect.Type{
+		reflect.TypeOf((*context.Context)(nil)).Elem(),
+		reflect.TypeOf(OwnerStateSnapshot{}),
+		reflect.TypeOf(uint64(0)),
+		reflect.TypeOf((*OwnerSealContentSource)(nil)).Elem(),
+	}
+	if functionType.NumIn() != len(wantInputs) || functionType.NumOut() != 2 {
+		t.Fatalf("committed media loader signature = %d inputs/%d outputs, want 4/2",
+			functionType.NumIn(), functionType.NumOut())
+	}
+	for index := range wantInputs {
+		if functionType.In(index) != wantInputs[index] {
+			t.Fatalf("committed media loader input %d = %s, want %s",
+				index, functionType.In(index), wantInputs[index])
+		}
+	}
+	if functionType.Out(0) != reflect.TypeOf(CommittedOwnerSealReplayPlan{}) ||
+		functionType.Out(1) != reflect.TypeOf((*error)(nil)).Elem() {
+		t.Fatalf("committed media loader outputs = %s/%s",
+			functionType.Out(0), functionType.Out(1))
+	}
+}
+
+func TestCommittedOwnerSealMediaReplayCrossesPageAndDeviceBoundaries(t *testing.T) {
+	fixture := ownerSealMediaTestLargeFragmentedFixture(t)
+	if len(fixture.publicationBytes) <= ContentPageBytes ||
+		len(fixture.initialMapBytes) <= ContentPageBytes {
+		t.Fatalf("large publication/map lengths = %d/%d, want both over one page",
+			len(fixture.publicationBytes), len(fixture.initialMapBytes))
+	}
+	source := ownerSealMediaTestSourceForFixture(t, fixture)
+
+	replay, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+		context.Background(), fixture.committed, 29, source)
+	if err != nil {
+		t.Fatalf("large fragmented committed media replay: %v", err)
+	}
+	if !reflect.DeepEqual(replay.Plan(), fixture.freshPlan) {
+		t.Fatal("large fragmented committed replay differs from fresh plan")
+	}
+	publicationDevices := make(map[string]bool)
+	slotDevices := make(map[string]bool)
+	for _, request := range source.pass.requests {
+		switch request.startDataPageIndex {
+		case 156:
+			slotDevices[request.binding.DeviceUUID] = true
+		case 158, 159:
+			publicationDevices[request.binding.DeviceUUID] = true
+		}
+	}
+	if len(slotDevices) != 2 || len(publicationDevices) != 2 {
+		t.Fatalf("committed slot/publication views did not span both devices: %#v",
+			source.pass.requests)
+	}
+}
+
+func TestCommittedOwnerSealMediaReplayDoesNotOpenUnallocatedAnchor(t *testing.T) {
+	fixture := ownerSealMediaTestUnallocatedAnchorFixture(t)
+	source := ownerSealMediaTestSourceForFixture(t, fixture)
+
+	replay, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+		context.Background(), fixture.committed, 29, source)
+	if err != nil {
+		t.Fatalf("committed media replay with unallocated anchor: %v", err)
+	}
+	if !reflect.DeepEqual(replay.Plan(), fixture.freshPlan) ||
+		replay.Plan().AnchorDeviceUUID() != "device-c" {
+		t.Fatal("committed replay with unallocated anchor differs from fresh plan")
+	}
+	if got := ownerSealMediaTestDeviceUUIDs(source.openDevices[0]); !reflect.DeepEqual(got, []string{"device-a", "device-b"}) {
+		t.Fatalf("opened devices = %v, want only allocated device-a/device-b", got)
+	}
+}
+
+func TestCommittedOwnerSealMediaReplaySelectsMiddleRecordOnly(t *testing.T) {
+	fixture := newOwnerSealRecoveryTestFixture(t)
+	target := fixture.committed.Records()[0]
+	left := ownerSealRecoveryTestRejectedRecord(target, 28, 80, "committed-media-left")
+	right := ownerSealRecoveryTestRejectedRecord(target, 30, 90, "committed-media-right")
+	fixture.committed = ownerSealRecoveryTestRebuildOwner(
+		t,
+		fixture.committed,
+		nil,
+		[]OwnerStateAllocationRecord{left, target, right},
+		fixture.committed.SnapshotSequence,
+		31,
+		fixture.committed.NextOwnerTransactionSequence,
+	)
+	source := ownerSealMediaTestSourceForFixture(t, fixture)
+
+	replay, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+		context.Background(), fixture.committed, 29, source)
+	if err != nil {
+		t.Fatalf("middle-record committed media replay: %v", err)
+	}
+	if !reflect.DeepEqual(replay.Plan(), fixture.freshPlan) ||
+		replay.ExpectedOwnerVerifiedSealSHA256() != fixture.freshSeal.SHA256() {
+		t.Fatal("neighboring records changed committed media replay")
 	}
 	if source.openCalls != 1 || len(source.pass.requests) != 3 {
 		t.Fatalf("open/view calls = %d/%d, want 1/3",
@@ -408,6 +550,208 @@ func TestOwnerSealMediaSourceFailuresAreTypedAndAlwaysClose(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCommittedOwnerSealMediaReplayRejectsStateLifecycleHAndMedia(t *testing.T) {
+	fixture := newOwnerSealRecoveryTestFixture(t)
+	for _, allocationRecordID := range []uint64{0, cxlcheckpoint.MaxSignedLong + 1} {
+		t.Run(fmt.Sprintf("invalid allocation ID %d", allocationRecordID), func(t *testing.T) {
+			source := ownerSealMediaTestSourceForFixture(t, fixture)
+			_, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+				context.Background(), fixture.committed, allocationRecordID, source)
+			var readError *OwnerSealMediaReadError
+			operation := ""
+			if errors.As(err, &readError) {
+				operation = readError.Operation()
+			}
+			if readError == nil || !errors.Is(err, ErrInvalidOwnerSealMedia) ||
+				operation != "select COMMITTED allocation" || source.openCalls != 0 {
+				t.Fatalf("invalid-ID error/operation/open calls = %v/%q/%d",
+					err, operation, source.openCalls)
+			}
+		})
+	}
+	t.Run("wrong COMMITTING state", func(t *testing.T) {
+		source := ownerSealMediaTestSourceForFixture(t, fixture)
+		_, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+			context.Background(), fixture.committing, 29, source)
+		if !errors.Is(err, ErrInvalidOwnerSealMedia) ||
+			errors.Is(err, ErrOwnerSealContentSource) || source.openCalls != 0 {
+			t.Fatalf("wrong-state error/open calls = %v/%d", err, source.openCalls)
+		}
+	})
+	t.Run("absent target", func(t *testing.T) {
+		source := ownerSealMediaTestSourceForFixture(t, fixture)
+		_, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+			context.Background(), fixture.committed, 30, source)
+		if !errors.Is(err, ErrInvalidOwnerSealMedia) || source.openCalls != 0 {
+			t.Fatalf("absent-target error/open calls = %v/%d", err, source.openCalls)
+		}
+	})
+	t.Run("zero durable H", func(t *testing.T) {
+		committed := fixture.committed.Clone()
+		committed.records[0].OwnerVerifiedSealSHA256 = [sha256.Size]byte{}
+		source := ownerSealMediaTestSourceForFixture(t, fixture)
+		_, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+			context.Background(), committed, 29, source)
+		if !errors.Is(err, ErrInvalidOwnerSealMedia) || source.openCalls != 0 {
+			t.Fatalf("zero-H error/open calls = %v/%d", err, source.openCalls)
+		}
+	})
+	t.Run("nonzero substituted H still requires opaque seal", func(t *testing.T) {
+		committed := fixture.committed.Clone()
+		wrongH := sha256.Sum256([]byte("substituted-terminal-H"))
+		if wrongH == fixture.freshSeal.SHA256() {
+			t.Fatal("test H unexpectedly equals fresh seal")
+		}
+		committed.records[0].OwnerVerifiedSealSHA256 = wrongH
+		source := ownerSealMediaTestSourceForFixture(t, fixture)
+		replay, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+			context.Background(), committed, 29, source)
+		if err != nil {
+			t.Fatalf("candidate replay with substituted H: %v", err)
+		}
+		if replay.ExpectedOwnerVerifiedSealSHA256() != wrongH {
+			t.Fatal("candidate replay did not retain substituted durable H scalar")
+		}
+		if err := replay.VerifyRecomputedSeal(fixture.freshSeal); !errors.Is(err, ErrInvalidOwnerSealRecoveryPlan) {
+			t.Fatalf("substituted H opaque-seal verification error = %v", err)
+		}
+	})
+	t.Run("non-immediate terminal lifecycle", func(t *testing.T) {
+		committed := ownerSealRecoveryTestRebuildOwner(
+			t,
+			fixture.committed,
+			nil,
+			fixture.committed.Records(),
+			fixture.committed.SnapshotSequence,
+			fixture.committed.NextAllocationRecordID,
+			fixture.committed.NextOwnerTransactionSequence+1,
+		)
+		source := ownerSealMediaTestSourceForFixture(t, fixture)
+		_, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+			context.Background(), committed, 29, source)
+		if !errors.Is(err, ErrInvalidOwnerSealMedia) ||
+			!errors.Is(err, ErrInvalidOwnerSealRecoveryPlan) ||
+			errors.Is(err, ErrOwnerSealContentSource) {
+			t.Fatalf("terminal lifecycle classification = %v", err)
+		}
+		if source.openCalls != 1 || source.pass.closeCalls != 1 {
+			t.Fatalf("terminal lifecycle open/close calls = %d/%d, want 1/1",
+				source.openCalls, source.pass.closeCalls)
+		}
+	})
+
+	mediaTests := []struct {
+		name   string
+		kind   cxlcheckpoint.ContentKindV7
+		offset uint64
+	}{
+		{name: "publication payload", kind: cxlcheckpoint.ContentPublicationV7,
+			offset: cxlcheckpoint.PublicationV7EnvelopeHeaderBytes},
+		{name: "slot-A payload", kind: cxlcheckpoint.ContentPlacementSlotAV7,
+			offset: cxlcheckpoint.ContentMappingEnvelopeHeaderBytes},
+	}
+	for _, test := range mediaTests {
+		t.Run(test.name, func(t *testing.T) {
+			source := ownerSealMediaTestSourceForFixture(t, fixture)
+			ownerSealMediaTestFlipObjectByte(
+				t, source, fixture.freshPlan, test.kind, test.offset)
+			_, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+				context.Background(), fixture.committed, 29, source)
+			if !errors.Is(err, ErrInvalidOwnerSealMedia) ||
+				errors.Is(err, ErrOwnerSealContentSource) {
+				t.Fatalf("committed invalid-media classification = %v", err)
+			}
+			if source.pass.closeCalls != 1 {
+				t.Fatalf("committed invalid-media close calls = %d, want 1",
+					source.pass.closeCalls)
+			}
+		})
+	}
+}
+
+func TestCommittedOwnerSealMediaReplaySourcePrefixesAreTypedAndCloseOnce(t *testing.T) {
+	fixture := newOwnerSealRecoveryTestFixture(t)
+	openFailure := errors.New("committed visibility pass unavailable")
+	viewFailure := errors.New("committed control view unavailable")
+	closeFailure := errors.New("committed visibility pass close failed")
+
+	t.Run("typed nil context", func(t *testing.T) {
+		var ctx *producerScatterTestNilContext
+		source := ownerSealMediaTestSourceForFixture(t, fixture)
+		_, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+			ctx, fixture.committed, 29, source)
+		if !errors.Is(err, ErrOwnerSealContentSource) || source.openCalls != 0 {
+			t.Fatalf("typed-nil context error/open calls = %v/%d", err, source.openCalls)
+		}
+	})
+	t.Run("typed nil source", func(t *testing.T) {
+		var source *ownerSealMediaTestSource
+		_, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+			context.Background(), fixture.committed, 29, source)
+		if !errors.Is(err, ErrOwnerSealContentSource) {
+			t.Fatalf("typed-nil source error = %v", err)
+		}
+	})
+	t.Run("open error without pass", func(t *testing.T) {
+		source := ownerSealMediaTestSourceForFixture(t, fixture)
+		source.openError = openFailure
+		_, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+			context.Background(), fixture.committed, 29, source)
+		if !errors.Is(err, ErrOwnerSealContentSource) || !errors.Is(err, openFailure) ||
+			source.pass.closeCalls != 0 {
+			t.Fatalf("open failure/close calls = %v/%d", err, source.pass.closeCalls)
+		}
+	})
+	t.Run("open error with partial pass and close error", func(t *testing.T) {
+		source := ownerSealMediaTestSourceForFixture(t, fixture)
+		source.openError = openFailure
+		source.returnPassOnError = true
+		source.pass.closeError = closeFailure
+		_, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+			context.Background(), fixture.committed, 29, source)
+		var readError *OwnerSealMediaReadError
+		if !errors.As(err, &readError) || !errors.Is(err, openFailure) ||
+			!errors.Is(err, closeFailure) || readError.CloseError() != closeFailure ||
+			source.pass.closeCalls != 1 {
+			t.Fatalf("partial-open error/close calls = %v/%d", err, source.pass.closeCalls)
+		}
+	})
+	t.Run("typed nil pass", func(t *testing.T) {
+		source := ownerSealMediaTestSourceForFixture(t, fixture)
+		source.returnTypedNil = true
+		_, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+			context.Background(), fixture.committed, 29, source)
+		if !errors.Is(err, ErrOwnerSealContentSource) || source.openCalls != 1 {
+			t.Fatalf("typed-nil pass error/open calls = %v/%d", err, source.openCalls)
+		}
+	})
+	t.Run("view error", func(t *testing.T) {
+		source := ownerSealMediaTestSourceForFixture(t, fixture)
+		source.pass.viewErrorCall = 3
+		source.pass.viewError = viewFailure
+		replay, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+			context.Background(), fixture.committed, 29, source)
+		if !errors.Is(err, ErrOwnerSealContentSource) || !errors.Is(err, viewFailure) ||
+			!reflect.DeepEqual(replay, CommittedOwnerSealReplayPlan{}) ||
+			source.pass.closeCalls != 1 {
+			t.Fatalf("view failure/result/close = %v/%#v/%d",
+				err, replay, source.pass.closeCalls)
+		}
+	})
+	t.Run("successful parse but close error", func(t *testing.T) {
+		source := ownerSealMediaTestSourceForFixture(t, fixture)
+		source.pass.closeError = closeFailure
+		replay, err := LoadCommittedOwnerSealReplayPlanFromMedia(
+			context.Background(), fixture.committed, 29, source)
+		if !errors.Is(err, ErrOwnerSealContentSource) || !errors.Is(err, closeFailure) ||
+			!reflect.DeepEqual(replay, CommittedOwnerSealReplayPlan{}) ||
+			source.pass.closeCalls != 1 {
+			t.Fatalf("close failure/result/calls = %v/%#v/%d",
+				err, replay, source.pass.closeCalls)
+		}
+	})
 }
 
 func TestOwnerSealMediaErrorPrecedenceRetainsPrimaryAndCloseFailure(t *testing.T) {
@@ -580,7 +924,8 @@ func TestOwnerSealMediaInvalidBytesAreNotOperationalSourceFailures(t *testing.T)
 func TestOwnerSealMediaHeaderDiscoveryIsCapacityBoundAndStable(t *testing.T) {
 	fixture := newOwnerSealRecoveryTestFixture(t)
 	source := ownerSealMediaTestSourceForFixture(t, fixture)
-	mediaPlan, err := buildOwnerSealRecordMediaPlan(fixture.committing, 29)
+	mediaPlan, err := buildOwnerSealRecordMediaPlan(
+		fixture.committing, 29, OwnerAllocationCommitting)
 	if err != nil {
 		t.Fatalf("build compact media plan: %v", err)
 	}
@@ -810,10 +1155,10 @@ func ownerSealMediaTestUnallocatedAnchorFixture(t *testing.T) ownerSealRecoveryT
 
 func ownerSealMediaTestLargeFragmentedFixture(t *testing.T) ownerSealRecoveryTestFixture {
 	t.Helper()
-	const restorePages = uint64(100)
+	const restorePages = uint64(104)
 	initialBase := producerScatterTestInitialPlan(t)
 	publication := ownerSealRecoveryTestClonePublication(initialBase.Publication)
-	publication.InitialAllocation.TotalPages = 116
+	publication.InitialAllocation.TotalPages = 5 + restorePages + 11
 	publication.InitialAllocation.Devices = []cxlcheckpoint.AllocationDeviceV7{
 		{DeviceUUID: "device-a", DataPageCount: 1000},
 		{DeviceUUID: "device-b", DataPageCount: 1000},
@@ -830,7 +1175,16 @@ func ownerSealMediaTestLargeFragmentedFixture(t *testing.T) ownerSealRecoveryTes
 	}
 	publication.Objects[2].ImmutableByteLength = restorePages * uint64(ContentPageBytes)
 	publication.Objects[2].CapacityPages = restorePages
-	logicalStarts := []uint64{0, 3, 5, 105, 106, 107, 108, 110, 112}
+	controlStart := uint64(5) + restorePages
+	logicalStarts := []uint64{
+		0, 3, 5,
+		controlStart,
+		controlStart + 1,
+		controlStart + 2,
+		controlStart + 3,
+		controlStart + 5,
+		controlStart + 7,
+	}
 	for index := range publication.Objects {
 		publication.Objects[index].LogicalPageStart = logicalStarts[index]
 	}
