@@ -10,29 +10,32 @@ import (
 )
 
 func TestDeviceGeometryTwoGiBHasOneDescriptorAndBitmapBitPerPage(t *testing.T) {
-	geometry, err := CalculateDeviceGeometry(2<<30, 128<<10)
+	geometry, err := CalculateDeviceGeometry(2<<30, 128<<10, 128<<10)
 	if err != nil {
 		t.Fatalf("calculate geometry: %v", err)
 	}
 	if err := geometry.Validate(); err != nil {
 		t.Fatalf("validate geometry: %v", err)
 	}
-	if geometry.DataPageCount != 516157 {
-		t.Fatalf("data page count = %d, expected 516157", geometry.DataPageCount)
+	if geometry.DataPageCount != 516094 {
+		t.Fatalf("data page count = %d, expected 516094", geometry.DataPageCount)
 	}
 	want := DeviceGeometry{
-		DeviceBytes:                2147483648,
-		SuperblockAOffset:          0,
-		SuperblockBOffset:          4096,
-		AllocatorSnapshotAOffset:   8192,
-		AllocatorSnapshotBOffset:   139264,
-		AllocatorSnapshotSlotBytes: 131072,
-		ControlRegionBytes:         270336,
-		DescriptorRegionBase:       270336,
-		DescriptorRegionBytes:      33034048,
-		ContentRegionBase:          33304576,
-		ContentRegionBytes:         2114179072,
-		DataPageCount:              516157,
+		DeviceBytes:                 2147483648,
+		SuperblockAOffset:           0,
+		SuperblockBOffset:           4096,
+		AllocatorSnapshotAOffset:    8192,
+		AllocatorSnapshotBOffset:    139264,
+		AllocatorSnapshotSlotBytes:  131072,
+		OwnerStateSnapshotAOffset:   270336,
+		OwnerStateSnapshotBOffset:   401408,
+		OwnerStateSnapshotSlotBytes: 131072,
+		ControlRegionBytes:          532480,
+		DescriptorRegionBase:        532480,
+		DescriptorRegionBytes:       33030016,
+		ContentRegionBase:           33562624,
+		ContentRegionBytes:          2113921024,
+		DataPageCount:               516094,
 	}
 	if geometry != want {
 		t.Fatalf("2 GiB geometry = %#v, expected %#v", geometry, want)
@@ -47,8 +50,8 @@ func TestDeviceGeometryTwoGiBHasOneDescriptorAndBitmapBitPerPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bitmap bytes: %v", err)
 	}
-	if bitmapBytes != 64520 {
-		t.Fatalf("bitmap bytes = %d, expected 64520", bitmapBytes)
+	if bitmapBytes != 64512 {
+		t.Fatalf("bitmap bytes = %d, expected 64512", bitmapBytes)
 	}
 	if AllocatorSnapshotFixedBytes+bitmapBytes > geometry.AllocatorSnapshotSlotBytes {
 		t.Fatal("bitmap does not fit either allocator snapshot slot")
@@ -61,7 +64,7 @@ func TestDeviceGeometryTwoGiBHasOneDescriptorAndBitmapBitPerPage(t *testing.T) {
 }
 
 func TestDeviceGeometryAddressCalculationIsOneToOne(t *testing.T) {
-	geometry, err := CalculateDeviceGeometry(2<<30, 128<<10)
+	geometry, err := CalculateDeviceGeometry(2<<30, 128<<10, 128<<10)
 	if err != nil {
 		t.Fatalf("calculate geometry: %v", err)
 	}
@@ -102,7 +105,7 @@ func TestDeviceGeometryAddressCalculationIsOneToOne(t *testing.T) {
 
 func TestDeviceGeometryUsesBitmapCapacityAsARealBound(t *testing.T) {
 	const deviceBytes = uint64(128 << 20)
-	geometry, err := CalculateDeviceGeometry(deviceBytes, 4096)
+	geometry, err := CalculateDeviceGeometry(deviceBytes, 4096, 4096)
 	if err != nil {
 		t.Fatalf("calculate bitmap-limited geometry: %v", err)
 	}
@@ -126,22 +129,31 @@ func TestDeviceGeometryUsesBitmapCapacityAsARealBound(t *testing.T) {
 }
 
 func TestDeviceGeometryRejectsAlternateAndInvalidLayouts(t *testing.T) {
-	for name, inputs := range map[string][2]uint64{
-		"zero-device":    {0, 4096},
-		"signed-device":  {cxlcheckpoint.MaxSignedLong + 1, 4096},
-		"small-slot":     {2 << 30, 2048},
-		"unaligned-slot": {2 << 30, 4097},
-		"oversized-slot": {2 << 30, MaxAllocatorSnapshotSlotBytes + 4096},
-		"control-only":   {SuperblockSlotBytes*2 + 4096*2, 4096},
+	for name, inputs := range map[string][3]uint64{
+		"zero-device":                {0, 4096, 4096},
+		"signed-device":              {cxlcheckpoint.MaxSignedLong + 1, 4096, 4096},
+		"small-allocator-slot":       {2 << 30, 2048, 4096},
+		"unaligned-allocator-slot":   {2 << 30, 4097, 4096},
+		"oversized-allocator-slot":   {2 << 30, MaxAllocatorSnapshotSlotBytes + 4096, 4096},
+		"small-owner-state-slot":     {2 << 30, 4096, 2048},
+		"unaligned-owner-state-slot": {2 << 30, 4096, 4097},
+		"oversized-owner-state-slot": {2 << 30, 4096, MaxOwnerStateSnapshotSlotBytes + 4096},
+		"control-only": {
+			SuperblockSlotBytes*SuperblockSlotCount +
+				4096*AllocatorSnapshotSlotCount +
+				4096*OwnerStateSnapshotSlotCount,
+			4096,
+			4096,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := CalculateDeviceGeometry(inputs[0], inputs[1]); err == nil {
+			if _, err := CalculateDeviceGeometry(inputs[0], inputs[1], inputs[2]); err == nil {
 				t.Fatal("invalid geometry inputs succeeded")
 			}
 		})
 	}
 
-	geometry, err := CalculateDeviceGeometry(2<<30, 128<<10)
+	geometry, err := CalculateDeviceGeometry(2<<30, 128<<10, 128<<10)
 	if err != nil {
 		t.Fatalf("calculate geometry: %v", err)
 	}
@@ -154,7 +166,7 @@ func TestDeviceGeometryRejectsAlternateAndInvalidLayouts(t *testing.T) {
 }
 
 func TestDeviceGeometryHasNoArtifactPool(t *testing.T) {
-	geometry, err := CalculateDeviceGeometry(2<<30, 128<<10)
+	geometry, err := CalculateDeviceGeometry(2<<30, 128<<10, 128<<10)
 	if err != nil {
 		t.Fatalf("calculate geometry: %v", err)
 	}
@@ -175,6 +187,9 @@ func TestDeviceGeometryHasNoArtifactPool(t *testing.T) {
 		"AllocatorSnapshotAOffset",
 		"AllocatorSnapshotBOffset",
 		"AllocatorSnapshotSlotBytes",
+		"OwnerStateSnapshotAOffset",
+		"OwnerStateSnapshotBOffset",
+		"OwnerStateSnapshotSlotBytes",
 		"ControlRegionBytes",
 		"DescriptorRegionBase",
 		"DescriptorRegionBytes",

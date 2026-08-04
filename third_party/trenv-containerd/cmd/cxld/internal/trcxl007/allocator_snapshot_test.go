@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	allocatorSnapshotKnownHeaderHex   = "5452414c433030370700000040000000616c6c6f636174696f6e2d6269746d61702d7631000000009f000000000000008516be3300000000e1d5a35200000000"
-	allocatorSnapshotKnownEnvelopeHex = "5452414c433030370700000040000000616c6c6f636174696f6e2d6269746d61702d7631000000009f000000000000008516be3300000000e1d5a352000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf0b000000000000000c000000000000000d000000000000000e000000000000000f00000000000000f80000000000000006000000000000001f0000000000000083010000000000800000000000000000000000000000000000000000000080"
-	allocatorSnapshotKnownSHA256      = "a144c14f7e5c15a7ef75931dc6956a8af21e72f2880570fcb7153f0a5377f0f9"
+	allocatorSnapshotKnownHeaderHex   = "5452414c433030370700000040000000616c6c6f636174696f6e2d6269746d61702d7631000000008f00000000000000083a74ef0000000079a8b73800000000"
+	allocatorSnapshotKnownEnvelopeHex = "5452414c433030370700000040000000616c6c6f636174696f6e2d6269746d61702d7631000000008f00000000000000083a74ef0000000079a8b738000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf0b000000000000000c000000000000000e00000000000000f60000000000000006000000000000001f0000000000000083010000000000800000000000000000000000000000000000000000000020"
+	allocatorSnapshotKnownSHA256      = "f69ad068b4aacf8a0355eca111e0f1d8821052bed07aa485071214cbb60f91a7"
 )
 
 func TestAllocatorSnapshotKnownAnswerAndRoundTrip(t *testing.T) {
@@ -25,8 +25,8 @@ func TestAllocatorSnapshotKnownAnswerAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("canonical bytes: %v", err)
 	}
-	if len(wire) != 223 {
-		t.Fatalf("known envelope length = %d, expected 223", len(wire))
+	if len(wire) != 207 {
+		t.Fatalf("known envelope length = %d, expected 207", len(wire))
 	}
 	if got := hex.EncodeToString(wire[:AllocatorSnapshotEnvelopeHeaderBytes]); got != allocatorSnapshotKnownHeaderHex {
 		t.Fatalf("known header hex = %s", got)
@@ -48,7 +48,7 @@ func TestAllocatorSnapshotKnownAnswerAndRoundTrip(t *testing.T) {
 	if !bytes.Equal(wire[16:40], wantDomain[:]) {
 		t.Fatalf("known domain field = %x", wire[16:40])
 	}
-	if binary.LittleEndian.Uint64(wire[40:48]) != 159 ||
+	if binary.LittleEndian.Uint64(wire[40:48]) != 143 ||
 		binary.LittleEndian.Uint32(wire[52:56]) != 0 ||
 		!allocatorSnapshotAllZero(wire[60:64]) {
 		t.Fatalf("known header length/flags/reserved = %x", wire[40:64])
@@ -69,12 +69,12 @@ func TestAllocatorSnapshotKnownAnswerAndRoundTrip(t *testing.T) {
 	if err := parsed.CrossCheck(
 		geometry,
 		snapshot.DeviceBindingSHA256,
-		snapshot.OwnerIdentitySHA256,
+		snapshot.OwnerGroupIdentitySHA256,
 		snapshot.OwnerEpoch); err != nil {
 		t.Fatalf("cross-check known answer: %v", err)
 	}
 	allocatorSnapshotRequireEqual(t, parsed, snapshot)
-	for _, index := range []uint64{0, 1, 7, 8, 63, 247} {
+	for _, index := range []uint64{0, 1, 7, 8, 63, 245} {
 		unavailable, err := parsed.PageUnavailable(index)
 		if err != nil || !unavailable {
 			t.Fatalf("known allocated page %d = %v, %v", index, unavailable, err)
@@ -89,7 +89,7 @@ func TestAllocatorSnapshotKnownAnswerAndRoundTrip(t *testing.T) {
 }
 
 func TestAllocatorSnapshotEmptyAndTwoGiBFixture(t *testing.T) {
-	geometry, err := CalculateDeviceGeometry(2<<30, 128<<10)
+	geometry, err := CalculateDeviceGeometry(2<<30, 128<<10, 128<<10)
 	if err != nil {
 		t.Fatalf("2 GiB geometry: %v", err)
 	}
@@ -97,8 +97,8 @@ func TestAllocatorSnapshotEmptyAndTwoGiBFixture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("2 GiB bitmap length: %v", err)
 	}
-	if bitmapBytes != 64520 {
-		t.Fatalf("2 GiB bitmap length = %d, expected 64520", bitmapBytes)
+	if bitmapBytes != 64512 {
+		t.Fatalf("2 GiB bitmap length = %d, expected 64512", bitmapBytes)
 	}
 	config := allocatorSnapshotTestConfig(geometry.DataPageCount)
 	snapshot, err := NewAllocatorSnapshot(config, make([]byte, int(bitmapBytes)))
@@ -123,11 +123,11 @@ func TestAllocatorSnapshotEmptyAndTwoGiBFixture(t *testing.T) {
 }
 
 func TestAllocatorSnapshotRejectsUnusedHighBitsAndPopcountMismatch(t *testing.T) {
-	geometry, err := CalculateDeviceGeometry(2<<20, 4096)
+	geometry, err := CalculateDeviceGeometry(2<<20, 4096, 4096)
 	if err != nil {
 		t.Fatalf("geometry: %v", err)
 	}
-	if geometry.DataPageCount != 500 || geometry.DataPageCount%8 != 4 {
+	if geometry.DataPageCount != 498 || geometry.DataPageCount%8 != 2 {
 		t.Fatalf("test geometry page count = %d", geometry.DataPageCount)
 	}
 	bitmapBytes, err := geometry.AllocationBitmapBytes()
@@ -165,7 +165,7 @@ func TestAllocatorSnapshotCrossCheckRejectsSubstitution(t *testing.T) {
 	if err := snapshot.CrossCheck(
 		geometry,
 		snapshot.DeviceBindingSHA256,
-		snapshot.OwnerIdentitySHA256,
+		snapshot.OwnerGroupIdentitySHA256,
 		snapshot.OwnerEpoch); err != nil {
 		t.Fatalf("baseline cross-check: %v", err)
 	}
@@ -175,11 +175,11 @@ func TestAllocatorSnapshotCrossCheckRejectsSubstitution(t *testing.T) {
 	if err := snapshot.CrossCheck(
 		geometry,
 		wrongDevice,
-		snapshot.OwnerIdentitySHA256,
+		snapshot.OwnerGroupIdentitySHA256,
 		snapshot.OwnerEpoch); !errors.Is(err, ErrAllocatorSnapshotMismatch) {
 		t.Fatalf("device substitution error = %v", err)
 	}
-	wrongOwner := snapshot.OwnerIdentitySHA256
+	wrongOwner := snapshot.OwnerGroupIdentitySHA256
 	wrongOwner[0] ^= 0xff
 	if err := snapshot.CrossCheck(
 		geometry,
@@ -191,18 +191,18 @@ func TestAllocatorSnapshotCrossCheckRejectsSubstitution(t *testing.T) {
 	if err := snapshot.CrossCheck(
 		geometry,
 		snapshot.DeviceBindingSHA256,
-		snapshot.OwnerIdentitySHA256,
+		snapshot.OwnerGroupIdentitySHA256,
 		snapshot.OwnerEpoch+1); !errors.Is(err, ErrAllocatorSnapshotMismatch) {
 		t.Fatalf("epoch substitution error = %v", err)
 	}
-	otherGeometry, err := CalculateDeviceGeometry(2<<20, 4096)
+	otherGeometry, err := CalculateDeviceGeometry(2<<20, 4096, 4096)
 	if err != nil {
 		t.Fatalf("other geometry: %v", err)
 	}
 	if err := snapshot.CrossCheck(
 		otherGeometry,
 		snapshot.DeviceBindingSHA256,
-		snapshot.OwnerIdentitySHA256,
+		snapshot.OwnerGroupIdentitySHA256,
 		snapshot.OwnerEpoch); !errors.Is(err, ErrAllocatorSnapshotMismatch) {
 		t.Fatalf("geometry substitution error = %v", err)
 	}
@@ -271,9 +271,8 @@ func TestAllocatorSnapshotEnvelopeCorruptionAndCompleteness(t *testing.T) {
 	}{
 		{"Owner epoch", allocatorSnapshotOwnerEpochOffset},
 		{"snapshot sequence", allocatorSnapshotSequenceOffset},
-		{"next allocation ID", allocatorSnapshotNextAllocationOffset},
-		{"next transaction seq", allocatorSnapshotNextTransactionOffset},
-		{"Owner journal sequence", allocatorSnapshotOwnerJournalOffset},
+		{"applied Owner transaction sequence", allocatorSnapshotAppliedTransactionOffset},
+		{"data-page count", allocatorSnapshotDataPageCountOffset},
 	} {
 		t.Run(test.name+" signed overflow", func(t *testing.T) {
 			overflow := append([]byte(nil), wire...)
@@ -303,16 +302,12 @@ func TestAllocatorSnapshotSignedBoundsAndLogicalMutations(t *testing.T) {
 		mutate func(*AllocatorSnapshotConfig)
 	}{
 		{"zero-device-digest", func(c *AllocatorSnapshotConfig) { c.DeviceBindingSHA256 = [sha256.Size]byte{} }},
-		{"zero-owner-digest", func(c *AllocatorSnapshotConfig) { c.OwnerIdentitySHA256 = [sha256.Size]byte{} }},
+		{"zero-owner-group-digest", func(c *AllocatorSnapshotConfig) { c.OwnerGroupIdentitySHA256 = [sha256.Size]byte{} }},
 		{"zero-owner-epoch", func(c *AllocatorSnapshotConfig) { c.OwnerEpoch = 0 }},
 		{"large-owner-epoch", func(c *AllocatorSnapshotConfig) { c.OwnerEpoch = cxlcheckpoint.MaxSignedLong + 1 }},
 		{"zero-snapshot-sequence", func(c *AllocatorSnapshotConfig) { c.SnapshotSequence = 0 }},
 		{"large-snapshot-sequence", func(c *AllocatorSnapshotConfig) { c.SnapshotSequence = cxlcheckpoint.MaxSignedLong + 1 }},
-		{"zero-next-allocation", func(c *AllocatorSnapshotConfig) { c.NextAllocationRecordID = 0 }},
-		{"large-next-allocation", func(c *AllocatorSnapshotConfig) { c.NextAllocationRecordID = cxlcheckpoint.MaxSignedLong + 1 }},
-		{"zero-next-transaction", func(c *AllocatorSnapshotConfig) { c.NextOwnerTransactionSeq = 0 }},
-		{"large-next-transaction", func(c *AllocatorSnapshotConfig) { c.NextOwnerTransactionSeq = cxlcheckpoint.MaxSignedLong + 1 }},
-		{"large-journal-sequence", func(c *AllocatorSnapshotConfig) { c.OwnerJournalSequence = cxlcheckpoint.MaxSignedLong + 1 }},
+		{"large-applied-transaction", func(c *AllocatorSnapshotConfig) { c.AppliedOwnerTransactionSequence = cxlcheckpoint.MaxSignedLong + 1 }},
 		{"zero-data-pages", func(c *AllocatorSnapshotConfig) { c.DataPageCount = 0 }},
 		{"large-data-pages", func(c *AllocatorSnapshotConfig) { c.DataPageCount = cxlcheckpoint.MaxSignedLong + 1 }},
 	}
@@ -329,16 +324,14 @@ func TestAllocatorSnapshotSignedBoundsAndLogicalMutations(t *testing.T) {
 	maxConfig := config
 	maxConfig.OwnerEpoch = cxlcheckpoint.MaxSignedLong
 	maxConfig.SnapshotSequence = cxlcheckpoint.MaxSignedLong
-	maxConfig.NextAllocationRecordID = cxlcheckpoint.MaxSignedLong
-	maxConfig.NextOwnerTransactionSeq = cxlcheckpoint.MaxSignedLong
-	maxConfig.OwnerJournalSequence = cxlcheckpoint.MaxSignedLong
+	maxConfig.AppliedOwnerTransactionSequence = cxlcheckpoint.MaxSignedLong
 	if _, err := NewAllocatorSnapshot(maxConfig, bitmap); err != nil {
 		t.Fatalf("inclusive signed maximum rejected: %v", err)
 	}
-	zeroJournal := config
-	zeroJournal.OwnerJournalSequence = 0
-	if _, err := NewAllocatorSnapshot(zeroJournal, bitmap); err != nil {
-		t.Fatalf("zero journal sequence rejected: %v", err)
+	genesis := config
+	genesis.AppliedOwnerTransactionSequence = 0
+	if _, err := NewAllocatorSnapshot(genesis, bitmap); err != nil {
+		t.Fatalf("zero applied transaction sequence rejected for genesis: %v", err)
 	}
 
 	badAllocated := snapshot.Clone()
@@ -441,22 +434,20 @@ func TestAllocatorSnapshotCallerMutationDoesNotAlias(t *testing.T) {
 	}
 }
 
-func TestAllocatorSnapshotHasNoGenerationCheckpointRecordPathOrRuntimeState(t *testing.T) {
+func TestAllocatorSnapshotIsDeviceLocalAndHasNoGroupGlobalRecordsOrRuntimeState(t *testing.T) {
 	wantSnapshotFields := []string{
 		"DeviceBindingSHA256",
-		"OwnerIdentitySHA256",
+		"OwnerGroupIdentitySHA256",
 		"OwnerEpoch",
 		"SnapshotSequence",
-		"NextAllocationRecordID",
-		"NextOwnerTransactionSeq",
-		"OwnerJournalSequence",
+		"AppliedOwnerTransactionSequence",
 		"DataPageCount",
 		"AllocatedPageCount",
 		"BitmapByteLength",
 		"allocationBitmap",
 	}
 	allocatorSnapshotRequireExactFields(t, reflect.TypeOf(AllocatorSnapshot{}), wantSnapshotFields)
-	wantConfigFields := wantSnapshotFields[:8]
+	wantConfigFields := wantSnapshotFields[:6]
 	allocatorSnapshotRequireExactFields(t, reflect.TypeOf(AllocatorSnapshotConfig{}), wantConfigFields)
 	for _, target := range []reflect.Type{
 		reflect.TypeOf(AllocatorSnapshot{}),
@@ -467,6 +458,7 @@ func TestAllocatorSnapshotHasNoGenerationCheckpointRecordPathOrRuntimeState(t *t
 			name := strings.ToLower(target.Field(index).Name)
 			for _, forbidden := range []string{
 				"generation", "checkpointid", "checkpointrecords", "path", "route", "runtime", "slotselection",
+				"nextallocation", "nexttransaction", "journal", "quarantin",
 			} {
 				if strings.Contains(name, forbidden) {
 					t.Fatalf("%s contains forbidden field %q", target.Name(), target.Field(index).Name)
@@ -483,12 +475,12 @@ func allocatorSnapshotKnownFixture(
 	t *testing.T,
 ) (DeviceGeometry, AllocatorSnapshot, AllocatorSnapshotConfig, []byte) {
 	t.Helper()
-	geometry, err := CalculateDeviceGeometry(1<<20, 4096)
+	geometry, err := CalculateDeviceGeometry(1<<20, 4096, 4096)
 	if err != nil {
 		t.Fatalf("known geometry: %v", err)
 	}
-	if geometry.DataPageCount != 248 {
-		t.Fatalf("known page count = %d, expected 248", geometry.DataPageCount)
+	if geometry.DataPageCount != 246 {
+		t.Fatalf("known page count = %d, expected 246", geometry.DataPageCount)
 	}
 	config := allocatorSnapshotTestConfig(geometry.DataPageCount)
 	bitmapBytes, err := geometry.AllocationBitmapBytes()
@@ -496,7 +488,7 @@ func allocatorSnapshotKnownFixture(
 		t.Fatalf("known bitmap length: %v", err)
 	}
 	bitmap := make([]byte, int(bitmapBytes))
-	for _, page := range []uint64{0, 1, 7, 8, 63, 247} {
+	for _, page := range []uint64{0, 1, 7, 8, 63, 245} {
 		allocatorSnapshotTestSetBit(bitmap, page)
 	}
 	snapshot, err := NewAllocatorSnapshot(config, bitmap)
@@ -514,14 +506,12 @@ func allocatorSnapshotTestConfig(dataPageCount uint64) AllocatorSnapshotConfig {
 		ownerDigest[index] = byte(0xa0 + index)
 	}
 	return AllocatorSnapshotConfig{
-		DeviceBindingSHA256:     deviceDigest,
-		OwnerIdentitySHA256:     ownerDigest,
-		OwnerEpoch:              11,
-		SnapshotSequence:        12,
-		NextAllocationRecordID:  13,
-		NextOwnerTransactionSeq: 14,
-		OwnerJournalSequence:    15,
-		DataPageCount:           dataPageCount,
+		DeviceBindingSHA256:             deviceDigest,
+		OwnerGroupIdentitySHA256:        ownerDigest,
+		OwnerEpoch:                      11,
+		SnapshotSequence:                12,
+		AppliedOwnerTransactionSequence: 14,
+		DataPageCount:                   dataPageCount,
 	}
 }
 

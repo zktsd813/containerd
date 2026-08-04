@@ -22,12 +22,19 @@ const (
 	MinAllocatorSnapshotSlotBytes        = uint64(4096)
 	MaxAllocatorSnapshotSlotBytes        = uint64(64 << 20)
 
+	// OwnerStateSnapshotSlotCount is deliberately two. Each slot holds a
+	// complete Owner-group state snapshot, not an append-only log. Group-global
+	// next IDs and allocation records live only in this Owner state, never in a
+	// per-device allocation-bitmap snapshot.
+	OwnerStateSnapshotSlotCount    uint64 = 2
+	MinOwnerStateSnapshotSlotBytes        = uint64(4096)
+	MaxOwnerStateSnapshotSlotBytes        = uint64(64 << 20)
+
 	// AllocatorSnapshotFixedBytes reserves the 64-byte envelope, two 32-byte
-	// device/Owner binding digests, and eight 64-bit scalar fields that precede
-	// the one-bit-per-page allocation bitmap. Allocation records themselves
-	// belong to the checkpoint-level Owner journal; they are not repeated once
-	// per page in this snapshot.
-	AllocatorSnapshotFixedBytes uint64 = 192
+	// device/Owner-group binding digests, and six 64-bit scalar fields that
+	// precede the one-bit-per-page allocation bitmap. This per-device snapshot
+	// records only the last Owner transaction it applied and local page state.
+	AllocatorSnapshotFixedBytes uint64 = 176
 )
 
 var (
@@ -55,7 +62,12 @@ type DeviceGeometry struct {
 	AllocatorSnapshotAOffset   uint64
 	AllocatorSnapshotBOffset   uint64
 	AllocatorSnapshotSlotBytes uint64
-	ControlRegionBytes         uint64
+
+	OwnerStateSnapshotAOffset   uint64
+	OwnerStateSnapshotBOffset   uint64
+	OwnerStateSnapshotSlotBytes uint64
+
+	ControlRegionBytes uint64
 
 	DescriptorRegionBase  uint64
 	DescriptorRegionBytes uint64
@@ -65,10 +77,15 @@ type DeviceGeometry struct {
 }
 
 // CalculateDeviceGeometry chooses the largest page count for which the
-// complete A/B control area, one 64-byte descriptor per page, one 4 KiB
-// payload per page, and a complete one-bit-per-page bitmap in either allocator
-// snapshot slot all fit. The result depends only on the two inputs.
-func CalculateDeviceGeometry(deviceBytes, allocatorSnapshotSlotBytes uint64) (DeviceGeometry, error) {
+// complete A/B superblock, allocator-snapshot, and Owner-state control area,
+// one 64-byte descriptor per page, one 4 KiB payload per page, and a complete
+// one-bit-per-page bitmap in either allocator snapshot slot all fit. The
+// result depends only on the three inputs.
+func CalculateDeviceGeometry(
+	deviceBytes,
+	allocatorSnapshotSlotBytes,
+	ownerStateSnapshotSlotBytes uint64,
+) (DeviceGeometry, error) {
 	if deviceBytes == 0 || deviceBytes > cxlcheckpoint.MaxSignedLong {
 		return DeviceGeometry{}, geometryInvalidf(
 			"device size %d is outside the positive signed-Long ABI", deviceBytes)
@@ -82,6 +99,15 @@ func CalculateDeviceGeometry(deviceBytes, allocatorSnapshotSlotBytes uint64) (De
 			MinAllocatorSnapshotSlotBytes,
 			MaxAllocatorSnapshotSlotBytes)
 	}
+	if ownerStateSnapshotSlotBytes < MinOwnerStateSnapshotSlotBytes ||
+		ownerStateSnapshotSlotBytes > MaxOwnerStateSnapshotSlotBytes ||
+		ownerStateSnapshotSlotBytes%uint64(ContentPageBytes) != 0 {
+		return DeviceGeometry{}, geometryInvalidf(
+			"Owner-state snapshot slot size %d must be page-aligned and in %d..%d",
+			ownerStateSnapshotSlotBytes,
+			MinOwnerStateSnapshotSlotBytes,
+			MaxOwnerStateSnapshotSlotBytes)
+	}
 
 	superblockBytes, ok := checkedMul(SuperblockSlotBytes, SuperblockSlotCount)
 	if !ok {
@@ -91,7 +117,14 @@ func CalculateDeviceGeometry(deviceBytes, allocatorSnapshotSlotBytes uint64) (De
 	if !ok {
 		return DeviceGeometry{}, geometryInvalidf("allocator snapshot region overflows")
 	}
+	ownerStateBytes, ok := checkedMul(ownerStateSnapshotSlotBytes, OwnerStateSnapshotSlotCount)
+	if !ok {
+		return DeviceGeometry{}, geometryInvalidf("Owner-state snapshot region overflows")
+	}
 	controlBytes, ok := checkedAdd(superblockBytes, allocatorBytes)
+	if ok {
+		controlBytes, ok = checkedAdd(controlBytes, ownerStateBytes)
+	}
 	if !ok || controlBytes >= deviceBytes {
 		return DeviceGeometry{}, geometryInvalidf(
 			"device size %d does not extend beyond control region %d",
@@ -138,18 +171,21 @@ func CalculateDeviceGeometry(deviceBytes, allocatorSnapshotSlotBytes uint64) (De
 		return DeviceGeometry{}, geometryInvalidf("content region overflows")
 	}
 	geometry := DeviceGeometry{
-		DeviceBytes:                deviceBytes,
-		SuperblockAOffset:          0,
-		SuperblockBOffset:          SuperblockSlotBytes,
-		AllocatorSnapshotAOffset:   superblockBytes,
-		AllocatorSnapshotBOffset:   superblockBytes + allocatorSnapshotSlotBytes,
-		AllocatorSnapshotSlotBytes: allocatorSnapshotSlotBytes,
-		ControlRegionBytes:         controlBytes,
-		DescriptorRegionBase:       controlBytes,
-		DescriptorRegionBytes:      descriptorBytes,
-		ContentRegionBase:          contentBase,
-		ContentRegionBytes:         contentBytes,
-		DataPageCount:              best,
+		DeviceBytes:                 deviceBytes,
+		SuperblockAOffset:           0,
+		SuperblockBOffset:           SuperblockSlotBytes,
+		AllocatorSnapshotAOffset:    superblockBytes,
+		AllocatorSnapshotBOffset:    superblockBytes + allocatorSnapshotSlotBytes,
+		AllocatorSnapshotSlotBytes:  allocatorSnapshotSlotBytes,
+		OwnerStateSnapshotAOffset:   superblockBytes + allocatorBytes,
+		OwnerStateSnapshotBOffset:   superblockBytes + allocatorBytes + ownerStateSnapshotSlotBytes,
+		OwnerStateSnapshotSlotBytes: ownerStateSnapshotSlotBytes,
+		ControlRegionBytes:          controlBytes,
+		DescriptorRegionBase:        controlBytes,
+		DescriptorRegionBytes:       descriptorBytes,
+		ContentRegionBase:           contentBase,
+		ContentRegionBytes:          contentBytes,
+		DataPageCount:               best,
 	}
 	if err := geometry.Validate(); err != nil {
 		return DeviceGeometry{}, err
@@ -174,17 +210,34 @@ func (geometry DeviceGeometry) Validate() error {
 		geometry.AllocatorSnapshotSlotBytes%uint64(ContentPageBytes) != 0 {
 		return geometryInvalidf("allocator snapshot slot size is invalid")
 	}
+	if geometry.OwnerStateSnapshotSlotBytes < MinOwnerStateSnapshotSlotBytes ||
+		geometry.OwnerStateSnapshotSlotBytes > MaxOwnerStateSnapshotSlotBytes ||
+		geometry.OwnerStateSnapshotSlotBytes%uint64(ContentPageBytes) != 0 {
+		return geometryInvalidf("Owner-state snapshot slot size is invalid")
+	}
 	expectedSnapshotB, ok := checkedAdd(
 		geometry.AllocatorSnapshotAOffset,
 		geometry.AllocatorSnapshotSlotBytes)
 	if !ok || geometry.AllocatorSnapshotBOffset != expectedSnapshotB {
 		return geometryInvalidf("allocator snapshot A/B slots overlap or have a gap")
 	}
-	expectedControlEnd, ok := checkedAdd(
+	expectedOwnerStateA, ok := checkedAdd(
 		geometry.AllocatorSnapshotBOffset,
 		geometry.AllocatorSnapshotSlotBytes)
+	if !ok || geometry.OwnerStateSnapshotAOffset != expectedOwnerStateA {
+		return geometryInvalidf("Owner-state snapshot A does not immediately follow allocator snapshot B")
+	}
+	expectedOwnerStateB, ok := checkedAdd(
+		geometry.OwnerStateSnapshotAOffset,
+		geometry.OwnerStateSnapshotSlotBytes)
+	if !ok || geometry.OwnerStateSnapshotBOffset != expectedOwnerStateB {
+		return geometryInvalidf("Owner-state snapshot A/B slots overlap or have a gap")
+	}
+	expectedControlEnd, ok := checkedAdd(
+		geometry.OwnerStateSnapshotBOffset,
+		geometry.OwnerStateSnapshotSlotBytes)
 	if !ok || geometry.ControlRegionBytes != expectedControlEnd {
-		return geometryInvalidf("control region does not end after allocator snapshot B")
+		return geometryInvalidf("control region does not end after Owner-state snapshot B")
 	}
 	if geometry.DescriptorRegionBase != geometry.ControlRegionBytes ||
 		geometry.DescriptorRegionBase%uint64(PageDescriptorBytes) != 0 {
@@ -227,7 +280,8 @@ func (geometry DeviceGeometry) Validate() error {
 
 	expected, err := calculateDeviceGeometryUnchecked(
 		geometry.DeviceBytes,
-		geometry.AllocatorSnapshotSlotBytes)
+		geometry.AllocatorSnapshotSlotBytes,
+		geometry.OwnerStateSnapshotSlotBytes)
 	if err != nil {
 		return err
 	}
@@ -315,11 +369,18 @@ func (geometry DeviceGeometry) DataPageIndex(contentOffset uint64) (uint64, erro
 	return index, nil
 }
 
-func calculateDeviceGeometryUnchecked(deviceBytes, allocatorSnapshotSlotBytes uint64) (DeviceGeometry, error) {
+func calculateDeviceGeometryUnchecked(
+	deviceBytes,
+	allocatorSnapshotSlotBytes,
+	ownerStateSnapshotSlotBytes uint64,
+) (DeviceGeometry, error) {
 	if deviceBytes == 0 || deviceBytes > cxlcheckpoint.MaxSignedLong ||
 		allocatorSnapshotSlotBytes < MinAllocatorSnapshotSlotBytes ||
 		allocatorSnapshotSlotBytes > MaxAllocatorSnapshotSlotBytes ||
-		allocatorSnapshotSlotBytes%uint64(ContentPageBytes) != 0 {
+		allocatorSnapshotSlotBytes%uint64(ContentPageBytes) != 0 ||
+		ownerStateSnapshotSlotBytes < MinOwnerStateSnapshotSlotBytes ||
+		ownerStateSnapshotSlotBytes > MaxOwnerStateSnapshotSlotBytes ||
+		ownerStateSnapshotSlotBytes%uint64(ContentPageBytes) != 0 {
 		return DeviceGeometry{}, geometryInvalidf("geometry inputs are invalid")
 	}
 	superblockBytes := SuperblockSlotBytes * SuperblockSlotCount
@@ -328,6 +389,13 @@ func calculateDeviceGeometryUnchecked(deviceBytes, allocatorSnapshotSlotBytes ui
 		return DeviceGeometry{}, geometryInvalidf("allocator snapshot region overflows")
 	}
 	controlBytes, ok := checkedAdd(superblockBytes, allocatorBytes)
+	ownerStateBytes, ownerStateOK := checkedMul(ownerStateSnapshotSlotBytes, OwnerStateSnapshotSlotCount)
+	if !ownerStateOK {
+		return DeviceGeometry{}, geometryInvalidf("Owner-state snapshot region overflows")
+	}
+	if ok {
+		controlBytes, ok = checkedAdd(controlBytes, ownerStateBytes)
+	}
 	if !ok || controlBytes >= deviceBytes {
 		return DeviceGeometry{}, geometryInvalidf("control region exceeds the device")
 	}
@@ -365,18 +433,21 @@ func calculateDeviceGeometryUnchecked(deviceBytes, allocatorSnapshotSlotBytes ui
 		return DeviceGeometry{}, geometryInvalidf("content region overflows")
 	}
 	return DeviceGeometry{
-		DeviceBytes:                deviceBytes,
-		SuperblockAOffset:          0,
-		SuperblockBOffset:          SuperblockSlotBytes,
-		AllocatorSnapshotAOffset:   superblockBytes,
-		AllocatorSnapshotBOffset:   superblockBytes + allocatorSnapshotSlotBytes,
-		AllocatorSnapshotSlotBytes: allocatorSnapshotSlotBytes,
-		ControlRegionBytes:         controlBytes,
-		DescriptorRegionBase:       controlBytes,
-		DescriptorRegionBytes:      descriptorBytes,
-		ContentRegionBase:          contentBase,
-		ContentRegionBytes:         contentBytes,
-		DataPageCount:              best,
+		DeviceBytes:                 deviceBytes,
+		SuperblockAOffset:           0,
+		SuperblockBOffset:           SuperblockSlotBytes,
+		AllocatorSnapshotAOffset:    superblockBytes,
+		AllocatorSnapshotBOffset:    superblockBytes + allocatorSnapshotSlotBytes,
+		AllocatorSnapshotSlotBytes:  allocatorSnapshotSlotBytes,
+		OwnerStateSnapshotAOffset:   superblockBytes + allocatorBytes,
+		OwnerStateSnapshotBOffset:   superblockBytes + allocatorBytes + ownerStateSnapshotSlotBytes,
+		OwnerStateSnapshotSlotBytes: ownerStateSnapshotSlotBytes,
+		ControlRegionBytes:          controlBytes,
+		DescriptorRegionBase:        controlBytes,
+		DescriptorRegionBytes:       descriptorBytes,
+		ContentRegionBase:           contentBase,
+		ContentRegionBytes:          contentBytes,
+		DataPageCount:               best,
 	}, nil
 }
 

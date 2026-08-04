@@ -35,17 +35,15 @@ const (
 	allocatorSnapshotHeaderCRCOffset     = 56
 	allocatorSnapshotReservedOffset      = 60
 
-	allocatorSnapshotDeviceDigestOffset    = 64
-	allocatorSnapshotOwnerDigestOffset     = 96
-	allocatorSnapshotOwnerEpochOffset      = 128
-	allocatorSnapshotSequenceOffset        = 136
-	allocatorSnapshotNextAllocationOffset  = 144
-	allocatorSnapshotNextTransactionOffset = 152
-	allocatorSnapshotOwnerJournalOffset    = 160
-	allocatorSnapshotDataPageCountOffset   = 168
-	allocatorSnapshotAllocatedCountOffset  = 176
-	allocatorSnapshotBitmapLengthOffset    = 184
-	allocatorSnapshotBitmapOffset          = 192
+	allocatorSnapshotDeviceDigestOffset       = 64
+	allocatorSnapshotOwnerGroupDigestOffset   = 96
+	allocatorSnapshotOwnerEpochOffset         = 128
+	allocatorSnapshotSequenceOffset           = 136
+	allocatorSnapshotAppliedTransactionOffset = 144
+	allocatorSnapshotDataPageCountOffset      = 152
+	allocatorSnapshotAllocatedCountOffset     = 160
+	allocatorSnapshotBitmapLengthOffset       = 168
+	allocatorSnapshotBitmapOffset             = 176
 
 	allocatorSnapshotFixedPayloadBytes = AllocatorSnapshotFixedBytes - AllocatorSnapshotEnvelopeHeaderBytes
 )
@@ -67,34 +65,35 @@ var (
 	allocatorSnapshotZeroCRCField [4]byte
 )
 
-// AllocatorSnapshotConfig supplies the non-derived fields of one allocator
-// snapshot. NewAllocatorSnapshot derives the bitmap length and popcount rather
-// than trusting caller-provided duplicates.
+// AllocatorSnapshotConfig supplies the non-derived fields of one device-local
+// allocator snapshot. NewAllocatorSnapshot derives the bitmap length and
+// popcount rather than trusting caller-provided duplicates. Group-global next
+// IDs and allocation records belong only to the A/B OwnerStateSnapshot and
+// are intentionally absent here.
 type AllocatorSnapshotConfig struct {
-	DeviceBindingSHA256     [sha256.Size]byte
-	OwnerIdentitySHA256     [sha256.Size]byte
-	OwnerEpoch              uint64
-	SnapshotSequence        uint64
-	NextAllocationRecordID  uint64
-	NextOwnerTransactionSeq uint64
-	OwnerJournalSequence    uint64
-	DataPageCount           uint64
+	DeviceBindingSHA256             [sha256.Size]byte
+	OwnerGroupIdentitySHA256        [sha256.Size]byte
+	OwnerEpoch                      uint64
+	SnapshotSequence                uint64
+	AppliedOwnerTransactionSequence uint64
+	DataPageCount                   uint64
 }
 
-// AllocatorSnapshot is the logical form of one canonical TRALC007 envelope.
-// The bitmap is intentionally private. Copies returned by BitmapBytes and
-// Clone never expose the internal slice used by a parsed or constructed value.
+// AllocatorSnapshot is the logical form of one canonical, per-device TRALC007
+// envelope. AppliedOwnerTransactionSequence is evidence of the latest
+// Owner-group transaction reflected by this device's bitmap; zero denotes the
+// genesis state. The bitmap is intentionally private. Copies returned by
+// BitmapBytes and Clone never expose the internal slice used by a parsed or
+// constructed value.
 type AllocatorSnapshot struct {
-	DeviceBindingSHA256     [sha256.Size]byte
-	OwnerIdentitySHA256     [sha256.Size]byte
-	OwnerEpoch              uint64
-	SnapshotSequence        uint64
-	NextAllocationRecordID  uint64
-	NextOwnerTransactionSeq uint64
-	OwnerJournalSequence    uint64
-	DataPageCount           uint64
-	AllocatedPageCount      uint64
-	BitmapByteLength        uint64
+	DeviceBindingSHA256             [sha256.Size]byte
+	OwnerGroupIdentitySHA256        [sha256.Size]byte
+	OwnerEpoch                      uint64
+	SnapshotSequence                uint64
+	AppliedOwnerTransactionSequence uint64
+	DataPageCount                   uint64
+	AllocatedPageCount              uint64
+	BitmapByteLength                uint64
 
 	allocationBitmap []byte
 }
@@ -127,17 +126,15 @@ func NewAllocatorSnapshot(
 			expectedBitmapBytes)
 	}
 	snapshot := AllocatorSnapshot{
-		DeviceBindingSHA256:     config.DeviceBindingSHA256,
-		OwnerIdentitySHA256:     config.OwnerIdentitySHA256,
-		OwnerEpoch:              config.OwnerEpoch,
-		SnapshotSequence:        config.SnapshotSequence,
-		NextAllocationRecordID:  config.NextAllocationRecordID,
-		NextOwnerTransactionSeq: config.NextOwnerTransactionSeq,
-		OwnerJournalSequence:    config.OwnerJournalSequence,
-		DataPageCount:           config.DataPageCount,
-		AllocatedPageCount:      allocatorSnapshotPopcount(allocationBitmap),
-		BitmapByteLength:        uint64(len(allocationBitmap)),
-		allocationBitmap:        allocationBitmap,
+		DeviceBindingSHA256:             config.DeviceBindingSHA256,
+		OwnerGroupIdentitySHA256:        config.OwnerGroupIdentitySHA256,
+		OwnerEpoch:                      config.OwnerEpoch,
+		SnapshotSequence:                config.SnapshotSequence,
+		AppliedOwnerTransactionSequence: config.AppliedOwnerTransactionSequence,
+		DataPageCount:                   config.DataPageCount,
+		AllocatedPageCount:              allocatorSnapshotPopcount(allocationBitmap),
+		BitmapByteLength:                uint64(len(allocationBitmap)),
+		allocationBitmap:                allocationBitmap,
 	}
 	if err := snapshot.Validate(); err != nil {
 		return AllocatorSnapshot{}, err
@@ -156,8 +153,8 @@ func (snapshot AllocatorSnapshot) Validate() error {
 	if snapshot.DeviceBindingSHA256 == ([sha256.Size]byte{}) {
 		return allocatorSnapshotInvalidf("device-binding SHA-256 is zero")
 	}
-	if snapshot.OwnerIdentitySHA256 == ([sha256.Size]byte{}) {
-		return allocatorSnapshotInvalidf("Owner-identity SHA-256 is zero")
+	if snapshot.OwnerGroupIdentitySHA256 == ([sha256.Size]byte{}) {
+		return allocatorSnapshotInvalidf("Owner-group-identity SHA-256 is zero")
 	}
 	for _, field := range []struct {
 		name  string
@@ -165,8 +162,6 @@ func (snapshot AllocatorSnapshot) Validate() error {
 	}{
 		{"Owner epoch", snapshot.OwnerEpoch},
 		{"snapshot sequence", snapshot.SnapshotSequence},
-		{"next allocation-record ID", snapshot.NextAllocationRecordID},
-		{"next Owner-transaction sequence", snapshot.NextOwnerTransactionSeq},
 		{"data-page count", snapshot.DataPageCount},
 	} {
 		if field.value == 0 || field.value > cxlcheckpoint.MaxSignedLong {
@@ -174,10 +169,10 @@ func (snapshot AllocatorSnapshot) Validate() error {
 				"%s %d is outside 1..%d", field.name, field.value, cxlcheckpoint.MaxSignedLong)
 		}
 	}
-	if snapshot.OwnerJournalSequence > cxlcheckpoint.MaxSignedLong {
+	if snapshot.AppliedOwnerTransactionSequence > cxlcheckpoint.MaxSignedLong {
 		return allocatorSnapshotInvalidf(
-			"Owner-journal sequence %d exceeds %d",
-			snapshot.OwnerJournalSequence,
+			"applied Owner-transaction sequence %d exceeds %d",
+			snapshot.AppliedOwnerTransactionSequence,
 			cxlcheckpoint.MaxSignedLong)
 	}
 	if snapshot.AllocatedPageCount > snapshot.DataPageCount {
@@ -220,7 +215,7 @@ func (snapshot AllocatorSnapshot) Validate() error {
 func (snapshot AllocatorSnapshot) CrossCheck(
 	geometry DeviceGeometry,
 	expectedDeviceBindingSHA256 [sha256.Size]byte,
-	expectedOwnerIdentitySHA256 [sha256.Size]byte,
+	expectedOwnerGroupIdentitySHA256 [sha256.Size]byte,
 	expectedOwnerEpoch uint64,
 ) error {
 	if err := geometry.Validate(); err != nil {
@@ -238,8 +233,8 @@ func (snapshot AllocatorSnapshot) CrossCheck(
 	if snapshot.DeviceBindingSHA256 != expectedDeviceBindingSHA256 {
 		return allocatorSnapshotMismatchf("device-binding SHA-256 differs")
 	}
-	if snapshot.OwnerIdentitySHA256 != expectedOwnerIdentitySHA256 {
-		return allocatorSnapshotMismatchf("Owner-identity SHA-256 differs")
+	if snapshot.OwnerGroupIdentitySHA256 != expectedOwnerGroupIdentitySHA256 {
+		return allocatorSnapshotMismatchf("Owner-group-identity SHA-256 differs")
 	}
 	if snapshot.OwnerEpoch != expectedOwnerEpoch {
 		return allocatorSnapshotMismatchf(
@@ -312,19 +307,15 @@ func CanonicalAllocatorSnapshotBytes(
 		exactLength-AllocatorSnapshotEnvelopeHeaderBytes)
 
 	copy(
-		out[allocatorSnapshotDeviceDigestOffset:allocatorSnapshotOwnerDigestOffset],
+		out[allocatorSnapshotDeviceDigestOffset:allocatorSnapshotOwnerGroupDigestOffset],
 		snapshot.DeviceBindingSHA256[:])
 	copy(
-		out[allocatorSnapshotOwnerDigestOffset:allocatorSnapshotOwnerEpochOffset],
-		snapshot.OwnerIdentitySHA256[:])
+		out[allocatorSnapshotOwnerGroupDigestOffset:allocatorSnapshotOwnerEpochOffset],
+		snapshot.OwnerGroupIdentitySHA256[:])
 	binary.LittleEndian.PutUint64(out[allocatorSnapshotOwnerEpochOffset:], snapshot.OwnerEpoch)
 	binary.LittleEndian.PutUint64(out[allocatorSnapshotSequenceOffset:], snapshot.SnapshotSequence)
 	binary.LittleEndian.PutUint64(
-		out[allocatorSnapshotNextAllocationOffset:], snapshot.NextAllocationRecordID)
-	binary.LittleEndian.PutUint64(
-		out[allocatorSnapshotNextTransactionOffset:], snapshot.NextOwnerTransactionSeq)
-	binary.LittleEndian.PutUint64(
-		out[allocatorSnapshotOwnerJournalOffset:], snapshot.OwnerJournalSequence)
+		out[allocatorSnapshotAppliedTransactionOffset:], snapshot.AppliedOwnerTransactionSequence)
 	binary.LittleEndian.PutUint64(out[allocatorSnapshotDataPageCountOffset:], snapshot.DataPageCount)
 	binary.LittleEndian.PutUint64(
 		out[allocatorSnapshotAllocatedCountOffset:], snapshot.AllocatedPageCount)
@@ -424,18 +415,14 @@ func ParseAllocatorSnapshot(
 	snapshot := AllocatorSnapshot{}
 	copy(
 		snapshot.DeviceBindingSHA256[:],
-		data[allocatorSnapshotDeviceDigestOffset:allocatorSnapshotOwnerDigestOffset])
+		data[allocatorSnapshotDeviceDigestOffset:allocatorSnapshotOwnerGroupDigestOffset])
 	copy(
-		snapshot.OwnerIdentitySHA256[:],
-		data[allocatorSnapshotOwnerDigestOffset:allocatorSnapshotOwnerEpochOffset])
+		snapshot.OwnerGroupIdentitySHA256[:],
+		data[allocatorSnapshotOwnerGroupDigestOffset:allocatorSnapshotOwnerEpochOffset])
 	snapshot.OwnerEpoch = binary.LittleEndian.Uint64(data[allocatorSnapshotOwnerEpochOffset:])
 	snapshot.SnapshotSequence = binary.LittleEndian.Uint64(data[allocatorSnapshotSequenceOffset:])
-	snapshot.NextAllocationRecordID = binary.LittleEndian.Uint64(
-		data[allocatorSnapshotNextAllocationOffset:])
-	snapshot.NextOwnerTransactionSeq = binary.LittleEndian.Uint64(
-		data[allocatorSnapshotNextTransactionOffset:])
-	snapshot.OwnerJournalSequence = binary.LittleEndian.Uint64(
-		data[allocatorSnapshotOwnerJournalOffset:])
+	snapshot.AppliedOwnerTransactionSequence = binary.LittleEndian.Uint64(
+		data[allocatorSnapshotAppliedTransactionOffset:])
 	snapshot.DataPageCount = binary.LittleEndian.Uint64(data[allocatorSnapshotDataPageCountOffset:])
 	snapshot.AllocatedPageCount = binary.LittleEndian.Uint64(
 		data[allocatorSnapshotAllocatedCountOffset:])
@@ -621,8 +608,17 @@ func allocatorSnapshotCompiledContractValid() bool {
 		AllocatorSnapshotDomain != "allocation-bitmap-v1" ||
 		len(AllocatorSnapshotDomain) > allocatorSnapshotDomainFieldBytes ||
 		AllocatorSnapshotEnvelopeHeaderBytes != 64 ||
-		AllocatorSnapshotFixedBytes != 192 ||
-		allocatorSnapshotFixedPayloadBytes != 128 {
+		AllocatorSnapshotFixedBytes != 176 ||
+		allocatorSnapshotFixedPayloadBytes != 112 ||
+		allocatorSnapshotDeviceDigestOffset != 64 ||
+		allocatorSnapshotOwnerGroupDigestOffset != 96 ||
+		allocatorSnapshotOwnerEpochOffset != 128 ||
+		allocatorSnapshotSequenceOffset != 136 ||
+		allocatorSnapshotAppliedTransactionOffset != 144 ||
+		allocatorSnapshotDataPageCountOffset != 152 ||
+		allocatorSnapshotAllocatedCountOffset != 160 ||
+		allocatorSnapshotBitmapLengthOffset != 168 ||
+		allocatorSnapshotBitmapOffset != 176 {
 		return false
 	}
 	if string(allocatorSnapshotDomain[:len(AllocatorSnapshotDomain)]) != AllocatorSnapshotDomain {
