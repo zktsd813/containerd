@@ -40,10 +40,14 @@ const (
 	DescriptorPublishedSlot
 	DescriptorRetiring
 	DescriptorQuarantined
+	// DescriptorZeroPadding is the explicit allocated, zero-filled suffix of
+	// the fixed-capacity Publication object. Appending it preserves every v1
+	// wire value 0..6; descriptor semantic ABI v2 assigns it wire value 7.
+	DescriptorZeroPadding
 )
 
 func (state DescriptorState) valid() bool {
-	return state >= DescriptorFree && state <= DescriptorQuarantined
+	return state >= DescriptorFree && state <= DescriptorZeroPadding
 }
 
 // Descriptor is the logical form of one exact 64-byte little-endian
@@ -65,7 +69,7 @@ type Descriptor struct {
 // a content page. MarshalBinary calls it before producing any bytes.
 func (descriptor Descriptor) Validate() error {
 	if !descriptor.State.valid() {
-		return invalidDescriptorf("state %d is outside FREE..QUARANTINED", descriptor.State)
+		return invalidDescriptorf("state %d is outside FREE..ZERO_PADDING", descriptor.State)
 	}
 	if descriptor.State == DescriptorFree {
 		if descriptor != (Descriptor{}) {
@@ -139,6 +143,15 @@ func (descriptor Descriptor) Validate() error {
 		if descriptor.PayloadLength == 0 || descriptor.ContentReferenceCount == 0 {
 			return invalidDescriptorf("PUBLISHED_SLOT requires meaningful content and a positive reference count")
 		}
+	case DescriptorZeroPadding:
+		if descriptor.ContentKind != cxlcheckpoint.ContentPublicationV7 {
+			return invalidDescriptorf("ZERO_PADDING requires the Publication content kind")
+		}
+		if descriptor.PaddedPageCRC32C != zeroContentPageCRC32C ||
+			descriptor.PayloadLength != 0 || descriptor.ContentReferenceCount != 0 {
+			return invalidDescriptorf(
+				"ZERO_PADDING requires the zero-page CRC32C and zero payload length/reference count")
+		}
 	case DescriptorRetiring, DescriptorQuarantined:
 		// These states retain their prior identity, kind, bounded length, and
 		// bounded reference count for diagnosis and checkpoint-level reclaim.
@@ -162,6 +175,10 @@ func (descriptor Descriptor) ValidateContentPage(content []byte) error {
 		descriptor.State == DescriptorQuarantined {
 		return fmt.Errorf("%w: state %d has no readable sealed content", ErrInvalidContentPage, descriptor.State)
 	}
+	// ZERO_PADDING deliberately accepts nil meaningful content and validates its
+	// implicit zero-padded CRC32C below. That does not inspect the actual 4 KiB
+	// physical capacity page; the Owner seal layer must separately read it in
+	// full and prove that every byte is zero before publishing this descriptor.
 	if len(content) != int(descriptor.PayloadLength) {
 		return fmt.Errorf(
 			"%w: meaningful content length %d does not equal descriptor length %d",
@@ -181,6 +198,29 @@ func (descriptor Descriptor) ValidateContentPage(content []byte) error {
 			descriptor.PaddedPageCRC32C)
 	}
 	return nil
+}
+
+// BuildZeroPaddingPageDescriptor marks one fully zero, allocated capacity page
+// beyond the exact Publication envelope. The descriptor proves only the logical
+// no-content shape and zero-page CRC32C. The Owner seal layer remains responsible
+// for reading the actual 4 KiB page and verifying that it is entirely zero.
+func BuildZeroPaddingPageDescriptor(
+	allocationRecordID uint64,
+	originObjectID uint64,
+	ownerTransactionSeq uint64,
+) (Descriptor, error) {
+	descriptor := Descriptor{
+		PaddedPageCRC32C:    zeroContentPageCRC32C,
+		AllocationRecordID:  allocationRecordID,
+		OriginObjectID:      originObjectID,
+		OwnerTransactionSeq: ownerTransactionSeq,
+		State:               DescriptorZeroPadding,
+		ContentKind:         cxlcheckpoint.ContentPublicationV7,
+	}
+	if err := descriptor.Validate(); err != nil {
+		return Descriptor{}, err
+	}
+	return descriptor, nil
 }
 
 // BuildImmutableContentPageDescriptor seals one immutable non-slot page.

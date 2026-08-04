@@ -510,7 +510,8 @@ func reservedDescriptorRecordScalarsEqual(
 		left.RequestSHA256 == right.RequestSHA256 &&
 		left.TotalDemandPages == right.TotalDemandPages &&
 		left.MaxExtents == right.MaxExtents &&
-		left.AuthorityEvidence == right.AuthorityEvidence
+		left.AuthorityEvidence == right.AuthorityEvidence &&
+		left.OwnerVerifiedSealSHA256 == right.OwnerVerifiedSealSHA256
 }
 
 func reservedDescriptorConflictf(

@@ -308,6 +308,16 @@ func TestProducerScatterPlanCommitsCompleteGrantedProducerIdentity(t *testing.T)
 		fixture.plan.integritySHA256 == changed.integritySHA256 {
 		t.Fatal("different Producer/capability yielded an indistinguishable scatter grant")
 	}
+	if producerScatterGrantRecordDigestDomain != "TRCXL007-producer-scatter-grant-record-v2" {
+		t.Fatalf("grant-record digest domain = %q", producerScatterGrantRecordDigestDomain)
+	}
+	canonicalGranted := fixture.owner.records[0]
+	mutatedSeal := cloneOwnerStateRecord(canonicalGranted)
+	mutatedSeal.OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
+	if producerScatterGrantRecordSHA256(canonicalGranted) ==
+		producerScatterGrantRecordSHA256(mutatedSeal) {
+		t.Fatal("complete GRANTED-record digest ignored canonical zero seal field")
+	}
 }
 
 func TestProducerScatterPlanRejectsEveryOwnerPublicationSubstitution(t *testing.T) {
@@ -317,6 +327,7 @@ func TestProducerScatterPlanRejectsEveryOwnerPublicationSubstitution(t *testing.
 	}{
 		{"state", func(owner *OwnerStateSnapshot, _ *cxlcheckpoint.InitialPublicationV7Plan) {
 			owner.records[0].State = OwnerAllocationCommitted
+			owner.records[0].OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
 		}},
 		{"checkpoint", func(owner *OwnerStateSnapshot, _ *cxlcheckpoint.InitialPublicationV7Plan) {
 			owner.records[0].CheckpointID = "substituted"

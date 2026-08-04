@@ -640,6 +640,40 @@ func TestOwnerAbortExecutorCleanFromFreePreparingAndReplay(t *testing.T) {
 	fixture.assertZeroIO(t)
 }
 
+func TestOwnerAbortExecutorRejectsSealedQuarantineProvenanceWithoutIO(t *testing.T) {
+	fixture := newOwnerReserveExecutorTestFixture(
+		t,
+		[]string{"device-a"},
+		"device-a",
+		2<<20)
+	reserve, abort := ownerAbortTestRequests(fixture, "sealed-quarantine", 1)
+	ownerAbortTestPreparing(t, fixture, reserve)
+	ownerState, _, err := fixture.group.PlannerInputs()
+	if err != nil {
+		t.Fatalf("PlannerInputs: %v", err)
+	}
+	records := ownerState.Records()
+	transaction := ownerState.NextOwnerTransactionSequence
+	records[0].State = OwnerAllocationQuarantined
+	records[0].OwnerTransactionSequence = transaction
+	records[0].OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
+	sealedBase := ownerState.Clone()
+	sealedBase.SnapshotSequence++
+	sealedBase.NextOwnerTransactionSequence = transaction + 1
+	sealed := ownerReserveExecutorSnapshotWithRecords(t, sealedBase, records)
+	if err := fixture.group.anchor.commitOwnerState(sealed); err != nil {
+		t.Fatalf("commit sealed QUARANTINED state: %v", err)
+	}
+	fixture.resetTracking()
+
+	if _, err := fixture.group.AbortPreparingCheckpoint(abort); !errors.Is(
+		err,
+		ErrOwnerAbortConflict) {
+		t.Fatalf("sealed QUARANTINED abort error = %v", err)
+	}
+	fixture.assertZeroIO(t)
+}
+
 func TestOwnerAbortExecutorCleanAfterReservationAllocatorApplied(t *testing.T) {
 	fixture := newOwnerReserveExecutorTestFixture(
 		t,
@@ -2026,6 +2060,7 @@ func TestOwnerAbortExecutorAbortingBesideTransitionLatchesOffline(t *testing.T) 
 	}
 	records := abortPlan.abortingState.Records()
 	records[0].State = OwnerAllocationCommitting
+	records[0].OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
 	malformed := ownerReserveExecutorSnapshotWithRecords(
 		t,
 		abortPlan.abortingState,

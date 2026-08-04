@@ -16,7 +16,7 @@ import (
 
 const (
 	ownerStateKnownMembershipSHA256 = "e4ed58ce1730f545f2439b7b7fb20316c139b483849ff438e880b1e8914aff6f"
-	ownerStateKnownEnvelopeSHA256   = "846141f607a13416e9f01be4823737b7e50992d27b6b06c186394b6ebea73fe6"
+	ownerStateKnownEnvelopeSHA256   = "394337360253c1b85c7dc0bee2c9b091d201e3d6d3c96372ff39ce2a19af4550"
 )
 
 func TestOwnerStateKnownAnswerRoundTripAndStorage(t *testing.T) {
@@ -42,6 +42,15 @@ func TestOwnerStateKnownAnswerRoundTripAndStorage(t *testing.T) {
 	}
 	if got := binary.LittleEndian.Uint64(wire[48:56]); got != uint64(len(wire))-64 {
 		t.Fatalf("payload length = %d, want %d", got, len(wire)-64)
+	}
+	if got := len(wire); got != 1139 {
+		t.Fatalf("exact envelope length = %d, want 1139", got)
+	}
+	if got := binary.LittleEndian.Uint64(wire[48:56]); got != 1075 {
+		t.Fatalf("exact payload length = %d, want 1075", got)
+	}
+	if !ownerStateAllZero(wire[1107:1139]) {
+		t.Fatalf("PREPARING Owner-verified seal tail is nonzero: %x", wire[1107:1139])
 	}
 	recordOffset := int(OwnerStateEnvelopeHeaderBytes)
 	for index := 0; index < 5; index++ {
@@ -75,6 +84,13 @@ func TestOwnerStateKnownAnswerRoundTripAndStorage(t *testing.T) {
 	wireHex := hex.EncodeToString(wireSHA[:])
 	if wireHex != ownerStateKnownEnvelopeSHA256 {
 		t.Fatalf("envelope SHA-256 = %s, freeze as known answer (length %d)", wireHex, len(wire))
+	}
+	sealed := snapshot.Clone()
+	sealed.records[0].State = OwnerAllocationCommitting
+	sealed.records[0].OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
+	sealedWire := ownerStateTestEncode(t, sealed, geometry)
+	if !bytes.Equal(sealedWire[1107:1139], sealed.records[0].OwnerVerifiedSealSHA256[:]) {
+		t.Fatalf("Owner-verified seal wire tail = %x", sealedWire[1107:1139])
 	}
 
 	parsed, err := ParseOwnerState(wire, geometry)
@@ -118,7 +134,7 @@ func TestOwnerStateKnownAnswerRoundTripAndStorage(t *testing.T) {
 	}
 }
 
-func TestOwnerStateV2StateNumbersAndTransactionSemantics(t *testing.T) {
+func TestOwnerStateV3StateNumbersAndTransactionSemantics(t *testing.T) {
 	wantNumbers := []OwnerAllocationState{
 		OwnerAllocationPreparing,
 		OwnerAllocationGranted,
@@ -371,6 +387,11 @@ func TestOwnerStateAllStatesAndNoSpaceSemantics(t *testing.T) {
 			case OwnerAllocationGranted:
 				candidate.records[0].OwnerTransactionSequence++
 				candidate.NextOwnerTransactionSequence++
+			case OwnerAllocationCommitting,
+				OwnerAllocationCommitted,
+				OwnerAllocationReclaiming,
+				OwnerAllocationReclaimed:
+				candidate.records[0].OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
 			case OwnerAllocationRejectedNoSpace:
 				candidate.records[0].ReservationTransactionSequence = 0
 				candidate.records[0].Fragments = nil
@@ -384,6 +405,13 @@ func TestOwnerStateAllStatesAndNoSpaceSemantics(t *testing.T) {
 				t.Fatalf("state %d codec = %d, %v", state, parsed.records[0].State, err)
 			}
 		})
+	}
+
+	quarantinedWithSeal := base.Clone()
+	quarantinedWithSeal.records[0].State = OwnerAllocationQuarantined
+	quarantinedWithSeal.records[0].OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
+	if err := quarantinedWithSeal.Validate(); err != nil {
+		t.Fatalf("QUARANTINED seal provenance: %v", err)
 	}
 
 	noSpaceWithFragments := base.Clone()
@@ -406,6 +434,60 @@ func TestOwnerStateAllStatesAndNoSpaceSemantics(t *testing.T) {
 	}
 	if err := noSpace.Validate(); err != nil {
 		t.Fatalf("valid no-space tombstone: %v", err)
+	}
+}
+
+func TestOwnerStateV3OwnerVerifiedSealStateRulesAndRecordEquality(t *testing.T) {
+	base := ownerStateTestSnapshot(t)
+	seal := ownerStateTestSealSHA256()
+
+	zeroRequired := []OwnerAllocationState{
+		OwnerAllocationPreparing,
+		OwnerAllocationGranted,
+		OwnerAllocationAborting,
+		OwnerAllocationAborted,
+		OwnerAllocationRejectedNoSpace,
+		OwnerAllocationCanceling,
+		OwnerAllocationCanceled,
+	}
+	for _, state := range zeroRequired {
+		candidate := base.Clone()
+		candidate.records[0].State = state
+		candidate.records[0].OwnerVerifiedSealSHA256 = seal
+		switch state {
+		case OwnerAllocationGranted:
+			candidate.records[0].OwnerTransactionSequence++
+			candidate.NextOwnerTransactionSequence++
+		case OwnerAllocationRejectedNoSpace:
+			candidate.records[0].ReservationTransactionSequence = 0
+			candidate.records[0].Fragments = nil
+		}
+		if err := candidate.Validate(); !errors.Is(err, ErrInvalidOwnerState) {
+			t.Fatalf("state %d accepted a nonzero Owner-verified seal: %v", state, err)
+		}
+	}
+
+	for _, state := range []OwnerAllocationState{
+		OwnerAllocationCommitting,
+		OwnerAllocationCommitted,
+		OwnerAllocationReclaiming,
+		OwnerAllocationReclaimed,
+	} {
+		candidate := base.Clone()
+		candidate.records[0].State = state
+		if err := candidate.Validate(); !errors.Is(err, ErrInvalidOwnerState) {
+			t.Fatalf("state %d accepted a zero Owner-verified seal: %v", state, err)
+		}
+	}
+
+	left := base.records[0]
+	right := cloneOwnerStateRecord(left)
+	if !reservedDescriptorRecordsEqual(left, right) {
+		t.Fatal("cloned record is not equal")
+	}
+	right.OwnerVerifiedSealSHA256 = seal
+	if reservedDescriptorRecordsEqual(left, right) {
+		t.Fatal("record equality ignored Owner-verified seal")
 	}
 }
 
@@ -528,16 +610,20 @@ func TestOwnerStateDuplicateRequestCheckpointAndRecordOrdering(t *testing.T) {
 			value.records[1].OwnerTransactionSequence = value.records[0].OwnerTransactionSequence
 			value.records[1].ReservationTransactionSequence = 30
 			value.records[1].State = OwnerAllocationCommitted
+			value.records[1].OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
 		}},
 		{"duplicate-reservation-transaction", func(value *OwnerStateSnapshot) {
 			value.records[1].ReservationTransactionSequence =
 				value.records[0].ReservationTransactionSequence
 			value.records[1].State = OwnerAllocationCommitted
+			value.records[1].OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
 		}},
 		{"reservation-collides-with-other-current", func(value *OwnerStateSnapshot) {
 			value.records[0].State = OwnerAllocationCommitted
+			value.records[0].OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
 			value.records[0].OwnerTransactionSequence = 32
 			value.records[1].State = OwnerAllocationCommitted
+			value.records[1].OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
 			value.records[1].ReservationTransactionSequence = 32
 			value.records[1].OwnerTransactionSequence = 33
 			value.NextOwnerTransactionSequence = 34
@@ -612,13 +698,13 @@ func TestOwnerStateParserRejectsTruncationCorruptionAndCountAttacks(t *testing.T
 		})
 	}
 
-	oldDraftDomain := append([]byte(nil), wire...)
+	oldV2Domain := append([]byte(nil), wire...)
 	var oldDomain [ownerStateDomainFieldBytes]byte
-	copy(oldDomain[:], "owner-group-full-snapshot-v1")
-	copy(oldDraftDomain[ownerStateDomainOffset:ownerStatePayloadLengthOffset], oldDomain[:])
-	ownerStateTestRefreshCRCs(oldDraftDomain)
-	if _, err := ParseOwnerState(oldDraftDomain, geometry); !errors.Is(err, ErrWrongOwnerStateFormat) {
-		t.Fatalf("old draft-v1 domain error = %v, want wrong format", err)
+	copy(oldDomain[:], "owner-group-full-snapshot-v2")
+	copy(oldV2Domain[ownerStateDomainOffset:ownerStatePayloadLengthOffset], oldDomain[:])
+	ownerStateTestRefreshCRCs(oldV2Domain)
+	if _, err := ParseOwnerState(oldV2Domain, geometry); !errors.Is(err, ErrWrongOwnerStateFormat) {
+		t.Fatalf("old v2 domain error = %v, want wrong format", err)
 	}
 
 	oversized := append([]byte(nil), wire[:64]...)
@@ -1005,6 +1091,10 @@ func ownerStateTestNoSpaceRecord(id uint64) OwnerStateAllocationRecord {
 			},
 		},
 	}
+}
+
+func ownerStateTestSealSHA256() [sha256.Size]byte {
+	return sha256.Sum256([]byte("owner-verified-seal"))
 }
 
 func ownerStateTestBootstrap(snapshot OwnerStateSnapshot) OwnerStateBootstrap {

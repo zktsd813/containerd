@@ -19,8 +19,8 @@ func TestV7StorageCompatibilityContract(t *testing.T) {
 	const want = "publication=TRPUB007/v7/little-endian/immutable-publication-v1;" +
 		"envelope-header=64;max-envelope=8388608;" +
 		"page=4096;fingerprint=crc32c-castagnoli/0x11edc6f41;" +
-		"descriptor=TRCXL007/64/trcxl007-page-descriptor-little-endian-v1;" +
-		"owner-state=TROWN007/v2"
+		"descriptor=TRCXL007/64/trcxl007-page-descriptor-little-endian-v2;" +
+		"owner-state=TROWN007/v3"
 	if V7StorageCompatibilityID != want {
 		t.Fatalf("V7 storage compatibility ID = %q", V7StorageCompatibilityID)
 	}
@@ -32,7 +32,7 @@ func TestV7StorageCompatibilityContract(t *testing.T) {
 		V7StoragePageDescriptorBytes != 64 ||
 		V7StoragePublicationByteOrder != "little-endian" ||
 		V7StoragePublicationABI != PublicationV7Domain ||
-		V7StoragePageDescriptorABI != "trcxl007-page-descriptor-little-endian-v1" ||
+		V7StoragePageDescriptorABI != "trcxl007-page-descriptor-little-endian-v2" ||
 		V7StorageFingerprintAlgorithm != "crc32c-castagnoli" ||
 		V7StorageFingerprintPolynomial != "0x11edc6f41" {
 		t.Fatal("compiled V7 target storage constants changed")
@@ -159,6 +159,13 @@ func TestStaticPublicationRootV7CrossCheckRejectsSubstitution(t *testing.T) {
 	}{
 		{"checkpoint", func(value *StaticPublicationRootV7) { value.CheckpointID += "-other" }},
 		{"compatibility", func(value *StaticPublicationRootV7) { value.StorageCompatibilityID += "-other" }},
+		{"owner-state-v2", func(value *StaticPublicationRootV7) {
+			value.StorageCompatibilityID = strings.Replace(
+				value.StorageCompatibilityID,
+				"owner-state=TROWN007/v3",
+				"owner-state=TROWN007/v2",
+				1)
+		}},
 		{"object", func(value *StaticPublicationRootV7) { value.PublicationObjectID++ }},
 		{"Owner", func(value *StaticPublicationRootV7) { value.OwnerID += "-other" }},
 		{"epoch", func(value *StaticPublicationRootV7) { value.OwnerEpoch++ }},
@@ -500,8 +507,8 @@ func TestStaticPublicationRootV7WorstCaseBound(t *testing.T) {
 }
 
 func TestStaticPublicationRootV7KnownAnswer(t *testing.T) {
-	const wantBase64 = "VFJQU1IwMDcHAAAAQAAAAHB1YmxpY2F0aW9uLWJvb3RzdHJhcC12McgBAAAAAAAATjQk1QAAAAB/JWeTAAAAAAETAAAAY2hlY2twb2ludC1rbm93bi12N/MAAABwdWJsaWNhdGlvbj1UUlBVQjAwNy92Ny9saXR0bGUtZW5kaWFuL2ltbXV0YWJsZS1wdWJsaWNhdGlvbi12MTtlbnZlbG9wZS1oZWFkZXI9NjQ7bWF4LWVudmVsb3BlPTgzODg2MDg7cGFnZT00MDk2O2ZpbmdlcnByaW50PWNyYzMyYy1jYXN0YWdub2xpLzB4MTFlZGM2ZjQxO2Rlc2NyaXB0b3I9VFJDWEwwMDcvNjQvdHJjeGwwMDctcGFnZS1kZXNjcmlwdG9yLWxpdHRsZS1lbmRpYW4tdjE7b3duZXItc3RhdGU9VFJPV04wMDcvdjIJAAAAAAAAAAgAAABvd25lci3OsQsAAAAAAAAAHQAAAAAAAACIEwAAAAAAAETkM582rZ8PS/4pMW9pU5qynn+XkIooUtZ5NcAWiWYYAgAAAAoAAABkZXZpY2Ut7oCAZAAAAAAAAAALAAAAZGV2aWNlLfCQgIDIAAAAAAAAAAIAAAAAAAAAAAAAAAEAAAAeAAAAAAAAAAEAAAAAAAAAAQAAAAAAAAAAAAAAFAAAAAAAAAABAAAAAAAAAA=="
-	const wantSHA256 = "b20ad2fb4f23f195d9ee76b2e02e7da0e6d0aabafdaf2926b398e592fb299cbf"
+	const wantBase64 = "VFJQU1IwMDcHAAAAQAAAAHB1YmxpY2F0aW9uLWJvb3RzdHJhcC12McgBAAAAAAAAO5udVgAAAADjU1n9AAAAAAETAAAAY2hlY2twb2ludC1rbm93bi12N/MAAABwdWJsaWNhdGlvbj1UUlBVQjAwNy92Ny9saXR0bGUtZW5kaWFuL2ltbXV0YWJsZS1wdWJsaWNhdGlvbi12MTtlbnZlbG9wZS1oZWFkZXI9NjQ7bWF4LWVudmVsb3BlPTgzODg2MDg7cGFnZT00MDk2O2ZpbmdlcnByaW50PWNyYzMyYy1jYXN0YWdub2xpLzB4MTFlZGM2ZjQxO2Rlc2NyaXB0b3I9VFJDWEwwMDcvNjQvdHJjeGwwMDctcGFnZS1kZXNjcmlwdG9yLWxpdHRsZS1lbmRpYW4tdjI7b3duZXItc3RhdGU9VFJPV04wMDcvdjMJAAAAAAAAAAgAAABvd25lci3OsQsAAAAAAAAAHQAAAAAAAACIEwAAAAAAAETkM582rZ8PS/4pMW9pU5qynn+XkIooUtZ5NcAWiWYYAgAAAAoAAABkZXZpY2Ut7oCAZAAAAAAAAAALAAAAZGV2aWNlLfCQgIDIAAAAAAAAAAIAAAAAAAAAAAAAAAEAAAAeAAAAAAAAAAEAAAAAAAAAAQAAAAAAAAAAAAAAFAAAAAAAAAABAAAAAAAAAA=="
+	const wantSHA256 = "2a9d4ef45757fb5b9a8cab0a9502bd993415cbd09ab899320735adfb1f0b148b"
 	encoded, err := CanonicalStaticPublicationRootV7Bytes(knownStaticPublicationRootV7())
 	if err != nil {
 		t.Fatalf("encode known answer: %v", err)

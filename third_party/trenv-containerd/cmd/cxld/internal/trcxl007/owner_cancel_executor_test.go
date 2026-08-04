@@ -372,6 +372,37 @@ func TestOwnerGrantedCancelSingleDeviceCleanAndReplay(t *testing.T) {
 	fixture.assertZeroIO(t)
 }
 
+func TestOwnerGrantedCancelRejectsSealedQuarantineProvenanceWithoutIO(t *testing.T) {
+	fixture := newOwnerReserveExecutorTestFixture(
+		t, []string{"device-a"}, "device-a", 4<<20)
+	_, granted := ownerCancelTestGrant(t, fixture, "sealed-quarantine", 1)
+	request := ownerCancelTestRequest(fixture, granted)
+	ownerState, _, err := fixture.group.PlannerInputs()
+	if err != nil {
+		t.Fatalf("PlannerInputs: %v", err)
+	}
+	records := ownerState.Records()
+	transaction := ownerState.NextOwnerTransactionSequence
+	records[0].State = OwnerAllocationQuarantined
+	records[0].OwnerTransactionSequence = transaction
+	records[0].OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
+	sealedBase := ownerState.Clone()
+	sealedBase.SnapshotSequence++
+	sealedBase.NextOwnerTransactionSequence = transaction + 1
+	sealed := ownerReserveExecutorSnapshotWithRecords(t, sealedBase, records)
+	if err := fixture.group.anchor.commitOwnerState(sealed); err != nil {
+		t.Fatalf("commit sealed QUARANTINED state: %v", err)
+	}
+	fixture.resetTracking()
+
+	if _, err := fixture.group.CancelGrantedCheckpoint(request); !errors.Is(
+		err,
+		ErrOwnerCancelConflict) {
+		t.Fatalf("sealed QUARANTINED cancellation error = %v", err)
+	}
+	fixture.assertZeroIO(t)
+}
+
 func TestOwnerGrantedCancelOlderRecordAllowsLaterPriorTransactions(t *testing.T) {
 	fixture := newOwnerReserveExecutorTestFixture(
 		t, []string{"device-a", "device-b", "device-c"}, "device-c", 2<<20)

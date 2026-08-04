@@ -16,8 +16,11 @@ import (
 )
 
 const (
+	// The plan domain remains v1 because the plan already commits the separately
+	// versioned complete GRANTED-record digest. The record domain is the hard cut
+	// that adds OwnerVerifiedSealSHA256, including its canonical zero GRANTED value.
 	producerScatterPlanDigestDomain        = "TRCXL007-producer-scatter-plan-v1"
-	producerScatterGrantRecordDigestDomain = "TRCXL007-producer-scatter-grant-record-v1"
+	producerScatterGrantRecordDigestDomain = "TRCXL007-producer-scatter-grant-record-v2"
 )
 
 var (
@@ -1100,6 +1103,7 @@ func producerScatterGrantRecordSHA256(
 	_, _ = digest.Write(record.AuthorityEvidence.ProducerCapabilitySHA256[:])
 	_, _ = digest.Write(record.AuthorityEvidence.PublicationAuthoritySHA256[:])
 	_, _ = digest.Write(record.AuthorityEvidence.ReclaimAuthoritySHA256[:])
+	_, _ = digest.Write(record.OwnerVerifiedSealSHA256[:])
 	producerScatterDigestUint64(digest, uint64(len(record.ContentDemands)))
 	for _, demand := range record.ContentDemands {
 		_, _ = digest.Write([]byte{byte(demand.Kind)})

@@ -24,11 +24,12 @@ const (
 	ownerStateStateFieldBytes = 8
 
 	ownerStateMinimumDeviceWireBytes   uint64 = 53  // one-byte UUID plus fixed fields
-	ownerStateMinimumRecordWireBytes   uint64 = 241 // five one-byte IDs plus fixed fields
+	ownerStateMinimumRecordWireBytes   uint64 = 273 // five one-byte IDs plus fixed fields
 	ownerStateContentDemandWireBytes   uint64 = 40
 	ownerStateMinimumFragmentWireBytes uint64 = 29 // one-byte UUID plus fixed fields
 	ownerStateExtentWireBytes          uint64 = 24
 	ownerStateAuthorityWireBytes       uint64 = 4 * sha256.Size
+	ownerStateRecordTailWireBytes      uint64 = ownerStateAuthorityWireBytes + sha256.Size
 )
 
 var (
@@ -348,7 +349,7 @@ func ownerStatePayloadLength(snapshot OwnerStateSnapshot) (uint64, error) {
 		}
 	}
 	for _, record := range snapshot.records {
-		if err := add(216); err != nil { // fixed scalars, digests, counts, and evidence
+		if err := add(248); err != nil { // fixed scalars, digests, counts, evidence, and seal
 			return 0, err
 		}
 		for _, value := range []string{
@@ -420,7 +421,8 @@ func ownerStateAppendRecord(destination []byte, record OwnerStateAllocationRecor
 	destination = append(destination, record.AuthorityEvidence.SchedulerReserveSHA256[:]...)
 	destination = append(destination, record.AuthorityEvidence.ProducerCapabilitySHA256[:]...)
 	destination = append(destination, record.AuthorityEvidence.PublicationAuthoritySHA256[:]...)
-	return append(destination, record.AuthorityEvidence.ReclaimAuthoritySHA256[:]...)
+	destination = append(destination, record.AuthorityEvidence.ReclaimAuthoritySHA256[:]...)
+	return append(destination, record.OwnerVerifiedSealSHA256[:]...)
 }
 
 type ownerStateDecoder struct {
@@ -570,7 +572,7 @@ func (decoder *ownerStateDecoder) record() (OwnerStateAllocationRecord, error) {
 		"content demand",
 		contentCount,
 		ownerStateContentDemandWireBytes,
-		8+ownerStateAuthorityWireBytes); err != nil {
+		8+ownerStateRecordTailWireBytes); err != nil {
 		return record, err
 	}
 	record.ContentDemands = make([]OwnerStateContentDemand, contentCount)
@@ -612,7 +614,7 @@ func (decoder *ownerStateDecoder) record() (OwnerStateAllocationRecord, error) {
 		"device fragment",
 		fragmentCount,
 		ownerStateMinimumFragmentWireBytes,
-		ownerStateAuthorityWireBytes); err != nil {
+		ownerStateRecordTailWireBytes); err != nil {
 		return record, err
 	}
 	record.Fragments = make([]OwnerStateDeviceFragment, fragmentCount)
@@ -650,7 +652,7 @@ func (decoder *ownerStateDecoder) record() (OwnerStateAllocationRecord, error) {
 		if !overflow {
 			return record, ownerStateCorruptf("minimum future-fragment bytes overflow")
 		}
-		tailBytes, overflow := checkedAdd(futureFragmentBytes, ownerStateAuthorityWireBytes)
+		tailBytes, overflow := checkedAdd(futureFragmentBytes, ownerStateRecordTailWireBytes)
 		if !overflow {
 			return record, ownerStateCorruptf("minimum fragment-tail bytes overflow")
 		}
@@ -685,6 +687,11 @@ func (decoder *ownerStateDecoder) record() (OwnerStateAllocationRecord, error) {
 		}
 		copy(destination[:], value)
 	}
+	seal, err := decoder.bytes("Owner-verified seal SHA-256", sha256.Size)
+	if err != nil {
+		return record, err
+	}
+	copy(record.OwnerVerifiedSealSHA256[:], seal)
 	return record, nil
 }
 

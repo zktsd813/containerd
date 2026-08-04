@@ -162,11 +162,16 @@ func (group *OwnerDeviceGroup) CancelGrantedCheckpoint(
 		return OwnerCancelExecutionResult{}, err
 	}
 	switch target.State {
-	case OwnerAllocationCanceled, OwnerAllocationQuarantined:
-		// QUARANTINED does not encode which service operation selected it. The
-		// exact durable identity and authority commitments above are the only
-		// reliable invariant, so terminal replay is deliberately conservative:
-		// return the record without descriptor, payload, allocator, or Owner I/O.
+	case OwnerAllocationCanceled:
+		return ownerCancelResult(target, false, true), nil
+	case OwnerAllocationQuarantined:
+		if target.OwnerVerifiedSealSHA256 != ([sha256.Size]byte{}) {
+			return OwnerCancelExecutionResult{}, ownerCancelConflictf(
+				"allocation %d is QUARANTINED with post-seal provenance",
+				target.AllocationRecordID)
+		}
+		// A zero seal identifies reservation/abort/cancellation provenance, so
+		// this exact terminal record is safe to replay without any device I/O.
 		return ownerCancelResult(target, false, true), nil
 	case OwnerAllocationGranted:
 		if transitional, blocked := ownerCancelOtherTransitionalRecord(ownerState, 0); blocked {

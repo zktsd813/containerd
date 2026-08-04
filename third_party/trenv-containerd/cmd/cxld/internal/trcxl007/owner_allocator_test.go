@@ -171,6 +171,7 @@ func TestOwnerAllocatorRejectsReservationMutationDuringRecordReplacement(t *test
 	replacement := ownerAllocatorLastRecord(t, base)
 	originalReservation := replacement.ReservationTransactionSequence
 	replacement.State = OwnerAllocationCommitted
+	replacement.OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
 	replacement.ReservationTransactionSequence = replacement.OwnerTransactionSequence
 	replacement.OwnerTransactionSequence = base.NextOwnerTransactionSequence
 	nextTransaction := base.NextOwnerTransactionSequence + 1
@@ -586,7 +587,7 @@ func TestOwnerReserveRequestDigestIsDerivedAndDomainSeparated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("digest: %v", err)
 	}
-	const wantHex = "8f7afb7c7a8d547f19c8174ba8975f3aef7cd6d951b3e575cba7898791860c94"
+	const wantHex = "51c05de3ef0aa7a8efed76b587c139ee2176a0ab704450e15ae43f465e17eb5f"
 	if got := hex.EncodeToString(digest[:]); got != wantHex {
 		t.Fatalf("request digest = %s", got)
 	}

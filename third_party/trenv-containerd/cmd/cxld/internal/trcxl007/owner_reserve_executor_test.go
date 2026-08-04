@@ -1043,6 +1043,9 @@ func TestOwnerReserveExecutorOlderTransitionBlocksPreparingRecovery(t *testing.T
 			plan := fixture.plan(t, second)
 			records := plan.PreparingOwnerState.Records()
 			records[0].State = test.state
+			if test.state == OwnerAllocationCommitting || test.state == OwnerAllocationReclaiming {
+				records[0].OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
+			}
 			blocked := ownerReserveExecutorSnapshotWithRecords(
 				t,
 				plan.PreparingOwnerState,
@@ -1087,6 +1090,7 @@ func TestOwnerReserveExecutorTerminalReplaySurvivesUnrelatedTransition(t *testin
 	}
 	records := ownerState.Records()
 	records[0].State = OwnerAllocationCommitting
+	records[0].OwnerVerifiedSealSHA256 = ownerStateTestSealSHA256()
 	transitionBase := ownerState.Clone()
 	transitionBase.SnapshotSequence++
 	transitionBase.NextOwnerTransactionSequence++

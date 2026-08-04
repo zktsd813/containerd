@@ -107,7 +107,7 @@ func validateCompiledDescriptorContract() error {
 	if cxlcheckpoint.V7StorageDeviceFormatMagicString != "TRCXL007" ||
 		cxlcheckpoint.V7StorageDeviceFormatVersion != 7 ||
 		PageDescriptorBytes != 64 || ContentPageBytes != 4096 ||
-		cxlcheckpoint.V7StoragePageDescriptorABI != "trcxl007-page-descriptor-little-endian-v1" ||
+		cxlcheckpoint.V7StoragePageDescriptorABI != "trcxl007-page-descriptor-little-endian-v2" ||
 		cxlcheckpoint.V7StorageFingerprintAlgorithm != "crc32c-castagnoli" ||
 		cxlcheckpoint.V7StorageFingerprintPolynomial != "0x11edc6f41" {
 		return invalidDescriptorf("compiled V7 storage constants do not name the required TRCXL007 ABI")

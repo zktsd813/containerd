@@ -180,7 +180,7 @@ func TestParseRejectsLengthTornIntegrityReservedAndStructuralInput(t *testing.T)
 		t.Fatalf("nonzero flags error = %v", err)
 	}
 	unknownState := append([]byte(nil), wire...)
-	unknownState[stateOffset] = 7
+	unknownState[stateOffset] = byte(DescriptorZeroPadding + 1)
 	rewriteDescriptorCRC32C(unknownState)
 	if _, err := ParseDescriptor(unknownState); !errors.Is(err, ErrInvalidDescriptor) {
 		t.Fatalf("unknown state error = %v", err)
@@ -282,6 +282,7 @@ func TestDescriptorStateValuesAndCompiledContractAreStable(t *testing.T) {
 		DescriptorPublishedSlot,
 		DescriptorRetiring,
 		DescriptorQuarantined,
+		DescriptorZeroPadding,
 	}
 	for want, state := range states {
 		if int(state) != want || !state.valid() {
@@ -293,6 +294,69 @@ func TestDescriptorStateValuesAndCompiledContractAreStable(t *testing.T) {
 	}
 	if _, err := ParseDescriptor(make([]byte, PageDescriptorBytes)); err != nil {
 		t.Fatalf("ParseDescriptor canonical FREE under compiled contract: %v", err)
+	}
+}
+
+func TestZeroPaddingKnownAnswerBuilderAndStateRules(t *testing.T) {
+	descriptor, err := BuildZeroPaddingPageDescriptor(
+		0x0102030405060708,
+		0x1112131415161718,
+		0x3132333435363738)
+	if err != nil {
+		t.Fatalf("BuildZeroPaddingPageDescriptor: %v", err)
+	}
+	wire := mustMarshalDescriptor(t, descriptor)
+	digest := sha256.Sum256(wire)
+	const expectedHex = "8941f9989e04031e0807060504030201181716151413121100000000000000003837363534333231000000000709000000000000000000000000000000000000"
+	const expectedSHA256 = "4890ee0279aeb101a7e18bcbd5348c8336819029fe06f6c9e0ef9273115f5208"
+	gotHex := hex.EncodeToString(wire)
+	gotSHA256 := hex.EncodeToString(digest[:])
+	if gotHex != expectedHex || gotSHA256 != expectedSHA256 {
+		t.Fatalf("ZERO_PADDING known answer changed:\nhex=%s\nsha256=%s", gotHex, gotSHA256)
+	}
+	if descriptor.State != DescriptorZeroPadding ||
+		descriptor.ContentKind != cxlcheckpoint.ContentPublicationV7 ||
+		descriptor.PaddedPageCRC32C != zeroContentPageCRC32C ||
+		descriptor.PayloadLength != 0 || descriptor.ContentReferenceCount != 0 ||
+		wire[stateOffset] != 7 || wire[contentKindOffset] != 9 {
+		t.Fatalf("ZERO_PADDING descriptor/wire = %#v/%x", descriptor, wire)
+	}
+	parsed, err := ParseDescriptor(wire)
+	if err != nil || parsed != descriptor {
+		t.Fatalf("ParseDescriptor(ZERO_PADDING) = %#v, %v", parsed, err)
+	}
+	if err := descriptor.ValidateContentPage(nil); err != nil {
+		t.Fatalf("ZERO_PADDING nil meaningful content: %v", err)
+	}
+	if err := descriptor.ValidateContentPage([]byte{0}); !errors.Is(err, ErrInvalidContentPage) {
+		t.Fatalf("ZERO_PADDING nonempty meaningful content error = %v", err)
+	}
+
+	mutations := []func(*Descriptor){
+		func(value *Descriptor) { value.ContentKind = cxlcheckpoint.ContentPlacementSlotAV7 },
+		func(value *Descriptor) { value.PaddedPageCRC32C ^= 1 },
+		func(value *Descriptor) { value.PayloadLength = 1 },
+		func(value *Descriptor) { value.ContentReferenceCount = 1 },
+		func(value *Descriptor) { value.Flags = 1 },
+	}
+	for index, mutate := range mutations {
+		candidate := descriptor
+		mutate(&candidate)
+		assertInvalidDescriptor(t, "ZERO_PADDING mutation "+string(rune('a'+index)), candidate)
+	}
+	for _, input := range []struct {
+		allocation  uint64
+		object      uint64
+		transaction uint64
+	}{
+		{object: 2, transaction: 3},
+		{allocation: 1, transaction: 3},
+		{allocation: 1, object: 2},
+	} {
+		if _, err := BuildZeroPaddingPageDescriptor(
+			input.allocation, input.object, input.transaction); !errors.Is(err, ErrInvalidDescriptor) {
+			t.Fatalf("ZERO_PADDING zero identity %#v error = %v", input, err)
+		}
 	}
 }
 

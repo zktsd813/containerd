@@ -13,7 +13,7 @@ const (
 	V7StorageDeviceFormatVersion     = uint32(7)
 	V7StoragePageSize                = uint64(4096)
 	V7StoragePageDescriptorBytes     = uint64(64)
-	V7StoragePageDescriptorABI       = "trcxl007-page-descriptor-little-endian-v1"
+	V7StoragePageDescriptorABI       = "trcxl007-page-descriptor-little-endian-v2"
 
 	// V7 fingerprints retain the Castagnoli CRC32C page-candidate contract.
 	// A fingerprint is neither content equality proof nor authentication.
@@ -29,12 +29,14 @@ const (
 	// V7StorageCompatibilityID is the complete persisted target identity.
 	// Keep this literal stable. It is a compatibility requirement, not a claim
 	// that a live TRCXL007 formatter or device path already exists. The
-	// owner-state suffix hard-cuts the earlier draft V7 Owner-state ABI: media
-	// without the suffix requires destructive reformatting, and this package
-	// supplies no dual decoder or live migration.
+	// descriptor-v2 suffix hard-cuts descriptor-v1 by adding the explicit
+	// ZERO_PADDING state without renumbering any v1 state. The owner-state-v3
+	// suffix appends the Owner-verified seal commitment to every allocation
+	// record. Media carrying either older identity requires destructive
+	// reformatting; this package supplies no dual decoder or live migration.
 	V7StorageCompatibilityID = "publication=TRPUB007/v7/little-endian/immutable-publication-v1;" +
 		"envelope-header=64;max-envelope=8388608;" +
 		"page=4096;fingerprint=crc32c-castagnoli/0x11edc6f41;" +
-		"descriptor=TRCXL007/64/trcxl007-page-descriptor-little-endian-v1;" +
-		"owner-state=TROWN007/v2"
+		"descriptor=TRCXL007/64/trcxl007-page-descriptor-little-endian-v2;" +
+		"owner-state=TROWN007/v3"
 )

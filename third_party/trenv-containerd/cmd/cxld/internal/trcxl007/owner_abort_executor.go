@@ -146,8 +146,17 @@ func (group *OwnerDeviceGroup) AbortPreparingCheckpoint(
 	if err != nil {
 		return OwnerAbortExecutionResult{}, err
 	}
-	if target.State == OwnerAllocationAborted ||
-		target.State == OwnerAllocationQuarantined {
+	if target.State == OwnerAllocationAborted {
+		return ownerAbortResult(target, false, true), nil
+	}
+	if target.State == OwnerAllocationQuarantined {
+		if target.OwnerVerifiedSealSHA256 != ([sha256.Size]byte{}) {
+			return OwnerAbortExecutionResult{}, ownerAbortConflictf(
+				"allocation %d is QUARANTINED with post-seal provenance",
+				target.AllocationRecordID)
+		}
+		// A zero seal identifies reservation/abort/cancellation provenance, so
+		// this exact terminal record is safe to replay without any device I/O.
 		return ownerAbortResult(target, false, true), nil
 	}
 

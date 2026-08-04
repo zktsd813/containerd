@@ -18,12 +18,13 @@ const (
 	// OwnerStateMagicString, OwnerStateVersion, and OwnerStateDomain identify
 	// one clean-slate, group-global TROWN007 full snapshot. The snapshot is
 	// checkpoint-level Owner metadata, not a per-page journal and not a
-	// PublicationV7 pinned-control object. The v2 domain is a destructive ABI
-	// cut: old draft-v1 media must be reformatted, because no dual decoder or
-	// live migration is supplied.
+	// PublicationV7 pinned-control object. The v3 domain is a destructive ABI
+	// cut that appends the Owner-verified seal commitment to each record. Older
+	// media must be reformatted, because no dual decoder or live migration is
+	// supplied.
 	OwnerStateMagicString = "TROWN007"
 	OwnerStateVersion     = uint32(7)
-	OwnerStateDomain      = "owner-group-full-snapshot-v2"
+	OwnerStateDomain      = "owner-group-full-snapshot-v3"
 
 	OwnerStateEnvelopeHeaderBytes uint64 = 64
 	MaxOwnerStateIdentityBytes           = 256
@@ -168,6 +169,12 @@ type OwnerStateAllocationRecord struct {
 	ContentDemands    []OwnerStateContentDemand
 	Fragments         []OwnerStateDeviceFragment
 	AuthorityEvidence OwnerStateAuthorityEvidence
+
+	// OwnerVerifiedSealSHA256 commits the Owner-verified durable content seal.
+	// Reservation, grant, abort, rejection, and cancellation provenance keeps
+	// this field zero. States at or beyond a verified seal require it nonzero;
+	// QUARANTINED admits either provenance explicitly.
+	OwnerVerifiedSealSHA256 [sha256.Size]byte
 }
 
 // OwnerStateConfig supplies one complete logical full snapshot. Construction
@@ -552,7 +559,34 @@ func validateOwnerStateRecord(
 		return err
 	}
 	if !record.State.valid() {
-		return ownerStateInvalidf("allocation state %d is outside the TROWN007 v2 state machine", record.State)
+		return ownerStateInvalidf("allocation state %d is outside the TROWN007 v3 state machine", record.State)
+	}
+	sealIsZero := record.OwnerVerifiedSealSHA256 == ([sha256.Size]byte{})
+	switch record.State {
+	case OwnerAllocationPreparing,
+		OwnerAllocationGranted,
+		OwnerAllocationAborting,
+		OwnerAllocationAborted,
+		OwnerAllocationRejectedNoSpace,
+		OwnerAllocationCanceling,
+		OwnerAllocationCanceled:
+		if !sealIsZero {
+			return ownerStateInvalidf(
+				"allocation state %d requires a zero Owner-verified seal SHA-256",
+				record.State)
+		}
+	case OwnerAllocationCommitting,
+		OwnerAllocationCommitted,
+		OwnerAllocationReclaiming,
+		OwnerAllocationReclaimed:
+		if sealIsZero {
+			return ownerStateInvalidf(
+				"allocation state %d requires a nonzero Owner-verified seal SHA-256",
+				record.State)
+		}
+	case OwnerAllocationQuarantined:
+		// QUARANTINED preserves either reservation/cancellation provenance with a
+		// zero seal or post-seal provenance with a nonzero seal.
 	}
 	if record.State == OwnerAllocationRejectedNoSpace {
 		if record.ReservationTransactionSequence != 0 {
@@ -932,7 +966,7 @@ func ownerStateDigestString(writer io.Writer, value string) {
 func ownerStateCompiledContractValid() bool {
 	return OwnerStateMagicString == "TROWN007" &&
 		OwnerStateVersion == 7 &&
-		OwnerStateDomain == "owner-group-full-snapshot-v2" &&
+		OwnerStateDomain == "owner-group-full-snapshot-v3" &&
 		len(OwnerStateDomain) <= ownerStateDomainFieldBytes &&
 		len(cxlcheckpoint.V7StorageCompatibilityID) <= MaxOwnerStateIdentityBytes &&
 		OwnerStateEnvelopeHeaderBytes == 64 &&
