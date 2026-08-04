@@ -146,6 +146,23 @@ func DecodeContentPlacementMap(
 	return mapping, nil
 }
 
+// ContentPlacementMapEnvelopeExactLengthFromHeader validates exactly one
+// fixed TRCPM007 envelope header and returns the complete envelope length
+// declared by that header. capacityBytes is the non-zero size of the storage
+// object from which recovery will read the envelope.
+//
+// This function validates only header integrity and bounds. It cannot validate
+// the declared payload CRC-32C without the payload; after reading exactly the
+// returned length, callers must pass the complete envelope to
+// DecodeContentPlacementMap.
+func ContentPlacementMapEnvelopeExactLengthFromHeader(
+	header []byte,
+	capacityBytes uint64,
+) (uint64, error) {
+	return contentMappingEnvelopeExactLengthFromHeader(
+		contentPlacementMapEnvelopeSpec, header, capacityBytes)
+}
+
 func marshalVirtualPageMapPayload(mapping VirtualPageMap) ([]byte, error) {
 	encoder := newContentMappingEncoder()
 	encoder.text(mapping.VirtualPageMapID)
@@ -337,54 +354,11 @@ func parseContentMappingEnvelope(
 		return nil, fmt.Errorf(
 			"%s envelope is truncated: %w", spec.name, ErrCorruptContentMapping)
 	}
-	var magic [8]byte
-	copy(magic[:], data[0:8])
-	if magic != spec.magic {
-		return nil, fmt.Errorf(
-			"%s magic %q is not %q: %w",
-			spec.name, magic, spec.magic, ErrWrongContentMappingFormat)
+	total, err := contentMappingEnvelopeExactLengthFromHeader(
+		spec, data[:contentMappingHeaderSize], MaxContentMappingBytes)
+	if err != nil {
+		return nil, err
 	}
-	if version := binary.LittleEndian.Uint32(data[8:12]); version != ContentMappingVersion {
-		return nil, fmt.Errorf(
-			"%s version %d is not %d: %w",
-			spec.name, version, ContentMappingVersion, ErrWrongContentMappingFormat)
-	}
-	if size := binary.LittleEndian.Uint32(data[12:16]); size != contentMappingHeaderSize {
-		return nil, fmt.Errorf(
-			"%s header size %d is not %d: %w",
-			spec.name, size, contentMappingHeaderSize, ErrWrongContentMappingFormat)
-	}
-	var domain [contentMappingDomainFieldBytes]byte
-	copy(domain[:], data[16:40])
-	if domain != spec.domain {
-		return nil, fmt.Errorf(
-			"%s domain does not match %q: %w",
-			spec.name, contentMappingDomainString(spec.domain), ErrWrongContentMappingFormat)
-	}
-	if flags := binary.LittleEndian.Uint32(data[52:56]); flags != 0 {
-		return nil, fmt.Errorf(
-			"%s has unknown mandatory flags %#x: %w",
-			spec.name, flags, ErrWrongContentMappingFormat)
-	}
-	if !allZero(data[60:contentMappingHeaderSize]) {
-		return nil, fmt.Errorf(
-			"%s reserved header bytes are non-zero: %w",
-			spec.name, ErrWrongContentMappingFormat)
-	}
-	wantHeaderCRC := binary.LittleEndian.Uint32(data[56:60])
-	if got := contentMappingHeaderCRC(data[:contentMappingHeaderSize]); got != wantHeaderCRC {
-		return nil, fmt.Errorf(
-			"%s header checksum %#x does not match %#x: %w",
-			spec.name, got, wantHeaderCRC, ErrCorruptContentMapping)
-	}
-	payloadLength := binary.LittleEndian.Uint64(data[40:48])
-	if payloadLength > maxContentMappingPayloadBytes {
-		return nil, fmt.Errorf(
-			"%s payload length %d exceeds %d: %w",
-			spec.name, payloadLength, maxContentMappingPayloadBytes,
-			ErrCorruptContentMapping)
-	}
-	total := ContentMappingEnvelopeHeaderBytes + payloadLength
 	if total != uint64(len(data)) {
 		return nil, fmt.Errorf(
 			"%s envelope is %d bytes, header declares %d: %w",
@@ -398,6 +372,82 @@ func parseContentMappingEnvelope(
 			spec.name, got, wantPayloadCRC, ErrCorruptContentMapping)
 	}
 	return append([]byte(nil), payload...), nil
+}
+
+func contentMappingEnvelopeExactLengthFromHeader(
+	spec contentMappingEnvelopeSpec,
+	header []byte,
+	capacityBytes uint64,
+) (uint64, error) {
+	if uint64(len(header)) != ContentMappingEnvelopeHeaderBytes {
+		return 0, fmt.Errorf(
+			"%s header is %d bytes, want exactly %d: %w",
+			spec.name, len(header), ContentMappingEnvelopeHeaderBytes,
+			ErrCorruptContentMapping)
+	}
+	var magic [8]byte
+	copy(magic[:], header[0:8])
+	if magic != spec.magic {
+		return 0, fmt.Errorf(
+			"%s magic %q is not %q: %w",
+			spec.name, magic, spec.magic, ErrWrongContentMappingFormat)
+	}
+	if version := binary.LittleEndian.Uint32(header[8:12]); version != ContentMappingVersion {
+		return 0, fmt.Errorf(
+			"%s version %d is not %d: %w",
+			spec.name, version, ContentMappingVersion, ErrWrongContentMappingFormat)
+	}
+	if size := binary.LittleEndian.Uint32(header[12:16]); size != contentMappingHeaderSize {
+		return 0, fmt.Errorf(
+			"%s header size %d is not %d: %w",
+			spec.name, size, contentMappingHeaderSize, ErrWrongContentMappingFormat)
+	}
+	var domain [contentMappingDomainFieldBytes]byte
+	copy(domain[:], header[16:40])
+	if domain != spec.domain {
+		return 0, fmt.Errorf(
+			"%s domain does not match %q: %w",
+			spec.name, contentMappingDomainString(spec.domain), ErrWrongContentMappingFormat)
+	}
+	if flags := binary.LittleEndian.Uint32(header[52:56]); flags != 0 {
+		return 0, fmt.Errorf(
+			"%s has unknown mandatory flags %#x: %w",
+			spec.name, flags, ErrWrongContentMappingFormat)
+	}
+	if !allZero(header[60:contentMappingHeaderSize]) {
+		return 0, fmt.Errorf(
+			"%s reserved header bytes are non-zero: %w",
+			spec.name, ErrWrongContentMappingFormat)
+	}
+	wantHeaderCRC := binary.LittleEndian.Uint32(header[56:60])
+	if got := contentMappingHeaderCRC(header); got != wantHeaderCRC {
+		return 0, fmt.Errorf(
+			"%s header checksum %#x does not match %#x: %w",
+			spec.name, got, wantHeaderCRC, ErrCorruptContentMapping)
+	}
+	payloadLength := binary.LittleEndian.Uint64(header[40:48])
+	if payloadLength > ^uint64(0)-ContentMappingEnvelopeHeaderBytes {
+		return 0, fmt.Errorf(
+			"%s envelope length overflows for payload %d: %w",
+			spec.name, payloadLength, ErrCorruptContentMapping)
+	}
+	total := ContentMappingEnvelopeHeaderBytes + payloadLength
+	if payloadLength > maxContentMappingPayloadBytes || total > MaxContentMappingBytes {
+		return 0, fmt.Errorf(
+			"%s payload length %d exceeds %d: %w",
+			spec.name, payloadLength, maxContentMappingPayloadBytes,
+			ErrCorruptContentMapping)
+	}
+	if capacityBytes == 0 {
+		return 0, fmt.Errorf(
+			"%s storage capacity is zero: %w", spec.name, ErrCorruptContentMapping)
+	}
+	if total > capacityBytes {
+		return 0, fmt.Errorf(
+			"%s envelope length %d exceeds storage capacity %d: %w",
+			spec.name, total, capacityBytes, ErrCorruptContentMapping)
+	}
+	return total, nil
 }
 
 func contentMappingHeaderCRC(header []byte) uint32 {

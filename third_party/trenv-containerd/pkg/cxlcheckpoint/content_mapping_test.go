@@ -854,6 +854,183 @@ func assertNoPanic(t *testing.T, operation func()) {
 	operation()
 }
 
+func TestContentPlacementMapEnvelopeExactLengthFromHeader(t *testing.T) {
+	objects, _, placement := validContentMappingFixture()
+	encoded, err := CanonicalContentPlacementMapBytes(placement, objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := append([]byte(nil), encoded[:contentMappingHeaderSize]...)
+	exact := uint64(len(encoded))
+
+	for _, capacity := range []uint64{exact, exact + PageSize} {
+		got, err := ContentPlacementMapEnvelopeExactLengthFromHeader(header, capacity)
+		if err != nil || got != exact {
+			t.Fatalf("capacity %d: exact length = %d, %v; want %d",
+				capacity, got, err, exact)
+		}
+	}
+
+	t.Run("maximum payload", func(t *testing.T) {
+		candidate := append([]byte(nil), header...)
+		binary.LittleEndian.PutUint64(candidate[40:48], maxContentMappingPayloadBytes)
+		repairContentMappingHeaderCRC(candidate)
+		got, err := ContentPlacementMapEnvelopeExactLengthFromHeader(
+			candidate, MaxContentMappingBytes)
+		if err != nil || got != MaxContentMappingBytes {
+			t.Fatalf("exact length = %d, %v; want %d", got, err, MaxContentMappingBytes)
+		}
+	})
+
+	t.Run("payload checksum validation is deferred", func(t *testing.T) {
+		candidate := append([]byte(nil), encoded...)
+		binary.LittleEndian.PutUint32(
+			candidate[48:52], binary.LittleEndian.Uint32(candidate[48:52])^1)
+		repairContentMappingHeaderCRC(candidate)
+		got, err := ContentPlacementMapEnvelopeExactLengthFromHeader(
+			candidate[:contentMappingHeaderSize], exact)
+		if err != nil || got != exact {
+			t.Fatalf("exact length = %d, %v; want %d", got, err, exact)
+		}
+		if _, err := DecodeContentPlacementMap(candidate, objects); !errors.Is(
+			err, ErrCorruptContentMapping) {
+			t.Fatalf("DecodeContentPlacementMap() error = %v, want payload corruption", err)
+		}
+	})
+
+	tests := []struct {
+		name     string
+		capacity uint64
+		target   error
+		mutate   func([]byte) []byte
+	}{
+		{
+			name:     "truncated header",
+			capacity: exact,
+			target:   ErrCorruptContentMapping,
+			mutate:   func(data []byte) []byte { return data[:len(data)-1] },
+		},
+		{
+			name:     "extra header byte",
+			capacity: exact,
+			target:   ErrCorruptContentMapping,
+			mutate:   func(data []byte) []byte { return append(data, 0) },
+		},
+		{
+			name:     "wrong magic",
+			capacity: exact,
+			target:   ErrWrongContentMappingFormat,
+			mutate: func(data []byte) []byte {
+				data[0] ^= 1
+				repairContentMappingHeaderCRC(data)
+				return data
+			},
+		},
+		{
+			name:     "wrong version",
+			capacity: exact,
+			target:   ErrWrongContentMappingFormat,
+			mutate: func(data []byte) []byte {
+				binary.LittleEndian.PutUint32(data[8:12], ContentMappingVersion+1)
+				repairContentMappingHeaderCRC(data)
+				return data
+			},
+		},
+		{
+			name:     "wrong header size",
+			capacity: exact,
+			target:   ErrWrongContentMappingFormat,
+			mutate: func(data []byte) []byte {
+				binary.LittleEndian.PutUint32(data[12:16], contentMappingHeaderSize+1)
+				repairContentMappingHeaderCRC(data)
+				return data
+			},
+		},
+		{
+			name:     "wrong domain",
+			capacity: exact,
+			target:   ErrWrongContentMappingFormat,
+			mutate: func(data []byte) []byte {
+				data[16] ^= 1
+				repairContentMappingHeaderCRC(data)
+				return data
+			},
+		},
+		{
+			name:     "mandatory flags",
+			capacity: exact,
+			target:   ErrWrongContentMappingFormat,
+			mutate: func(data []byte) []byte {
+				binary.LittleEndian.PutUint32(data[52:56], 1)
+				repairContentMappingHeaderCRC(data)
+				return data
+			},
+		},
+		{
+			name:     "reserved byte",
+			capacity: exact,
+			target:   ErrWrongContentMappingFormat,
+			mutate: func(data []byte) []byte {
+				data[60] = 1
+				repairContentMappingHeaderCRC(data)
+				return data
+			},
+		},
+		{
+			name:     "corrupt header checksum",
+			capacity: exact,
+			target:   ErrCorruptContentMapping,
+			mutate: func(data []byte) []byte {
+				data[56] ^= 1
+				return data
+			},
+		},
+		{
+			name:     "payload exceeds maximum",
+			capacity: ^uint64(0),
+			target:   ErrCorruptContentMapping,
+			mutate: func(data []byte) []byte {
+				binary.LittleEndian.PutUint64(data[40:48], maxContentMappingPayloadBytes+1)
+				repairContentMappingHeaderCRC(data)
+				return data
+			},
+		},
+		{
+			name:     "envelope length overflow",
+			capacity: ^uint64(0),
+			target:   ErrCorruptContentMapping,
+			mutate: func(data []byte) []byte {
+				binary.LittleEndian.PutUint64(data[40:48], ^uint64(0))
+				repairContentMappingHeaderCRC(data)
+				return data
+			},
+		},
+		{
+			name:     "zero capacity",
+			capacity: 0,
+			target:   ErrCorruptContentMapping,
+			mutate:   func(data []byte) []byte { return data },
+		},
+		{
+			name:     "capacity smaller than envelope",
+			capacity: exact - 1,
+			target:   ErrCorruptContentMapping,
+			mutate:   func(data []byte) []byte { return data },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := test.mutate(append([]byte(nil), header...))
+			got, err := ContentPlacementMapEnvelopeExactLengthFromHeader(
+				candidate, test.capacity)
+			if got != 0 || !errors.Is(err, test.target) {
+				t.Fatalf("exact length = %d, error = %v; want 0, %v",
+					got, err, test.target)
+			}
+		})
+	}
+}
+
 func TestV7ContentMappingEnvelopeRejectsCorruptionAndTrailingBytes(t *testing.T) {
 	objects, virtual, placement := validContentMappingFixture()
 	virtualBytes, err := CanonicalVirtualPageMapBytes(virtual, objects)

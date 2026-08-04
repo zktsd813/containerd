@@ -66,6 +66,88 @@ func DecodePublicationV7(data []byte) (PublicationV7, error) {
 	return publication, nil
 }
 
+// PublicationV7EnvelopeExactLengthFromHeader validates exactly one fixed
+// TRPUB007 envelope header and returns the complete envelope length declared
+// by that header. capacityBytes is the non-zero size of the storage object
+// from which recovery will read the envelope.
+//
+// This function validates only header integrity and bounds. It cannot validate
+// the declared payload CRC-32C without the payload; after reading exactly the
+// returned length, callers must pass the complete envelope to
+// DecodePublicationV7.
+func PublicationV7EnvelopeExactLengthFromHeader(
+	header []byte,
+	capacityBytes uint64,
+) (uint64, error) {
+	if uint64(len(header)) != PublicationV7EnvelopeHeaderBytes {
+		return 0, fmt.Errorf(
+			"publication header is %d bytes, want exactly %d: %w",
+			len(header), PublicationV7EnvelopeHeaderBytes, ErrCorruptPublicationV7)
+	}
+	var magic [8]byte
+	copy(magic[:], header[0:8])
+	if magic != publicationV7Magic {
+		return 0, fmt.Errorf(
+			"publication magic %q is not %q: %w",
+			magic, publicationV7Magic, ErrWrongPublicationV7Format)
+	}
+	if version := binary.LittleEndian.Uint32(header[8:12]); version != PublicationV7Version {
+		return 0, fmt.Errorf(
+			"publication version %d is not %d: %w",
+			version, PublicationV7Version, ErrWrongPublicationV7Format)
+	}
+	if size := binary.LittleEndian.Uint32(header[12:16]); size != publicationV7HeaderSize {
+		return 0, fmt.Errorf(
+			"publication header size %d is not %d: %w",
+			size, publicationV7HeaderSize, ErrWrongPublicationV7Format)
+	}
+	var domain [publicationV7DomainFieldBytes]byte
+	copy(domain[:], header[16:40])
+	if domain != publicationV7Domain {
+		return 0, fmt.Errorf(
+			"publication domain does not match %q: %w",
+			PublicationV7Domain, ErrWrongPublicationV7Format)
+	}
+	if flags := binary.LittleEndian.Uint32(header[52:56]); flags != 0 {
+		return 0, fmt.Errorf(
+			"publication has unknown mandatory flags %#x: %w",
+			flags, ErrWrongPublicationV7Format)
+	}
+	if !publicationV7AllZero(header[60:publicationV7HeaderSize]) {
+		return 0, fmt.Errorf(
+			"publication reserved header bytes are non-zero: %w",
+			ErrWrongPublicationV7Format)
+	}
+	wantHeaderCRC := binary.LittleEndian.Uint32(header[56:60])
+	if got := publicationV7HeaderCRC(header); got != wantHeaderCRC {
+		return 0, fmt.Errorf(
+			"publication header checksum %#x does not match %#x: %w",
+			got, wantHeaderCRC, ErrCorruptPublicationV7)
+	}
+	payloadLength := binary.LittleEndian.Uint64(header[40:48])
+	if payloadLength > ^uint64(0)-PublicationV7EnvelopeHeaderBytes {
+		return 0, fmt.Errorf(
+			"publication envelope length overflows for payload %d: %w",
+			payloadLength, ErrCorruptPublicationV7)
+	}
+	total := PublicationV7EnvelopeHeaderBytes + payloadLength
+	if payloadLength > maxPublicationV7PayloadBytes || total > MaxPublicationV7Bytes {
+		return 0, fmt.Errorf(
+			"publication payload length %d exceeds %d: %w",
+			payloadLength, maxPublicationV7PayloadBytes, ErrCorruptPublicationV7)
+	}
+	if capacityBytes == 0 {
+		return 0, fmt.Errorf(
+			"publication storage capacity is zero: %w", ErrCorruptPublicationV7)
+	}
+	if total > capacityBytes {
+		return 0, fmt.Errorf(
+			"publication envelope length %d exceeds storage capacity %d: %w",
+			total, capacityBytes, ErrCorruptPublicationV7)
+	}
+	return total, nil
+}
+
 // EncodePublicationV7ForStorage prepares the exact immutable bytes, zero-only
 // slot padding, digest, and external bootstrap PageID runs. The graph itself
 // never embeds these runs, avoiding a self-locator cycle.
@@ -408,53 +490,11 @@ func parsePublicationV7Envelope(data []byte) ([]byte, error) {
 			"publication envelope is %d bytes, limit is %d: %w",
 			len(data), MaxPublicationV7Bytes, ErrCorruptPublicationV7)
 	}
-	var magic [8]byte
-	copy(magic[:], data[0:8])
-	if magic != publicationV7Magic {
-		return nil, fmt.Errorf(
-			"publication magic %q is not %q: %w",
-			magic, publicationV7Magic, ErrWrongPublicationV7Format)
+	total, err := PublicationV7EnvelopeExactLengthFromHeader(
+		data[:publicationV7HeaderSize], MaxPublicationV7Bytes)
+	if err != nil {
+		return nil, err
 	}
-	if version := binary.LittleEndian.Uint32(data[8:12]); version != PublicationV7Version {
-		return nil, fmt.Errorf(
-			"publication version %d is not %d: %w",
-			version, PublicationV7Version, ErrWrongPublicationV7Format)
-	}
-	if size := binary.LittleEndian.Uint32(data[12:16]); size != publicationV7HeaderSize {
-		return nil, fmt.Errorf(
-			"publication header size %d is not %d: %w",
-			size, publicationV7HeaderSize, ErrWrongPublicationV7Format)
-	}
-	var domain [publicationV7DomainFieldBytes]byte
-	copy(domain[:], data[16:40])
-	if domain != publicationV7Domain {
-		return nil, fmt.Errorf(
-			"publication domain does not match %q: %w",
-			PublicationV7Domain, ErrWrongPublicationV7Format)
-	}
-	if flags := binary.LittleEndian.Uint32(data[52:56]); flags != 0 {
-		return nil, fmt.Errorf(
-			"publication has unknown mandatory flags %#x: %w",
-			flags, ErrWrongPublicationV7Format)
-	}
-	if !publicationV7AllZero(data[60:publicationV7HeaderSize]) {
-		return nil, fmt.Errorf(
-			"publication reserved header bytes are non-zero: %w",
-			ErrWrongPublicationV7Format)
-	}
-	wantHeaderCRC := binary.LittleEndian.Uint32(data[56:60])
-	if got := publicationV7HeaderCRC(data[:publicationV7HeaderSize]); got != wantHeaderCRC {
-		return nil, fmt.Errorf(
-			"publication header checksum %#x does not match %#x: %w",
-			got, wantHeaderCRC, ErrCorruptPublicationV7)
-	}
-	payloadLength := binary.LittleEndian.Uint64(data[40:48])
-	if payloadLength > maxPublicationV7PayloadBytes {
-		return nil, fmt.Errorf(
-			"publication payload length %d exceeds %d: %w",
-			payloadLength, maxPublicationV7PayloadBytes, ErrCorruptPublicationV7)
-	}
-	total := PublicationV7EnvelopeHeaderBytes + payloadLength
 	if total != uint64(len(data)) {
 		return nil, fmt.Errorf(
 			"publication envelope is %d bytes, header declares %d: %w",
