@@ -227,6 +227,39 @@ func ownerSealCrossCheckStatePhase(
 	wantCurrentTransaction uint64,
 	wantSeal [sha256.Size]byte,
 ) ([]OwnerStateAllocationRecord, int, error) {
+	// Only an opaque seal returned by a complete transcript may authorize a
+	// transition planner. Media reconstruction uses the scalar-only checker
+	// below and must separately verify a recomputed opaque seal before any
+	// completion transition.
+	if wantState != OwnerAllocationGranted && wantSeal != seal.SHA256() {
+		return nil, -1, ownerSealStateTransitionInvalidf(
+			"planned phase seal differs from the supplied Owner-verified seal")
+	}
+	return ownerSealCrossCheckStatePhaseDigest(
+		snapshot,
+		plan,
+		wantState,
+		wantSnapshotSequence,
+		wantNextTransaction,
+		wantCurrentTransaction,
+		wantSeal,
+	)
+}
+
+// ownerSealCrossCheckStatePhaseDigest validates the durable state phase using
+// only its persisted seal digest. It does not create, accept, or prove an
+// OwnerVerifiedSeal. Recovery may use it while reconstructing a plan, but a
+// caller must still finish a complete transcript and use
+// ownerSealCrossCheckStatePhase before planning a state mutation.
+func ownerSealCrossCheckStatePhaseDigest(
+	snapshot OwnerStateSnapshot,
+	plan OwnerSealPlan,
+	wantState OwnerAllocationState,
+	wantSnapshotSequence uint64,
+	wantNextTransaction uint64,
+	wantCurrentTransaction uint64,
+	wantSeal [sha256.Size]byte,
+) ([]OwnerStateAllocationRecord, int, error) {
 	owner := snapshot.Clone()
 	if err := owner.Validate(); err != nil {
 		return nil, -1, ownerSealStateTransitionInvalidf("Owner state: %v", err)
@@ -299,12 +332,6 @@ func ownerSealCrossCheckStatePhase(
 		return nil, -1, ownerSealStateTransitionInvalidf(
 			"allocation %d canonical hypothetical GRANTED-record SHA-256 differs",
 			target.AllocationRecordID)
-	}
-	// seal is deliberately opaque. This scalar comparison complements the
-	// earlier plan-binding validation for post-GRANTED phases.
-	if wantState != OwnerAllocationGranted && wantSeal != seal.SHA256() {
-		return nil, -1, ownerSealStateTransitionInvalidf(
-			"planned phase seal differs from the supplied Owner-verified seal")
 	}
 	return records, targetIndex, nil
 }
